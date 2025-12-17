@@ -499,3 +499,154 @@ async def get_available_types():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chyba: {str(e)}")
+
+
+@router.get("/sport-stats")
+async def get_sport_statistics():
+    """Získať agregované športové štatistiky pre dashboard"""
+    try:
+        from sqlalchemy import func
+        from datetime import timedelta
+        import pandas as pd
+        
+        session = get_session()
+        now = datetime.now()
+        
+        # Helper funkcia pre agregáciu
+        def aggregate_daily(record_type: str, days: int = 7):
+            """Agreguje denné hodnoty pre daný typ metriky"""
+            start_date = now - timedelta(days=days)
+            records = session.query(AppleHealthData).filter(
+                AppleHealthData.record_type == record_type,
+                AppleHealthData.start_date >= start_date
+            ).all()
+            
+            if not records:
+                return []
+            
+            df = pd.DataFrame([{
+                'date': r.start_date.date(),
+                'value': r.value
+            } for r in records])
+            
+            # Group by date and sum/avg
+            daily = df.groupby('date')['value'].agg(['sum', 'mean', 'max', 'min']).reset_index()
+            daily['date'] = daily['date'].astype(str)
+            return daily.to_dict('records')
+        
+        # KROKY
+        steps_data = aggregate_daily('HKQuantityTypeIdentifierStepCount', 30)
+        steps_today = steps_data[-1]['sum'] if steps_data else 0
+        steps_7d = sum(d['sum'] for d in steps_data[-7:]) / 7 if len(steps_data) >= 7 else 0
+        steps_30d = sum(d['sum'] for d in steps_data) / len(steps_data) if steps_data else 0
+        steps_trend = 'up' if steps_7d > steps_30d else 'down' if steps_7d < steps_30d * 0.9 else 'stable'
+        
+        # SRDCOVÝ TEP
+        hr_data = aggregate_daily('HKQuantityTypeIdentifierHeartRate', 7)
+        hr_current = hr_data[-1]['mean'] if hr_data else 0
+        hr_max = hr_data[-1]['max'] if hr_data else 0
+        hr_7d = sum(d['mean'] for d in hr_data) / len(hr_data) if hr_data else 0
+        
+        resting_hr_data = aggregate_daily('HKQuantityTypeIdentifierRestingHeartRate', 7)
+        resting_hr = resting_hr_data[-1]['mean'] if resting_hr_data else 0
+        
+        # SPÁNOK (v hodinách)
+        sleep_records = session.query(AppleHealthData).filter(
+            AppleHealthData.record_type == 'HKCategoryTypeIdentifierSleepAnalysis',
+            AppleHealthData.start_date >= now - timedelta(days=7)
+        ).all()
+        
+        sleep_by_day = {}
+        for r in sleep_records:
+            day = r.start_date.date()
+            if day not in sleep_by_day:
+                sleep_by_day[day] = 0
+            # Vypočítame dĺžku spánku v hodinách
+            if r.end_date and r.start_date:
+                duration_hours = (r.end_date - r.start_date).total_seconds() / 3600
+                sleep_by_day[day] += duration_hours
+        
+        sleep_history = [{'date': str(d), 'hours': h} for d, h in sorted(sleep_by_day.items())]
+        sleep_last = sleep_history[-1]['hours'] if sleep_history else 0
+        sleep_7d = sum(d['hours'] for d in sleep_history) / len(sleep_history) if sleep_history else 0
+        sleep_30d = sleep_7d  # Simplified
+        sleep_quality = 'good' if sleep_last >= 7 else 'fair' if sleep_last >= 6 else 'poor'
+        
+        # AKTIVITA & KALÓRIE
+        calories_data = aggregate_daily('HKQuantityTypeIdentifierActiveEnergyBurned', 7)
+        calories_today = calories_data[-1]['sum'] if calories_data else 0
+        
+        distance_data = aggregate_daily('HKQuantityTypeIdentifierDistanceWalkingRunning', 7)
+        distance_today = distance_data[-1]['sum'] / 1000 if distance_data else 0  # convert m to km
+        
+        # Spojíme kalórie a aktívne minúty (estimované z krokov/vzdialenosti)
+        activity_history = []
+        for i, cal in enumerate(calories_data):
+            activity_history.append({
+                'date': cal['date'],
+                'calories': int(cal['sum']),
+                'minutes': int(cal['sum'] / 5) if cal['sum'] else 0  # Estimate: ~5 cal/min
+            })
+        
+        # HMOTNOSŤ
+        weight_data = aggregate_daily('HKQuantityTypeIdentifierBodyMass', 30)
+        weight_current = weight_data[-1]['mean'] if weight_data else 0
+        weight_7d_ago = weight_data[-7]['mean'] if len(weight_data) >= 7 else weight_current
+        weight_trend = weight_current - weight_7d_ago
+        
+        bmi_data = aggregate_daily('HKQuantityTypeIdentifierBodyMassIndex', 30)
+        bmi_current = bmi_data[-1]['mean'] if bmi_data else 0
+        
+        weight_history = []
+        for w in weight_data:
+            entry = {'date': w['date'], 'weight': round(w['mean'], 1)}
+            # Try to find matching BMI
+            matching_bmi = next((b for b in bmi_data if b['date'] == w['date']), None)
+            if matching_bmi:
+                entry['bmi'] = round(matching_bmi['mean'], 1)
+            weight_history.append(entry)
+        
+        session.close()
+        
+        return JSONResponse(content={
+            "steps": {
+                "today": int(steps_today),
+                "avg_7d": int(steps_7d),
+                "avg_30d": int(steps_30d),
+                "trend": steps_trend,
+                "history": [{'date': d['date'], 'value': int(d['sum'])} for d in steps_data]
+            },
+            "heart_rate": {
+                "current": int(hr_current),
+                "resting": int(resting_hr),
+                "max": int(hr_max),
+                "avg_7d": int(hr_7d),
+                "history": [{'date': d['date'], 'value': int(d['mean'])} for d in hr_data]
+            },
+            "sleep": {
+                "last_night_hours": round(sleep_last, 1),
+                "avg_7d": round(sleep_7d, 1),
+                "avg_30d": round(sleep_30d, 1),
+                "quality": sleep_quality,
+                "history": sleep_history
+            },
+            "activity": {
+                "calories_today": int(calories_today),
+                "active_minutes_today": int(calories_today / 5) if calories_today else 0,
+                "distance_km_today": round(distance_today, 1),
+                "workouts_this_week": 0,  # TODO: Calculate from workout records
+                "history": activity_history
+            },
+            "weight": {
+                "current": round(weight_current, 1),
+                "trend_7d": round(weight_trend, 1),
+                "bmi": round(bmi_current, 1),
+                "history": weight_history
+            }
+        })
+        
+    except Exception as e:
+        print(f"[APPLE HEALTH SPORT STATS] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Chyba: {str(e)}")
