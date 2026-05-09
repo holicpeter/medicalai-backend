@@ -253,27 +253,32 @@ class AppleHealthData(Base):
 
 # Database setup funkcie
 def get_database_path():
-    """Získať cestu k databáze"""
-    # Databáza bude v backend/data/medical_ai.db
-    base_dir = Path(__file__).parent.parent.parent  # backend/
+    """Získať DATABASE URL - PostgreSQL alebo SQLite fallback"""
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        return db_url
+    base_dir = Path(__file__).parent.parent.parent
     db_dir = base_dir / "data" / "database"
     db_dir.mkdir(parents=True, exist_ok=True)
-    
     db_path = db_dir / "medical_ai.db"
     return f"sqlite:///{db_path}"
 
 
 def init_database():
     """Inicializovať databázu - vytvoriť všetky tabuľky"""
-    engine = create_engine(get_database_path(), echo=False)
+    db_url = get_database_path()
+    engine = create_engine(db_url, echo=False)
     Base.metadata.create_all(engine)
-    print(f"[DATABASE] Initialized at: {get_database_path()}")
+    print(f"[DATABASE] Initialized")
     return engine
 
 
 def get_session():
     """Získať databázovú session"""
-    engine = create_engine(get_database_path(), echo=False)
+    db_url = get_database_path()
+    engine = create_engine(db_url, echo=False)
     Session = sessionmaker(bind=engine)
     return Session()
 
