@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Union
 import base64
 import os
-from mistralai import Mistral
+from mistralai.client import MistralClient
 
 class DocumentProcessor:
     def __init__(self):
