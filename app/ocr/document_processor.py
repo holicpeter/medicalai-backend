@@ -2,12 +2,13 @@ from pathlib import Path
 from typing import Union
 import base64
 import os
-from mistralai import Mistral
+import anthropic
 
 class DocumentProcessor:
     def __init__(self):
-        api_key = os.environ.get("MISTRAL_API_KEY")
-        self.client = Mistral(api_key=api_key)
+        self.client = anthropic.Anthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY")
+        )
     
     def process_document(self, file_path: Union[str, Path]) -> str:
         file_path = Path(file_path)
@@ -23,23 +24,28 @@ class DocumentProcessor:
         else:
             media_type = "image/png"
         
-        response = self.client.chat.complete(
-            model="mistral-small-latest",
+        message = self.client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
             messages=[{
                 "role": "user",
                 "content": [
                     {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{media_type};base64,{file_data}"}
+                        "type": "document" if media_type == "application/pdf" else "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": file_data
+                        }
                     },
                     {
                         "type": "text",
-                        "text": "Extract all text and health data from this medical document."
+                        "text": "Extract all text and health data from this medical document. Include all values, dates, and measurements."
                     }
                 ]
             }]
         )
         
-        text = response.choices[0].message.content
+        text = message.content[0].text
         print(f"[OCR] Extracted {len(text)} characters")
         return text
