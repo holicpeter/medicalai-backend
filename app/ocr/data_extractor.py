@@ -246,14 +246,65 @@ class HealthDataExtractor:
         except:
             return None
     
-    def _save_extracted_data(self, metrics: List[Dict]):
-        """Uloží extrahované dáta do JSON súboru"""
-        if not metrics:
-            return
+def _save_extracted_data(self, metrics: List[Dict]):
+    """Uloží extrahované dáta do PostgreSQL databázy"""
+    if not metrics:
+        return
+    
+    try:
+        from app.database import get_session, HealthRecord
+        from datetime import date
         
-        output_file = settings.PROCESSED_DATA_DIR / f"extracted_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        session = get_session()
+        saved_count = 0
         
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        for metric in metrics:
+            try:
+                metric_name = metric.get('metric')
+                value = metric.get('value')
+                metric_date = metric.get('date')
+                
+                if value is None:
+                    continue
+                
+                # Blood pressure je dict
+                if isinstance(value, dict):
+                    value_str = f"{value.get('systolic')}/{value.get('diastolic')}"
+                else:
+                    value_str = str(value)
+                
+                # Parse dátum
+                record_date = None
+                if metric_date:
+                    try:
+                        record_date = datetime.strptime(metric_date, '%Y-%m-%d').date()
+                    except:
+                        record_date = date.today()
+                else:
+                    record_date = date.today()
+                
+                record = HealthRecord(
+                    patient_id=1,
+                    record_type="lab_test",
+                    record_date=record_date,
+                    source="ocr",
+                    metric_type=metric_name,
+                    value=value_str,
+                    notes=metric.get('raw_text', '')[:500]
+                )
+                
+                session.add(record)
+                saved_count += 1
+                
+            except Exception as e:
+                print(f"[EXTRACTOR] Error saving metric {metric}: {e}")
+                continue
+        
+        session.commit()
+        session.close()
+        print(f"[EXTRACTOR] Saved {saved_count} metrics to database")
+        
+    except Exception as e:
+        print(f"[EXTRACTOR] Database error: {e}")
         
         print(f"Saved {len(metrics)} metrics to {output_file}")
