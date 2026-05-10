@@ -6,7 +6,10 @@ from mistralai.client import MistralClient
 
 class DocumentProcessor:
     def __init__(self):
-        self.client = Mistral(api_key=os.environ.get("MISTRAL_API_KEY"))
+        response = self.client.chat(
+            model="mistral-small-latest",
+            messages=[...]
+        )
     
     def process_document(self, file_path: Union[str, Path]) -> str:
         file_path = Path(file_path)
