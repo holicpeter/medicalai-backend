@@ -2,6 +2,8 @@ from pathlib import Path
 from typing import Union
 import base64
 import os
+import httpx
+import json
 
 
 class DocumentProcessor:
@@ -9,11 +11,8 @@ class DocumentProcessor:
         self.api_key = os.environ.get('MISTRAL_API_KEY')
 
     def process_document(self, file_path: Union[str, Path]) -> str:
-        from mistralai import Mistral as MistralSDK
         file_path = Path(file_path)
         print(f'[OCR] Processing: {file_path.name}')
-
-        client = MistralSDK(api_key=self.api_key)
 
         with open(file_path, 'rb') as f:
             file_data = base64.standard_b64encode(f.read()).decode('utf-8')
@@ -25,9 +24,9 @@ class DocumentProcessor:
         else:
             media_type = 'image/png'
 
-        response = client.chat.complete(
-            model='pixtral-12b-2409',
-            messages=[{
+        payload = {
+            'model': 'pixtral-12b-2409',
+            'messages': [{
                 'role': 'user',
                 'content': [
                     {
@@ -40,8 +39,19 @@ class DocumentProcessor:
                     }
                 ]
             }]
+        }
+
+        response = httpx.post(
+            'https://api.mistral.ai/v1/chat/completions',
+            headers={
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json'
+            },
+            json=payload,
+            timeout=120.0
         )
 
-        text = response.choices[0].message.content
+        result = response.json()
+        text = result['choices'][0]['message']['content']
         print(f'[OCR] Extracted {len(text)} characters')
         return text
