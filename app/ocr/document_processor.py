@@ -7,7 +7,7 @@ import httpx
 
 class DocumentProcessor:
     def __init__(self):
-        self.api_key = os.environ.get('MISTRAL_API_KEY')
+        self.api_key = os.environ.get('ANTHROPIC_API_KEY')
 
     def process_document(self, file_path: Union[str, Path]) -> str:
         file_path = Path(file_path)
@@ -17,43 +17,50 @@ class DocumentProcessor:
             file_data = base64.standard_b64encode(f.read()).decode('utf-8')
 
         if file_path.suffix.lower() == '.pdf':
-            media_type = 'application/pdf'
-        elif file_path.suffix.lower() in ['.jpg', '.jpeg']:
-            media_type = 'image/jpeg'
-        else:
-            media_type = 'image/png'
-
-        payload = {
-            'model': 'pixtral-12b-2409',
-            'messages': [{
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'image_url',
-                        'image_url': {'url': f'data:{media_type};base64,{file_data}'}
-                    },
-                    {
-                        'type': 'text',
-                        'text': 'Extract ALL health data from this Slovak medical document. Include every lab value, blood test result, urine test result, date, doctor name, diagnosis, medication.'
+            content = [
+                {
+                    'type': 'document',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': 'application/pdf',
+                        'data': file_data
                     }
-                ]
-            }]
-        }
+                },
+                {
+                    'type': 'text',
+                    'text': 'Extract ALL health data from this Slovak medical document. Include every lab value, blood test result, urine test result, date, doctor name, diagnosis, medication.'
+                }
+            ]
+        else:
+            media_type = 'image/jpeg' if file_path.suffix.lower() in ['.jpg', '.jpeg'] else 'image/png'
+            content = [
+                {
+                    'type': 'image',
+                    'source': {'type': 'base64', 'media_type': media_type, 'data': file_data}
+                },
+                {
+                    'type': 'text',
+                    'text': 'Extract ALL health data from this Slovak medical document.'
+                }
+            ]
 
         response = httpx.post(
-            'https://api.mistral.ai/v1/chat/completions',
+            'https://api.anthropic.com/v1/messages',
             headers={
-                'Authorization': f'Bearer {self.api_key}',
-                'Content-Type': 'application/json'
+                'x-api-key': self.api_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json'
             },
-            json=payload,
+            json={
+                'model': 'claude-opus-4-5',
+                'max_tokens': 4096,
+                'messages': [{'role': 'user', 'content': content}]
+            },
             timeout=120.0
         )
 
         response.raise_for_status()
         result = response.json()
-        text = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-        if not text:
-            text = str(result)
+        text = result.get('content', [{}])[0].get('text', '')
         print(f'[OCR] Extracted {len(text)} characters')
         return text
