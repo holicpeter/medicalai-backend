@@ -97,10 +97,12 @@ class HealthDataExtractor:
         return None
     
     def _parse_metric_value(self, metric_name: str, matches) -> Optional[float]:
-        try:
-            if metric_name == 'blood_pressure':
-                return {'systolic': float(matches.group(1)), 'diastolic': float(matches.group(2))}
-            else:
-                return float(matches.group(1)
+            try:
+                if metric_name == 'blood_pressure':
+                    return {'systolic': float(matches.group(1)), 'diastolic': float(matches.group(2))}
+                else:
+                    return float(matches.group(1).replace(',', '.'))
+            except:
+                return None
         
         print(f"Saved {len(metrics)} metrics to {output_file}")
