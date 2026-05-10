@@ -3,7 +3,6 @@ from typing import Union
 import base64
 import os
 import httpx
-import json
 
 
 class DocumentProcessor:
@@ -51,7 +50,10 @@ class DocumentProcessor:
             timeout=120.0
         )
 
+        response.raise_for_status()
         result = response.json()
-        text = result['choices'][0]['message']['content']
+        text = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+        if not text:
+            text = str(result)
         print(f'[OCR] Extracted {len(text)} characters')
         return text
