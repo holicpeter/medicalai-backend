@@ -2,14 +2,12 @@ from pathlib import Path
 from typing import Union
 import base64
 import os
-from mistralai.client import MistralClient
+from mistralai import Mistral
 
 class DocumentProcessor:
     def __init__(self):
-        response = self.client.chat(
-            model="mistral-small-latest",
-            messages=[...]
-        )
+        api_key = os.environ.get("MISTRAL_API_KEY")
+        self.client = Mistral(api_key=api_key)
     
     def process_document(self, file_path: Union[str, Path]) -> str:
         file_path = Path(file_path)
@@ -32,11 +30,11 @@ class DocumentProcessor:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": f"data:{media_type};base64,{file_data}"
+                        "image_url": {"url": f"data:{media_type};base64,{file_data}"}
                     },
                     {
                         "type": "text",
-                        "text": "Extract all text and health data from this medical document. Include all values, dates, and measurements."
+                        "text": "Extract all text and health data from this medical document."
                     }
                 ]
             }]
