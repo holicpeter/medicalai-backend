@@ -1,8 +1,5 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-import joblib
 from typing import Dict, List
 from pathlib import Path
 import json
@@ -14,7 +11,6 @@ class RiskPredictor:
     
     def __init__(self):
         self.data = self._load_data()
-        self.scaler = StandardScaler()
     
     def _load_data(self) -> pd.DataFrame:
         """Načíta zdravotné dáta"""

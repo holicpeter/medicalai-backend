@@ -1,8 +1,11 @@
+import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import anthropic
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 try:
     from mistralai.client import MistralClient
@@ -67,24 +70,24 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
         elif settings.ANTHROPIC_API_KEY:
             client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
             message = client.messages.create(
-                model="claude-3-haiku-20240307",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=2048,
                 system=system_prompt,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": user_prompt
-                    }
-                ]
+                messages=[{"role": "user", "content": user_prompt}],
             )
             answer = message.content[0].text
         else:
-            raise HTTPException(status_code=500, detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env")
-        
+            raise HTTPException(
+                status_code=500,
+                detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
+            )
+
         return ChatResponse(answer=answer)
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[CHAT ERROR] {str(e)}")
+        logger.error('Chat error: %s', e)
         raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
 
 

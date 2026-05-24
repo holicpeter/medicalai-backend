@@ -266,54 +266,64 @@ def get_database_path():
     return f"sqlite:///{db_path}"
 
 
+import logging as _logging
+
+_db_logger = _logging.getLogger(__name__)
+
+# Module-level engine singleton — created once, reused on every get_session() call.
+_engine = None
+_SessionLocal = None
+
+
+def _get_engine():
+    global _engine, _SessionLocal
+    if _engine is None:
+        db_url = get_database_path()
+        _engine = create_engine(db_url, echo=False)
+        _SessionLocal = sessionmaker(bind=_engine)
+    return _engine
+
+
 def init_database():
     """Inicializovať databázu - vytvoriť všetky tabuľky"""
-    db_url = get_database_path()
-    engine = create_engine(db_url, echo=False)
+    engine = _get_engine()
     Base.metadata.create_all(engine)
-    print(f"[DATABASE] Initialized")
+    _db_logger.info('Database initialized')
     return engine
 
 
 def get_session():
     """Získať databázovú session"""
-    db_url = get_database_path()
-    engine = create_engine(db_url, echo=False)
-    Session = sessionmaker(bind=engine)
-    return Session()
+    _get_engine()  # ensure singleton is ready
+    return _SessionLocal()
 
 
 # Convenience funkcie
 def create_default_patient():
     """Vytvoriť defaultného pacienta (prvé spustenie)"""
     session = get_session()
-    
-    # Skontrolovať, či už pacient existuje
+
     existing = session.query(Patient).first()
     if existing:
         session.close()
         return existing
-    
-    # Vytvoriť nového
+
     patient = Patient(
         first_name="Používateľ",
         last_name="MedicalAI",
-        gender="other"
+        gender="other",
     )
-    
+
     session.add(patient)
     session.commit()
-    
+
     patient_id = patient.id
     session.close()
-    
-    print(f"[DATABASE] Created default patient with ID: {patient_id}")
+
+    _db_logger.info('Created default patient with ID: %s', patient_id)
     return patient
 
 
 if __name__ == "__main__":
-    # Test - vytvoriť databázu
-    print("Creating database...")
     init_database()
     create_default_patient()
-    print("Done!")
