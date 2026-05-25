@@ -29,13 +29,13 @@ async def upload_documents(files: List[UploadFile] = File(...)):
         
         for file in files:
             # Validate file type
-            allowed_extensions = {'.pdf', '.jpg', '.jpeg', '.png', '.csv'}
+            allowed_extensions = {'.pdf', '.jpg', '.jpeg', '.png', '.csv', '.heic', '.heif'}
             file_ext = Path(file.filename).suffix.lower()
-            
+
             if file_ext not in allowed_extensions:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"File type {file_ext} not allowed. Allowed: {allowed_extensions}"
+                    detail=f"File type {file_ext} not allowed. Allowed: {sorted(allowed_extensions)}"
                 )
             
             # Generate unique filename
