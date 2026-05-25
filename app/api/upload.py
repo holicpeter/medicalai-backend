@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from typing import List
@@ -17,7 +18,6 @@ doc_processor = DocumentProcessor()
 data_extractor = HealthDataExtractor()
 csv_importer = CSVImporter()
 
-# Maps content-type → canonical extension (used when filename has no extension)
 _CONTENT_TYPE_MAP = {
     'application/pdf': '.pdf',
     'image/jpeg': '.jpg',
@@ -33,66 +33,89 @@ _ALLOWED_EXTENSIONS = {'.pdf', '.jpg', '.jpeg', '.png', '.csv', '.heic', '.heif'
 
 
 def _resolve_extension(file: UploadFile) -> str:
-    """Return the lowercase extension, falling back to content-type if missing."""
     ext = Path(file.filename or '').suffix.lower()
     if ext in _ALLOWED_EXTENSIONS:
         return ext
-    # No recognised extension — try content-type
     ct = (file.content_type or '').split(';')[0].strip().lower()
     return _CONTENT_TYPE_MAP.get(ct, ext)
+
+
+def _invalidate_analyzers():
+    """Clear cached data so next request reloads from DB."""
+    from app.analysis.trend_analyzer import TrendAnalyzer
+    TrendAnalyzer._data_cache = None
+    TrendAnalyzer._cache_timestamp = None
+
+
+async def _process_single_file(file: UploadFile) -> dict:
+    """Save and process one uploaded file. Runs Claude call in a thread."""
+    file_ext = _resolve_extension(file)
+
+    if file_ext not in _ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{file_ext or 'unknown'}' is not supported. Allowed: {sorted(_ALLOWED_EXTENSIONS)}",
+        )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    stem = Path(file.filename or 'document').stem
+    safe_filename = f"{timestamp}_{stem}{file_ext}"
+    file_path = settings.RAW_DATA_DIR / safe_filename
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    logger.info('Saved upload: %s', safe_filename)
+
+    if file_ext == '.csv':
+        health_data = await asyncio.to_thread(csv_importer.import_from_csv, file_path)
+        text_content = f"CSV import: {len(health_data)} records"
+    else:
+        # Run blocking Claude API call in a thread so other files can process concurrently
+        text_content = await asyncio.to_thread(doc_processor.process_document, file_path)
+        health_data = await asyncio.to_thread(data_extractor.extract_health_metrics, text_content)
+
+    return {
+        "filename": safe_filename,
+        "original_name": file.filename,
+        "extracted_text_length": len(text_content),
+        "health_metrics_found": len(health_data),
+    }
 
 
 @router.post("/documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
     """
     Upload health documents (PDF, images, CSV) for processing.
-
     Supported formats: PDF, JPG, JPEG, PNG, HEIC, HEIF, CSV
+    Multiple files are processed concurrently.
     """
     try:
+        # Process all files concurrently
+        tasks = [_process_single_file(f) for f in files]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
         uploaded_files = []
-
-        for file in files:
-            file_ext = _resolve_extension(file)
-
-            if file_ext not in _ALLOWED_EXTENSIONS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"File type '{file_ext or 'unknown'}' is not supported. "
-                        f"Allowed: {sorted(_ALLOWED_EXTENSIONS)}"
-                    ),
-                )
-
-            # Generate unique filename with correct extension
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            stem = Path(file.filename or 'document').stem
-            safe_filename = f"{timestamp}_{stem}{file_ext}"
-            file_path = settings.RAW_DATA_DIR / safe_filename
-
-            with file_path.open("wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-
-            logger.info('Saved upload: %s (%s)', safe_filename, file_ext)
-
-            if file_ext == '.csv':
-                health_data = csv_importer.import_from_csv(file_path)
-                text_content = f"CSV import: {len(health_data)} records"
+        errors = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                fname = files[i].filename or f"file_{i}"
+                logger.error('Failed to process %s: %s', fname, result)
+                errors.append({"file": fname, "error": str(result)})
             else:
-                text_content = doc_processor.process_document(file_path)
-                health_data = data_extractor.extract_health_metrics(text_content)
+                uploaded_files.append(result)
 
-            uploaded_files.append({
-                "filename": safe_filename,
-                "original_name": file.filename,
-                "path": str(file_path),
-                "extracted_text_length": len(text_content),
-                "health_metrics_found": len(health_data),
-            })
+        # Invalidate analyzer cache so dashboard reflects new data immediately
+        if uploaded_files:
+            _invalidate_analyzers()
+
+        if errors and not uploaded_files:
+            raise HTTPException(status_code=500, detail=f"All files failed: {errors}")
 
         return {
-            "message": f"Successfully uploaded {len(uploaded_files)} files",
+            "message": f"Successfully processed {len(uploaded_files)} of {len(files)} files",
             "files": uploaded_files,
+            "errors": errors,
         }
 
     except HTTPException:
@@ -104,7 +127,6 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
 @router.get("/csv-template")
 async def download_csv_template():
-    """Stiahne vzorový CSV súbor pre manuálny import dát"""
     try:
         template_path = settings.DATA_DIR / "health_data_template.csv"
         csv_importer.create_template_csv(template_path)
@@ -119,17 +141,12 @@ async def download_csv_template():
 
 @router.get("/documents")
 async def list_documents():
-    """List all uploaded documents"""
     try:
         files = list(settings.RAW_DATA_DIR.glob("*"))
         return {
             "count": len(files),
             "files": [
-                {
-                    "name": f.name,
-                    "size": f.stat().st_size,
-                    "created": f.stat().st_ctime,
-                }
+                {"name": f.name, "size": f.stat().st_size, "created": f.stat().st_ctime}
                 for f in files if f.is_file()
             ],
         }

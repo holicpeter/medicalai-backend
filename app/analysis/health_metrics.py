@@ -73,7 +73,12 @@ class HealthMetricsAnalyzer:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
         return df
 
+    def _refresh(self):
+        """Reload from DB to pick up data added after startup."""
+        self.data = self._load_all_data()
+
     def get_latest_metrics(self) -> Dict:
+        self._refresh()
         if self.data.empty:
             return {"error": "No data available"}
 
