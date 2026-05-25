@@ -12,15 +12,49 @@ logger = logging.getLogger(__name__)
 
 _HEIC_EXTENSIONS = {'.heic', '.heif'}
 
-_EXTRACTION_INSTRUCTION = (
-    'Extract ALL health data from this Slovak medical document. '
-    'Include every lab value, blood test result, urine test result, '
-    'date, doctor name, diagnosis, medication.'
-)
+_EXTRACTION_INSTRUCTION = """\
+Extract ALL lab values and medical metrics from this Slovak medical document.
+Return ONLY a JSON array — no other text, no markdown, no explanation.
+
+Format:
+[
+  {"metric": "glucose", "value": 5.2, "unit": "mmol/l", "date": "2022-08-04", "status": "OK"},
+  {"metric": "cholesterol", "value": 4.8, "unit": "mmol/l", "date": "2022-08-04", "status": "HIGH"}
+]
+
+Use these standard metric names:
+- glucose (glukóza, glykémia, S_Glukóza)
+- cholesterol (S_Cholesterol)
+- ldl (LDL, S_LDL-chol)
+- hdl (HDL, S_HDL-chol)
+- triglycerides (triglyceridy, S_Triacylglyceroly)
+- hba1c (HbA1c)
+- creatinine (kreatinín, S_Kreatinín)
+- alt (ALT, ALAT, S_ALT)
+- ast (AST, ASAT, S_AST)
+- ggt (GGT, S_GGT)
+- hemoglobin (hemoglobín, B_Hemoglobin HGB)
+- leukocytes (leukocyty, B_Leukocyty WBC)
+- platelets (trombocyty, B_Trombocyty PLT)
+- erythrocytes (erytrocyty, B_Erytrocyty RBC)
+- crp (CRP, S_CRP)
+- urea (urea, S_Urea)
+- uric_acid (kyselina močová, S_Kyselina močová)
+- tsh (TSH)
+- bmi (BMI)
+- weight (hmotnosť, váha)
+- blood_pressure (krvný tlak, format value as "120/80")
+
+Rules:
+- value must be a number (or "systolic/diastolic" string for blood_pressure)
+- date format: YYYY-MM-DD (extract from document header/footer)
+- status: "OK", "HIGH", "LOW", or "ABNORMAL"
+- include EVERY numeric lab value found
+- if date not found, omit the date field
+"""
 
 
 def _load_heif_support():
-    """Register HEIC/HEIF support with Pillow if pillow-heif is installed."""
     try:
         from pillow_heif import register_heif_opener
         register_heif_opener()
@@ -32,7 +66,6 @@ _load_heif_support()
 
 
 def _read_image_as_jpeg(file_path: Path) -> bytes:
-    """Read an image file and return JPEG bytes (converts HEIC/HEIF automatically)."""
     img = Image.open(file_path)
     if img.mode not in ('RGB', 'L'):
         img = img.convert('RGB')
@@ -74,7 +107,6 @@ class DocumentProcessor:
                 },
             ]
         else:
-            # HEIC/HEIF: convert to JPEG; other images: read directly
             if suffix in _HEIC_EXTENSIONS:
                 logger.info('Converting HEIC/HEIF to JPEG: %s', file_path.name)
                 image_bytes = _read_image_as_jpeg(file_path)
