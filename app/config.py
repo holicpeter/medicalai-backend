@@ -16,8 +16,12 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = _DEFAULT_SECRET_KEY
 
-    # CORS — override via ALLOWED_ORIGINS env var (comma-separated list or JSON array)
-    ALLOWED_ORIGINS: List[str] = ["*"]
+    # CORS — override via ALLOWED_ORIGINS env var (JSON array or comma-separated)
+    ALLOWED_ORIGINS: List[str] = [
+        "https://medicalai.peterholic.com",
+        "http://localhost:3000",
+        "http://localhost:8000",
+    ]
 
     # Claude API
     ANTHROPIC_API_KEY: str = ""
