@@ -1,6 +1,9 @@
+import logging
 import re
 from datetime import datetime, date
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class HealthDataExtractor:
@@ -38,13 +41,13 @@ class HealthDataExtractor:
         lines = text.split('\n')
         for i, line in enumerate(lines):
             current_date = self._extract_date(line)
-            context_lines = lines[i:min(i+21, len(lines))]
+            context_lines = lines[i:min(i + 21, len(lines))]
             for context_line in context_lines:
                 line_metrics = self._extract_from_line(context_line, current_date)
                 for metric in line_metrics:
                     if not any(m['raw_text'] == metric['raw_text'] for m in metrics):
                         metrics.append(metric)
-        print('[EXTRACTOR] Found ' + str(len(metrics)) + ' health metrics')
+        logger.info('Found %d health metrics', len(metrics))
         self._save_extracted_data(metrics)
         return metrics
 
@@ -60,7 +63,12 @@ class HealthDataExtractor:
                 if matches:
                     value = self._parse_metric_value(metric_name, matches)
                     if value is not None:
-                        results.append({'metric': metric_name, 'value': value, 'date': current_date, 'raw_text': line.strip()})
+                        results.append({
+                            'metric': metric_name,
+                            'value': value,
+                            'date': current_date,
+                            'raw_text': line.strip(),
+                        })
                     break
         return results
 
@@ -75,7 +83,7 @@ class HealthDataExtractor:
                     else:
                         year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
                     return datetime(year, month, day).strftime('%Y-%m-%d')
-                except:
+                except Exception:
                     continue
         return None
 
@@ -83,9 +91,8 @@ class HealthDataExtractor:
         try:
             if metric_name == 'blood_pressure':
                 return {'systolic': float(matches.group(1)), 'diastolic': float(matches.group(2))}
-            else:
-                return float(matches.group(1).replace(',', '.'))
-        except:
+            return float(matches.group(1).replace(',', '.'))
+        except Exception:
             return None
 
     def _save_extracted_data(self, metrics: List[Dict]):
@@ -101,22 +108,30 @@ class HealthDataExtractor:
                     if value is None:
                         continue
                     if isinstance(value, dict):
-                        value_str = str(value.get('systolic')) + '/' + str(value.get('diastolic'))
+                        value_str = f"{value.get('systolic')}/{value.get('diastolic')}"
                     else:
                         value_str = str(value)
                     metric_date = metric.get('date')
-                    if metric_date:
-                        record_date = datetime.strptime(metric_date, '%Y-%m-%d').date()
-                    else:
-                        record_date = date.today()
-                    record = HealthRecord(patient_id=1, record_type='lab_test', record_date=record_date, source='ocr', metric_type=metric.get('metric'), value=value_str, notes=metric.get('raw_text', '')[:500])
+                    record_date = (
+                        datetime.strptime(metric_date, '%Y-%m-%d').date()
+                        if metric_date else date.today()
+                    )
+                    record = HealthRecord(
+                        patient_id=1,
+                        record_type='lab_test',
+                        record_date=record_date,
+                        source='ocr',
+                        metric_type=metric.get('metric'),
+                        value=value_str,
+                        notes=metric.get('raw_text', '')[:500],
+                    )
                     session.add(record)
                     saved_count += 1
                 except Exception as e:
-                    print('[EXTRACTOR] Error: ' + str(e))
+                    logger.warning('Error saving metric: %s', e)
                     continue
             session.commit()
             session.close()
-            print('[EXTRACTOR] Saved ' + str(saved_count) + ' metrics to database')
+            logger.info('Saved %d metrics to database', saved_count)
         except Exception as e:
-            print('[EXTRACTOR] Database error: ' + str(e))
+            logger.error('Database error saving extracted data: %s', e)

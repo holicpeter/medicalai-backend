@@ -43,7 +43,8 @@ def _read_image_as_jpeg(file_path: Path) -> bytes:
 
 class DocumentProcessor:
     def __init__(self):
-        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        from app.config import settings
+        api_key = settings.ANTHROPIC_API_KEY or os.environ.get('ANTHROPIC_API_KEY')
         self.client = anthropic.Anthropic(api_key=api_key) if api_key else None
 
     def process_document(self, file_path: Union[str, Path]) -> str:
