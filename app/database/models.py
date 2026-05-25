@@ -1,327 +1,274 @@
 """
 Database models pre MedicalAI
-Lokálna SQLite databáza - všetky dáta zostávajú na vašom PC!
+Podporuje PostgreSQL (Railway/Supabase) aj SQLite (lokálne)
 """
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text, Boolean, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text, Boolean, ForeignKey, JSON, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 import os
+import logging
 from pathlib import Path
 
-# Base class pre všetky modely
+_db_logger = logging.getLogger(__name__)
+
 Base = declarative_base()
 
 
 class Patient(Base):
-    """Hlavný pacient (vlastník aplikácie)"""
     __tablename__ = 'patients'
-    
     id = Column(Integer, primary_key=True)
     first_name = Column(String(100))
     last_name = Column(String(100))
     date_of_birth = Column(Date)
-    gender = Column(String(10))  # male, female, other
-    blood_type = Column(String(5))  # A+, B-, AB+, O-, atď.
+    gender = Column(String(10))
+    blood_type = Column(String(5))
     height_cm = Column(Float)
     email = Column(String(200))
     phone = Column(String(50))
-    
-    # Timestamps
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    
-    # Relationships
     health_records = relationship("HealthRecord", back_populates="patient")
     family_members = relationship("FamilyMember", back_populates="patient")
 
 
 class FamilyMember(Base):
-    """Rodinní príbuzní (rodičia, súrodenci, deti, prarodičia)"""
     __tablename__ = 'family_members'
-    
     id = Column(Integer, primary_key=True)
     patient_id = Column(Integer, ForeignKey('patients.id'))
-    
-    # Osobné údaje
     first_name = Column(String(100))
     last_name = Column(String(100))
-    relationship_type = Column(String(50))  # mother, father, sister, brother, grandmother, grandfather, child
+    relationship_type = Column(String(50))
     date_of_birth = Column(Date, nullable=True)
     date_of_death = Column(Date, nullable=True)
     gender = Column(String(10))
     blood_type = Column(String(5), nullable=True)
-    
-    # Zdravotná anamnéza
-    chronic_conditions = Column(JSON)  # ["diabetes", "hypertension", ...]
-    genetic_conditions = Column(JSON)  # ["hemophilia", "sickle cell", ...]
-    allergies = Column(JSON)  # ["penicillin", "peanuts", ...]
-    medications = Column(JSON)  # [{"name": "...", "dosage": "..."}, ...]
-    surgeries = Column(JSON)  # [{"type": "...", "date": "...", "notes": "..."}, ...]
-    
-    # Životný štýl
+    chronic_conditions = Column(JSON)
+    genetic_conditions = Column(JSON)
+    allergies = Column(JSON)
+    medications = Column(JSON)
+    surgeries = Column(JSON)
     smoking = Column(Boolean, default=False)
     smoking_years = Column(Integer, nullable=True)
     alcohol = Column(Boolean, default=False)
-    exercise_frequency = Column(String(50), nullable=True)  # daily, weekly, rarely, never
-    
-    # Príčina smrti (ak relevantné)
+    exercise_frequency = Column(String(50), nullable=True)
     cause_of_death = Column(String(200), nullable=True)
-    
-    # Poznámky
     notes = Column(Text, nullable=True)
-    
-    # Timestamps
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    
-    # Relationships
     patient = relationship("Patient", back_populates="family_members")
 
 
 class HealthRecord(Base):
-    """Zdravotné záznamy - z dokumentov alebo manuálne"""
     __tablename__ = 'health_records'
-    
     id = Column(Integer, primary_key=True)
     patient_id = Column(Integer, ForeignKey('patients.id'))
-    
-    # Metadata
-    record_type = Column(String(50))  # lab_test, checkup, prescription, imaging, manual_entry
+    record_type = Column(String(50))
     record_date = Column(Date)
-    source = Column(String(100))  # ocr, manual, import
+    source = Column(String(100))
     source_file = Column(String(500), nullable=True)
-    
-    # Data
-    metric_type = Column(String(100))  # glucose, blood_pressure, cholesterol, etc.
-    value = Column(String(50))  # Hodnota ako string (môže byť "120/80", "5.4", atď.)
+    metric_type = Column(String(100))
+    value = Column(String(50))
     unit = Column(String(20), nullable=True)
-    reference_range = Column(String(100), nullable=True)  # "3.9-6.1" alebo "<5.0"
-    
-    # Interpretácia
+    reference_range = Column(String(100), nullable=True)
     is_normal = Column(Boolean, nullable=True)
-    interpretation = Column(String(50), nullable=True)  # normal, high, low, critical
-    
-    # Kontext
+    interpretation = Column(String(50), nullable=True)
     doctor_name = Column(String(200), nullable=True)
     facility_name = Column(String(200), nullable=True)
     notes = Column(Text, nullable=True)
-    
-    # Timestamps
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    
-    # Relationships
     patient = relationship("Patient", back_populates="health_records")
 
 
 class Document(Base):
-    """Nahrané dokumenty (PDF, obrázky)"""
     __tablename__ = 'documents'
-    
     id = Column(Integer, primary_key=True)
     patient_id = Column(Integer, ForeignKey('patients.id'), nullable=True)
-    
-    # File info
     filename = Column(String(500))
     file_path = Column(String(1000))
-    file_type = Column(String(50))  # pdf, jpg, png
+    file_type = Column(String(50))
     file_size_bytes = Column(Integer)
-    
-    # Processing
     ocr_processed = Column(Boolean, default=False)
     ocr_text = Column(Text, nullable=True)
-    processing_status = Column(String(50))  # pending, processing, completed, failed
+    processing_status = Column(String(50))
     processing_error = Column(Text, nullable=True)
-    
-    # Metadata
-    document_type = Column(String(100), nullable=True)  # lab_results, prescription, checkup_summary
+    document_type = Column(String(100), nullable=True)
     document_date = Column(Date, nullable=True)
-    
-    # Timestamps
     uploaded_at = Column(DateTime, default=datetime.now)
     processed_at = Column(DateTime, nullable=True)
 
 
 class GarminData(Base):
-    """Dáta z Garmin hodinek"""
     __tablename__ = 'garmin_data'
-    
     id = Column(Integer, primary_key=True)
     patient_id = Column(Integer, ForeignKey('patients.id'))
-    
-    # Dátum merania
     record_date = Column(Date, unique=True)
-    
-    # Srdce
     resting_heart_rate = Column(Integer, nullable=True)
     max_heart_rate = Column(Integer, nullable=True)
     min_heart_rate = Column(Integer, nullable=True)
     avg_heart_rate = Column(Integer, nullable=True)
-    
-    # Spánok
     total_sleep_seconds = Column(Integer, nullable=True)
     deep_sleep_seconds = Column(Integer, nullable=True)
     light_sleep_seconds = Column(Integer, nullable=True)
     rem_sleep_seconds = Column(Integer, nullable=True)
     awake_seconds = Column(Integer, nullable=True)
     sleep_score = Column(Integer, nullable=True)
-    
-    # Stres
     avg_stress_level = Column(Integer, nullable=True)
     max_stress_level = Column(Integer, nullable=True)
-    
-    # Aktivita
     total_steps = Column(Integer, nullable=True)
     total_distance_meters = Column(Integer, nullable=True)
     active_calories = Column(Integer, nullable=True)
-    
-    # Telesné zloženie
     weight_kg = Column(Float, nullable=True)
     bmi = Column(Float, nullable=True)
     body_fat_percentage = Column(Float, nullable=True)
-    
-    # Timestamps
     synced_at = Column(DateTime, default=datetime.now)
 
 
 class CalendarEvent(Base):
-    """Udalosti z Google Calendar"""
     __tablename__ = 'calendar_events'
-    
     id = Column(Integer, primary_key=True)
     patient_id = Column(Integer, ForeignKey('patients.id'))
-    
-    # Google Calendar ID
     google_event_id = Column(String(200), unique=True)
-    
-    # Udalosť
     summary = Column(String(500))
     description = Column(Text, nullable=True)
     location = Column(String(500), nullable=True)
-    
-    # Čas
     start_time = Column(DateTime)
     end_time = Column(DateTime)
     is_all_day = Column(Boolean, default=False)
-    
-    # Kategória (auto-detekovaná)
-    category = Column(String(50), nullable=True)  # work, sport, health, travel, social
-    
-    # Timestamps
+    category = Column(String(50), nullable=True)
     synced_at = Column(DateTime, default=datetime.now)
 
 
 class AppleHealthData(Base):
-    """Apple Health dáta z iPhone"""
     __tablename__ = 'apple_health_data'
-    
     id = Column(Integer, primary_key=True)
     patient_id = Column(Integer, ForeignKey('patients.id'), default=1)
-    
-    # Typ záznamu (z Apple Health)
-    record_type = Column(String(200))  # HKQuantityTypeIdentifierStepCount, HKQuantityTypeIdentifierHeartRate, atď.
-    
-    # Hodnota
+    record_type = Column(String(200))
     value = Column(Float)
-    unit = Column(String(50))  # count, bpm, kg, m, atď.
-    
-    # Čas
+    unit = Column(String(50))
     start_date = Column(DateTime)
     end_date = Column(DateTime)
     creation_date = Column(DateTime, nullable=True)
-    
-    # Zdroj (ktorá aplikácia zaznamenala)
-    source_name = Column(String(200), nullable=True)  # "iPhone", "Apple Watch", "Health Mate", atď.
+    source_name = Column(String(200), nullable=True)
     source_version = Column(String(100), nullable=True)
     device_name = Column(String(200), nullable=True)
     device_manufacturer = Column(String(100), nullable=True)
     device_model = Column(String(100), nullable=True)
     device_hardware = Column(String(100), nullable=True)
     device_software = Column(String(100), nullable=True)
-    
-    # Metadata (dodatočné info)
-    record_metadata = Column(JSON, nullable=True)  # Extra info ako HKMetadataKey*
-    
-    # Import info
+    record_metadata = Column(JSON, nullable=True)
     imported_at = Column(DateTime, default=datetime.now)
-    import_batch_id = Column(String(50), nullable=True)  # ID dávky importu (rovnaký export)
-    
-    # Relationship
+    import_batch_id = Column(String(50), nullable=True)
     patient = relationship("Patient")
 
 
-# Database setup funkcie
+# ─── Engine singleton ────────────────────────────────────────────────────────
+
+_engine = None
+_SessionLocal = None
+_db_initialized = False  # ← NOVÝ FLAG
+
+
 def get_database_path():
-    """Získať DATABASE URL - PostgreSQL alebo SQLite fallback"""
+    """PostgreSQL ak DATABASE_URL env var existuje, inak SQLite."""
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
+        # Railway/Heroku používajú starý postgres:// prefix
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql://", 1)
+        _db_logger.info("[DATABASE] Using PostgreSQL: %s", db_url[:30] + "...")
         return db_url
+
+    # SQLite fallback pre lokálny vývoj
     base_dir = Path(__file__).parent.parent.parent
     db_dir = base_dir / "data" / "database"
     db_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_dir / "medical_ai.db"
+    _db_logger.info("[DATABASE] Using SQLite: %s", db_path)
     return f"sqlite:///{db_path}"
-
-
-import logging as _logging
-
-_db_logger = _logging.getLogger(__name__)
-
-# Module-level engine singleton — created once, reused on every get_session() call.
-_engine = None
-_SessionLocal = None
 
 
 def _get_engine():
     global _engine, _SessionLocal
     if _engine is None:
         db_url = get_database_path()
-        _engine = create_engine(db_url, echo=False)
-        _SessionLocal = sessionmaker(bind=_engine)
+        is_sqlite = db_url.startswith("sqlite")
+        _engine = create_engine(
+            db_url,
+            echo=False,
+            # SQLite potrebuje check_same_thread=False pre FastAPI async
+            connect_args={"check_same_thread": False} if is_sqlite else {},
+            # PostgreSQL connection pool settings
+            pool_pre_ping=True,  # ← overí spojenie pred každým použitím
+            pool_recycle=300,    # ← recykluj spojenia každých 5 minút
+        )
+        _SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
+        _db_logger.info("[DATABASE] Initialized at: %s", db_url[:50])
     return _engine
 
 
 def init_database():
-    """Inicializovať databázu - vytvoriť všetky tabuľky"""
+    """
+    Vytvoriť všetky tabuľky ak neexistujú.
+    MUSÍ byť zavolaná pred akýmikoľvek DB queries!
+    Volá sa v lifespan() v main.py.
+    """
+    global _db_initialized
     engine = _get_engine()
-    Base.metadata.create_all(engine)
-    _db_logger.info('Database initialized')
+    # checkfirst=True = nevyhadzuje error ak tabuľky už existujú
+    Base.metadata.create_all(engine, checkfirst=True)
+    _db_initialized = True
+    _db_logger.info("[DATABASE] All tables created/verified")
     return engine
 
 
 def get_session():
-    """Získať databázovú session"""
-    _get_engine()  # ensure singleton is ready
+    """
+    Vráti novú DB session.
+    Vždy zavri session po použití: session.close()
+    Alebo použi ako context manager: with get_session() as session:
+    """
+    _get_engine()  # lazy init engine ak ešte neexistuje
+
+    # ── KRITICKÝ FIX ──────────────────────────────────────────────────────────
+    # Ak init_database() ešte nebola zavolaná (napr. pri module-level importoch
+    # pred lifespan()), bezpečne vytvor tabuľky pred prvou query.
+    if not _db_initialized:
+        _db_logger.warning(
+            "[DATABASE] get_session() called before init_database() — "
+            "auto-initializing. Check module import order."
+        )
+        init_database()
+    # ─────────────────────────────────────────────────────────────────────────
+
     return _SessionLocal()
 
 
-# Convenience funkcie
 def create_default_patient():
-    """Vytvoriť defaultného pacienta (prvé spustenie)"""
+    """Vytvoriť defaultného pacienta ak žiadny neexistuje."""
     session = get_session()
+    try:
+        existing = session.query(Patient).first()
+        if existing:
+            return existing
 
-    existing = session.query(Patient).first()
-    if existing:
+        patient = Patient(
+            first_name="Používateľ",
+            last_name="MedicalAI",
+            gender="other",
+        )
+        session.add(patient)
+        session.commit()
+        session.refresh(patient)
+        _db_logger.info("[DATABASE] Created default patient with ID: %s", patient.id)
+        return patient
+    except Exception as e:
+        session.rollback()
+        _db_logger.error("[DATABASE] Failed to create default patient: %s", e)
+        raise
+    finally:
         session.close()
-        return existing
-
-    patient = Patient(
-        first_name="Používateľ",
-        last_name="MedicalAI",
-        gender="other",
-    )
-
-    session.add(patient)
-    session.commit()
-
-    patient_id = patient.id
-    session.close()
-
-    _db_logger.info('Created default patient with ID: %s', patient_id)
-    return patient
 
 
 if __name__ == "__main__":
