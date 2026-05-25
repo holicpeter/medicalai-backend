@@ -1,41 +1,47 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from typing import List, Optional
 import uvicorn
-from pathlib import Path
 
 from app.api import health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health
 from app.config import settings
 from app.database import init_database, create_default_patient
 
-app = FastAPI(
-    title="MedicalAI API",
-    description="API for medical health analysis and predictions",
-    version="1.0.0"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
 )
+logger = logging.getLogger(__name__)
 
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database and create default patient"""
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
         init_database()
         create_default_patient()
-        print("[STARTUP] Database initialized successfully")
+        logger.info('Database initialized successfully')
     except Exception as e:
-        print(f"[STARTUP ERROR] Failed to initialize database: {e}")
+        logger.error('Failed to initialize database: %s', e)
+    yield
 
-# CORS middleware pre React frontend
+
+app = FastAPI(
+    title="MedicalAI API",
+    description="API for medical health analysis and predictions",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routers
 app.include_router(health.router, prefix="/api/health", tags=["health"])
 app.include_router(upload.router, prefix="/api/upload", tags=["upload"])
 app.include_router(analysis.router, prefix="/api/analysis", tags=["analysis"])
@@ -45,18 +51,20 @@ app.include_router(integrations.router)
 app.include_router(manual_entry.router)
 app.include_router(apple_health.router)
 
+
 @app.get("/")
 async def root():
     return {
         "message": "MedicalAI API",
         "version": "1.0.0",
-        "status": "running"
+        "status": "running",
     }
+
 
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host=settings.BACKEND_HOST,
         port=settings.BACKEND_PORT,
-        reload=True
+        reload=True,
     )
