@@ -170,6 +170,9 @@ _SessionLocal = None
 _db_initialized = False  # ← NOVÝ FLAG
 
 
+_VALID_DB_SCHEMES = ("postgresql://", "postgresql+", "sqlite://")
+
+
 def get_database_path():
     """PostgreSQL ak DATABASE_URL env var existuje, inak SQLite."""
     db_url = os.environ.get("DATABASE_URL")
@@ -177,7 +180,20 @@ def get_database_path():
         # Railway/Heroku používajú starý postgres:// prefix
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql://", 1)
-        _db_logger.info("[DATABASE] Using PostgreSQL: %s", db_url[:30] + "...")
+
+        # A Supabase/REST project URL (https://...) is a common mix-up here. SQLAlchemy
+        # would try to load a dialect named after the scheme and fail deep inside the
+        # engine, so reject it up front with an actionable message.
+        if not db_url.startswith(_VALID_DB_SCHEMES):
+            scheme = db_url.split("://", 1)[0] if "://" in db_url else db_url[:20]
+            raise ValueError(
+                f"DATABASE_URL has an unusable scheme '{scheme}://'. Expected a "
+                "PostgreSQL connection string like "
+                "'postgresql://user:password@host:5432/dbname'. A project's REST/API "
+                "URL (https://...) is not a database connection string."
+            )
+
+        _db_logger.info("[DATABASE] Using PostgreSQL: %s", db_url.split("@")[-1][:40])
         return db_url
 
     # SQLite fallback pre lokálny vývoj
