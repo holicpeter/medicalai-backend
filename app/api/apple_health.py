@@ -4,11 +4,18 @@ Podporuje import z export.xml súboru
 """
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+import asyncio
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uuid
 from pathlib import Path
+
+# A full Apple Health export runs to hundreds of MB; cap it rather than let an
+# oversized upload fill the container's disk.
+_MAX_UPLOAD_BYTES = 600 * 1024 * 1024
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 from ..database.models import AppleHealthData, get_session
 
@@ -84,35 +91,38 @@ def parse_apple_health_date(date_str: str) -> Optional[datetime]:
         return None
 
 
-def parse_apple_health_xml(xml_content: bytes) -> Dict[str, Any]:
+def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
     """
-    Parse Apple Health export.xml súbor (optimalizované - iteratívne parsovanie)
-    
+    Parse Apple Health export.xml súbor (iteratívne, streamované zo súboru).
+
+    xml_source: cesta k súboru (str/Path) alebo bytes.
+
     Returns:
         Dict s parsed dátami a štatistikami
     """
     try:
         import io
         from xml.etree.ElementTree import ParseError
-        
+
         records = []
         stats = {
             "total_records": 0,
             "by_type": {},
             "date_range": {"start": None, "end": None}
         }
-        
+
         print(f"[APPLE HEALTH] Using iterative XML parsing for better performance...")
-        
-        # Iteratívne parsovanie - nezaťažuje pamäť!
-        # Použijeme iterparse namiesto fromstring
+
+        # Parse straight off disk when given a path — a full Apple Health export
+        # is hundreds of MB and must never be held in memory as one blob.
+        source = io.BytesIO(xml_source) if isinstance(xml_source, bytes) else str(xml_source)
+
         try:
-            context = ET.iterparse(io.BytesIO(xml_content), events=('end',))
+            context = ET.iterparse(source, events=('end',))
         except ParseError as e:
-            # Skúsme fallback na normálne parsovanie
             print(f"[APPLE HEALTH] Warning: XML parse error at line {e.position[0]}, trying alternative approach...")
             raise Exception(f"XML súbor má chybnú štruktúru na riadku {e.position[0]}. Skúste re-exportovať súbor z iPhone.")
-        
+
         record_count = 0
         
         # Získať všetky <Record> elementy iteratívne
@@ -225,6 +235,7 @@ async def import_apple_health_data(file: UploadFile = File(...)):
     6. Rozbaľte ZIP → získate export.xml
     7. Nahrajte export.xml (alebo export_small.xml, alebo iný .xml súbor) sem
     """
+    tmp_path = None
     try:
         # Skontrolovať typ súboru - akceptuje AKÝKOĽVEK .xml súbor
         if not file.filename.lower().endswith('.xml'):
@@ -232,19 +243,57 @@ async def import_apple_health_data(file: UploadFile = File(...)):
                 status_code=400,
                 detail="Neplatný súbor. Musí mať príponu .xml (napr. export.xml, export_small.xml)"
             )
-        
-        # Načítať obsah
-        content = await file.read()
-        
-        # Parse XML
-        print(f"[APPLE HEALTH] Parsing {file.filename}...")
-        parsed_data = parse_apple_health_xml(content)
-        
+
+        # export.zip contains two XML files. export_cda.xml is a Clinical Document
+        # Architecture file with no <Record> elements, so importing it always
+        # yields nothing — say so instead of reporting a successful empty import.
+        if 'cda' in Path(file.filename).stem.lower():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Toto je súbor export_cda.xml, ktorý obsahuje klinické dokumenty "
+                    "v inom formáte a žiadne merania. Nahrajte prosím export.xml — "
+                    "nájdete ho v tom istom priečinku apple_health_export."
+                ),
+            )
+
+        # Stream the upload to disk in chunks. A full export is hundreds of MB and
+        # reading it into memory would exhaust the container.
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xml') as tmp:
+            tmp_path = Path(tmp.name)
+            bytes_written = 0
+            while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
+                bytes_written += len(chunk)
+                if bytes_written > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Súbor je príliš veľký (limit "
+                            f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."
+                        ),
+                    )
+                tmp.write(chunk)
+
+        print(f"[APPLE HEALTH] Received {bytes_written / (1024*1024):.1f} MB, parsing {file.filename}...")
+
+        # Parsing and importing are CPU/DB bound — keep them off the event loop.
+        parsed_data = await asyncio.to_thread(parse_apple_health_xml, tmp_path)
+
         records = parsed_data["records"]
         stats = parsed_data["stats"]
-        
+
         print(f"[APPLE HEALTH] Found {len(records)} records")
-        
+
+        if not records:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "V súbore sa nenašli žiadne merania. Uistite sa, že nahrávate "
+                    "export.xml z priečinka apple_health_export (nie export_cda.xml "
+                    "ani iný XML súbor)."
+                ),
+            )
+
         # Vygenerovať batch ID (pre tento import)
         batch_id = str(uuid.uuid4())[:8]
         
@@ -341,9 +390,16 @@ async def import_apple_health_data(file: UploadFile = File(...)):
             }
         })
         
+    except HTTPException:
+        # Deliberate 4xx (wrong file, too large, no records) must reach the client
+        # as-is instead of being reported as a server error.
+        raise
     except Exception as e:
         print(f"[APPLE HEALTH] Import error: {e}")
         raise HTTPException(status_code=500, detail=f"Chyba pri importe: {str(e)}")
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 @router.get("/stats")
