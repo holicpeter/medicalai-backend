@@ -150,10 +150,9 @@ class TrendAnalyzer:
         end_date: Optional[str] = None,
     ) -> Dict:
         if self.data.empty:
-            return {
-                "trends": {},
-                "message": "Zatiaľ nie sú k dispozícii žiadne dáta. Pridajte zdravotné záznamy manuálne alebo nahrajte dokumenty.",
-            }
+            # Always a plain metric map. Returning {"trends": ...} here made the
+            # API layer wrap it a second time, so callers got trends.trends.
+            return {}
 
         df = self.data.copy()
 
@@ -173,7 +172,9 @@ class TrendAnalyzer:
             df = df[df['metric'] == metric]
 
         if df.empty:
-            return {"error": "No data found", "message": "Žiadne dáta pre zvolené filtre"}
+            # No matching rows is a normal state (empty account, narrow filter),
+            # so keep the metric-map shape instead of swapping in an error object.
+            return {}
 
         trends = {}
         for metric_name in df['metric'].unique():

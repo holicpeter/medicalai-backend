@@ -26,17 +26,28 @@ class RiskPredictor:
         
         return pd.DataFrame(all_metrics)
     
+    def _empty_risks(self) -> Dict:
+        """Shape-compatible result for an account with no data yet."""
+        return {
+            'cardiovascular': None,
+            'diabetes': None,
+            'metabolic_syndrome': None,
+            'overall_risk_score': 0,
+            'high_risk_conditions': [],
+            'has_data': False,
+        }
+
     def predict_risks(self) -> Dict:
         """Predikuje zdravotné riziká"""
         if self.data.empty:
-            return {"error": "No data available for prediction"}
-        
+            return self._empty_risks()
+
         # Pripraviť features
         features = self._prepare_features()
-        
+
         if features is None:
-            return {"error": "Insufficient data for risk prediction"}
-        
+            return self._empty_risks()
+
         # Predikcia pre rôzne ochorenia
         risks = {
             'cardiovascular': self._predict_cardiovascular_risk(features),
@@ -55,7 +66,8 @@ class RiskPredictor:
         for disease, risk_data in risks.items():
             if isinstance(risk_data, dict) and risk_data.get('risk_level') == 'high':
                 risks['high_risk_conditions'].append(disease)
-        
+
+        risks['has_data'] = True
         return risks
     
     def predict_disease_risk(self, disease: str) -> Dict:

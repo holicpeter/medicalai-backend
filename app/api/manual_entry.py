@@ -150,8 +150,9 @@ async def get_family_members():
     try:
         patient = session.query(Patient).first()
         if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        
+            # A list endpoint with nothing to list returns an empty list, not 404.
+            return []
+
         members = session.query(FamilyMember).filter_by(patient_id=patient.id).all()
         
         result = []
@@ -344,8 +345,8 @@ async def get_health_records(metric_type: Optional[str] = None, limit: int = 100
     try:
         patient = session.query(Patient).first()
         if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        
+            return []
+
         query = session.query(HealthRecord).filter_by(patient_id=patient.id)
         
         if metric_type:

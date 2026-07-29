@@ -80,7 +80,10 @@ class HealthMetricsAnalyzer:
     def get_latest_metrics(self) -> Dict:
         self._refresh()
         if self.data.empty:
-            return {"error": "No data available"}
+            # An empty account is a normal state, not an error. Returning a
+            # different shape here (an {"error": ...} object instead of the
+            # metric map) breaks every caller that iterates the result.
+            return {}
 
         latest_metrics = {}
         for metric_name in self.data['metric'].unique():
@@ -95,8 +98,9 @@ class HealthMetricsAnalyzer:
         return latest_metrics
 
     def get_metrics_history(self, days: int = 365) -> Dict:
+        self._refresh()
         if self.data.empty:
-            return {"error": "No data available"}
+            return {}
 
         cutoff = datetime.now() - timedelta(days=days)
         recent = self.data[self.data['date'] >= cutoff]
@@ -113,16 +117,24 @@ class HealthMetricsAnalyzer:
         return history
 
     def get_comprehensive_summary(self) -> Dict:
-        if self.data.empty:
-            return {"error": "No data available"}
-
         latest = self.get_latest_metrics()
+        if not latest:
+            return {
+                'generated_at': datetime.now().isoformat(),
+                'latest_metrics': {},
+                'health_score': 0,
+                'alerts': [],
+                'recommendations': [],
+                'has_data': False,
+            }
+
         return {
             'generated_at': datetime.now().isoformat(),
             'latest_metrics': latest,
             'health_score': self._calculate_health_score(latest),
             'alerts': self._generate_alerts(latest),
             'recommendations': self._generate_basic_recommendations(latest),
+            'has_data': True,
         }
 
     def _get_metric_status(self, metric_name: str, value) -> str:
