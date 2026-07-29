@@ -234,9 +234,35 @@ def init_database():
     engine = _get_engine()
     # checkfirst=True = nevyhadzuje error ak tabuľky už existujú
     Base.metadata.create_all(engine, checkfirst=True)
+    _ensure_indexes(engine)
     _db_initialized = True
     _db_logger.info("[DATABASE] All tables created/verified")
     return engine
+
+
+# create_all() only creates indexes alongside a new table, so existing
+# deployments never get them. These are idempotent and cheap to re-run.
+_INDEXES = (
+    ("ix_apple_health_type_start", "apple_health_data", "record_type, start_date"),
+    ("ix_apple_health_start", "apple_health_data", "start_date"),
+    ("ix_health_records_patient_metric", "health_records", "patient_id, metric_type"),
+    ("ix_health_records_date", "health_records", "record_date"),
+    ("ix_health_records_source", "health_records", "source"),
+)
+
+
+def _ensure_indexes(engine):
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        for name, table, columns in _INDEXES:
+            try:
+                conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"
+                ))
+                conn.commit()
+            except Exception as e:
+                _db_logger.warning("[DATABASE] Could not create index %s: %s", name, e)
 
 
 def get_session():

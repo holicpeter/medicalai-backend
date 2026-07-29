@@ -91,11 +91,13 @@ def parse_apple_health_date(date_str: str) -> Optional[datetime]:
         return None
 
 
-def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
+def parse_apple_health_xml(xml_source, on_record=None) -> Dict[str, Any]:
     """
     Parse Apple Health export.xml súbor (iteratívne, streamované zo súboru).
 
     xml_source: cesta k súboru (str/Path) alebo bytes.
+    on_record:  voliteľný callback volaný pre každý záznam. Ak je zadaný,
+                záznamy sa nehromadia v pamäti — nutné pre veľké exporty.
 
     Returns:
         Dict s parsed dátami a štatistikami
@@ -118,7 +120,10 @@ def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
         source = io.BytesIO(xml_source) if isinstance(xml_source, bytes) else str(xml_source)
 
         try:
-            context = ET.iterparse(source, events=('end',))
+            context = ET.iterparse(source, events=('start', 'end'))
+            # Keep the root so processed children can be dropped as we go —
+            # elem.clear() alone leaves them attached and the tree still grows.
+            _, root = next(context)
         except ParseError as e:
             print(f"[APPLE HEALTH] Warning: XML parse error at line {e.position[0]}, trying alternative approach...")
             raise Exception(f"XML súbor má chybnú štruktúru na riadku {e.position[0]}. Skúste re-exportovať súbor z iPhone.")
@@ -127,9 +132,9 @@ def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
         
         # Získať všetky <Record> elementy iteratívne
         for event, elem in context:
-            if elem.tag != 'Record':
+            if event != 'end' or elem.tag != 'Record':
                 continue
-                
+
             record = elem  # elem je už Record element
             record_type = record.get('type', '')
             value = record.get('value')
@@ -173,7 +178,7 @@ def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
                 val = meta.get('value', '')
                 metadata[key] = val
             
-            records.append({
+            record_data = {
                 "type": record_type,
                 "value": value_float,
                 "unit": unit,
@@ -184,8 +189,14 @@ def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
                 "source_version": source_version,
                 "device": device_parts,
                 "metadata": metadata if metadata else None
-            })
-            
+            }
+            # A real export holds millions of records. When a consumer is given,
+            # hand each one straight over instead of building the whole list.
+            if on_record is not None:
+                on_record(record_data)
+            else:
+                records.append(record_data)
+
             # Stats
             stats["total_records"] += 1
             
@@ -209,9 +220,10 @@ def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
             
             # Uvoľniť pamäť - dôležité pre veľké súbory!
             elem.clear()
-        
-        print(f"[APPLE HEALTH] Parsing complete: {len(records):,} records")
-        
+            root.clear()
+
+        print(f"[APPLE HEALTH] Parsing complete: {stats['total_records']:,} records")
+
         return {
             "records": records,
             "stats": stats
@@ -219,6 +231,80 @@ def parse_apple_health_xml(xml_source) -> Dict[str, Any]:
         
     except Exception as e:
         raise Exception(f"Chyba pri parsovaní Apple Health XML: {str(e)}")
+
+
+def _stream_import(xml_path, batch_id: str):
+    """Parse and insert in one streaming pass.
+
+    Records are handed over one at a time and flushed in batches, so a
+    multi-hundred-MB export never materialises as a list. Duplicates are
+    checked against a set built from one query instead of one SELECT per
+    record — the latter turned a large import into millions of table scans.
+    """
+    session = get_session()
+    counts = {"saved": 0, "skipped": 0, "duplicates": 0}
+    batch = []
+    BATCH_SIZE = 5000
+
+    seen = {
+        row
+        for row in session.query(
+            AppleHealthData.record_type,
+            AppleHealthData.start_date,
+            AppleHealthData.value,
+            AppleHealthData.unit,
+        ).all()
+    }
+    print(f"[APPLE HEALTH] Loaded {len(seen):,} existing keys for duplicate check")
+
+    def flush():
+        if batch:
+            session.bulk_save_objects(batch)
+            session.commit()
+            batch.clear()
+
+    def handle(record):
+        if record["value"] is None or record["start_date"] is None:
+            counts["skipped"] += 1
+            return
+
+        key = (record["type"], record["start_date"], record["value"], record["unit"])
+        if key in seen:
+            counts["duplicates"] += 1
+            return
+        seen.add(key)
+
+        device = record["device"] or {}
+        batch.append(AppleHealthData(
+            patient_id=1,
+            record_type=record["type"],
+            value=record["value"],
+            unit=record["unit"],
+            start_date=record["start_date"],
+            end_date=record["end_date"],
+            creation_date=record["creation_date"],
+            source_name=record["source_name"],
+            source_version=record["source_version"],
+            device_name=device.get("name"),
+            device_manufacturer=device.get("manufacturer"),
+            device_model=device.get("model"),
+            device_hardware=device.get("hardware"),
+            device_software=device.get("software"),
+            record_metadata=record["metadata"],
+            import_batch_id=batch_id,
+        ))
+        counts["saved"] += 1
+
+        if len(batch) >= BATCH_SIZE:
+            flush()
+            print(f"[APPLE HEALTH] Progress: {counts['saved']:,} records imported...")
+
+    try:
+        parsed = parse_apple_health_xml(xml_path, on_record=handle)
+        flush()
+        return parsed["stats"], counts
+    finally:
+        session.close()
 
 
 @router.post("/import")
@@ -276,15 +362,19 @@ async def import_apple_health_data(file: UploadFile = File(...)):
 
         print(f"[APPLE HEALTH] Received {bytes_written / (1024*1024):.1f} MB, parsing {file.filename}...")
 
+        batch_id = str(uuid.uuid4())[:8]
+
         # Parsing and importing are CPU/DB bound — keep them off the event loop.
-        parsed_data = await asyncio.to_thread(parse_apple_health_xml, tmp_path)
+        stats, counts = await asyncio.to_thread(_stream_import, tmp_path, batch_id)
 
-        records = parsed_data["records"]
-        stats = parsed_data["stats"]
+        saved_count = counts["saved"]
+        skipped_count = counts["skipped"]
+        duplicate_count = counts["duplicates"]
+        total_records = stats["total_records"]
 
-        print(f"[APPLE HEALTH] Found {len(records)} records")
+        print(f"[APPLE HEALTH] Found {total_records} records")
 
-        if not records:
+        if total_records == 0:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -293,92 +383,15 @@ async def import_apple_health_data(file: UploadFile = File(...)):
                     "ani iný XML súbor)."
                 ),
             )
-
-        # Vygenerovať batch ID (pre tento import)
-        batch_id = str(uuid.uuid4())[:8]
-        
-        # Uložiť do databázy (optimalizované pre veľké súbory)
-        session = get_session()
-        
-        saved_count = 0
-        skipped_count = 0
-        duplicate_count = 0
-        batch_buffer = []
-        BATCH_SIZE = 5000  # Commit každých 5000 záznamov (rýchlejšie pre veľké súbory)
-        
-        print(f"[APPLE HEALTH] Starting import of {len(records)} records...")
-        print(f"[APPLE HEALTH] Checking for duplicates...")
-        
-        for idx, record in enumerate(records):
-            try:
-                # Iba záznamy s hodnotou a platným dátumom
-                if record["value"] is None or record["start_date"] is None:
-                    skipped_count += 1
-                    continue
-                
-                # ✅ DUPLICATE CHECK - Skontroluj, či záznam už existuje
-                existing = session.query(AppleHealthData).filter_by(
-                    record_type=record["type"],
-                    start_date=record["start_date"],
-                    value=record["value"],
-                    unit=record["unit"]
-                ).first()
-                
-                if existing:
-                    duplicate_count += 1
-                    continue  # Preskočiť duplikát
-                
-                # Vytvoriť záznam
-                health_record = AppleHealthData(
-                    patient_id=1,  # Default patient
-                    record_type=record["type"],
-                    value=record["value"],
-                    unit=record["unit"],
-                    start_date=record["start_date"],
-                    end_date=record["end_date"],
-                    creation_date=record["creation_date"],
-                    source_name=record["source_name"],
-                    source_version=record["source_version"],
-                    device_name=record["device"].get("name") if record["device"] else None,
-                    device_manufacturer=record["device"].get("manufacturer") if record["device"] else None,
-                    device_model=record["device"].get("model") if record["device"] else None,
-                    device_hardware=record["device"].get("hardware") if record["device"] else None,
-                    device_software=record["device"].get("software") if record["device"] else None,
-                    record_metadata=record["metadata"],
-                    import_batch_id=batch_id
-                )
-                
-                batch_buffer.append(health_record)
-                saved_count += 1
-                
-                # Bulk insert každých BATCH_SIZE záznamov (rýchlejšie)
-                if len(batch_buffer) >= BATCH_SIZE:
-                    session.bulk_save_objects(batch_buffer)
-                    session.commit()
-                    progress_percent = int((idx / len(records)) * 100)
-                    print(f"[APPLE HEALTH] Progress: {saved_count:,} records ({progress_percent}%)...")
-                    batch_buffer = []
-                
-            except Exception as e:
-                print(f"[APPLE HEALTH] Error saving record: {e}")
-                skipped_count += 1
-                continue
-        
-        # Final commit (zvyšné záznamy)
-        if batch_buffer:
-            session.bulk_save_objects(batch_buffer)
-            session.commit()
-        
-        session.close()
         
         print(f"[APPLE HEALTH] Import complete: {saved_count} saved, {skipped_count} skipped, {duplicate_count} duplicates")
-        
+
         return JSONResponse(content={
             "success": True,
             "message": f"Import úspešný! Importovaných {saved_count} nových záznamov, {duplicate_count} duplikátov preskočených.",
             "batch_id": batch_id,
             "stats": {
-                "total_records": len(records),
+                "total_records": total_records,
                 "saved": saved_count,
                 "skipped": skipped_count,
                 "duplicates": duplicate_count,
