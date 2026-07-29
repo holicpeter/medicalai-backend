@@ -6,7 +6,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import uuid
 from pathlib import Path
 
@@ -65,16 +65,23 @@ APPLE_HEALTH_TYPE_MAPPING = {
 }
 
 
-def parse_apple_health_date(date_str: str) -> datetime:
-    """Parse Apple Health datetime format"""
+def parse_apple_health_date(date_str: str) -> Optional[datetime]:
+    """Parse Apple Health datetime format, e.g. "2023-12-13 15:30:45 +0100".
+
+    Keeps local wall-clock time (timezone offset is dropped, not applied).
+    Returns None if the date cannot be parsed — never a fabricated value.
+    """
+    date_str = date_str.strip()
     try:
-        # Formát: "2023-12-13 15:30:45 +0100"
-        # Odstránime timezone časť pre jednoduchosť
-        date_part = date_str.split('+')[0].split('-0')[0].strip()
-        return datetime.strptime(date_part, "%Y-%m-%d %H:%M:%S")
-    except Exception as e:
+        return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S %z").replace(tzinfo=None)
+    except ValueError:
+        pass
+    try:
+        # Fallback: first 19 chars are "YYYY-MM-DD HH:MM:SS"
+        return datetime.strptime(date_str[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError as e:
         print(f"[APPLE HEALTH] Error parsing date '{date_str}': {e}")
-        return datetime.now()
+        return None
 
 
 def parse_apple_health_xml(xml_content: bytes) -> Dict[str, Any]:
@@ -255,8 +262,8 @@ async def import_apple_health_data(file: UploadFile = File(...)):
         
         for idx, record in enumerate(records):
             try:
-                # Iba záznamy s hodnotou
-                if record["value"] is None:
+                # Iba záznamy s hodnotou a platným dátumom
+                if record["value"] is None or record["start_date"] is None:
                     skipped_count += 1
                     continue
                 
