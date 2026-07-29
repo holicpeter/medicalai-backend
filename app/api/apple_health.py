@@ -386,6 +386,10 @@ async def import_apple_health_data(file: UploadFile = File(...)):
         
         print(f"[APPLE HEALTH] Import complete: {saved_count} saved, {skipped_count} skipped, {duplicate_count} duplicates")
 
+        # Newly imported records must be visible in /trends straight away.
+        from app.analysis.trend_analyzer import TrendAnalyzer
+        TrendAnalyzer.invalidate_cache()
+
         return JSONResponse(content={
             "success": True,
             "message": f"Import úspešný! Importovaných {saved_count} nových záznamov, {duplicate_count} duplikátov preskočených.",

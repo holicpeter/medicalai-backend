@@ -27,6 +27,26 @@ class TrendAnalyzer:
     _cache_ttl = 300  # seconds
 
     def __init__(self):
+        self.refresh()
+
+    @classmethod
+    def invalidate_cache(cls):
+        """Drop the shared cache so the next request reloads from the database.
+
+        Call this from every endpoint that writes health data, otherwise new
+        records stay invisible in /trends for up to the cache TTL.
+        """
+        cls._data_cache = None
+        cls._cache_timestamp = None
+
+    def refresh(self):
+        """Load data, reusing the shared cache while it is still fresh.
+
+        This has to run per request, not once in __init__. The router keeps a
+        single module-level analyzer, so doing the TTL check at construction
+        time froze self.data for the life of the process — newly imported
+        records never showed up in /trends until a restart.
+        """
         if (
             TrendAnalyzer._data_cache is not None
             and TrendAnalyzer._cache_timestamp
@@ -149,6 +169,7 @@ class TrendAnalyzer:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> Dict:
+        self.refresh()
         if self.data.empty:
             # Always a plain metric map. Returning {"trends": ...} here made the
             # API layer wrap it a second time, so callers got trends.trends.
@@ -302,13 +323,15 @@ class TrendAnalyzer:
         if not systolic or not diastolic:
             return "no_data"
         s, d = systolic[-1], diastolic[-1]
+        # Each stage is bounded by BOTH values. With `or` a reading of 200/85
+        # satisfied d < 90 and was reported as stage 1 instead of a crisis.
         if s < 120 and d < 80:
             return "normal"
         if s < 130 and d < 80:
             return "elevated"
-        if s < 140 or d < 90:
+        if s < 140 and d < 90:
             return "hypertension_stage_1"
-        if s < 180 or d < 120:
+        if s < 180 and d < 120:
             return "hypertension_stage_2"
         return "hypertension_crisis"
 

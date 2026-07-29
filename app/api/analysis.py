@@ -87,23 +87,22 @@ async def get_health_summary():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/refresh-cache")
+@router.post("/refresh-cache")
 async def refresh_trend_cache():
     """Vymaže cache a znova načíta všetky dáta"""
     try:
-        # Invalidovať cache
-        from app.analysis.trend_analyzer import TrendAnalyzer
-        TrendAnalyzer._data_cache = None
-        TrendAnalyzer._cache_timestamp = None
-        
-        # Vytvoriť novú inštanciu aby sa dáta načítali znova
-        new_analyzer = TrendAnalyzer()
-        
+        TrendAnalyzer.invalidate_cache()
+
+        # Refresh the analyzer the router actually serves from, rather than
+        # building a throwaway one and leaving the old data in place.
+        trend_analyzer.refresh()
+
         return {
             "success": True,
             "message": "Cache refreshed",
-            "total_records": len(new_analyzer.data)
+            "total_records": len(trend_analyzer.data),
         }
-    
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception('/refresh-cache failed')
+        raise HTTPException(status_code=500, detail="Cache refresh failed")

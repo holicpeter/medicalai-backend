@@ -7,6 +7,12 @@ from app.database import get_session, Patient, FamilyMember, HealthRecord
 router = APIRouter(prefix="/api/manual", tags=["manual-entry"])
 
 
+def _invalidate_trends():
+    """Manually entered records must show up in /trends immediately."""
+    from app.analysis.trend_analyzer import TrendAnalyzer
+    TrendAnalyzer.invalidate_cache()
+
+
 # Pydantic models pre requesty
 class FamilyMemberCreate(BaseModel):
     first_name: str
@@ -328,7 +334,8 @@ async def add_health_record(data: HealthRecordCreate):
         
         session.add(record)
         session.commit()
-        
+        _invalidate_trends()
+
         return {
             "success": True,
             "message": f"Health record for {data.metric_type} added",
@@ -387,7 +394,8 @@ async def delete_health_record(record_id: int):
         
         session.delete(record)
         session.commit()
-        
+        _invalidate_trends()
+
         return {"success": True, "message": "Health record deleted"}
     finally:
         session.close()

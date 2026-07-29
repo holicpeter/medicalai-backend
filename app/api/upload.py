@@ -43,8 +43,7 @@ def _resolve_extension(file: UploadFile) -> str:
 def _invalidate_analyzers():
     """Clear cached data so next request reloads from DB."""
     from app.analysis.trend_analyzer import TrendAnalyzer
-    TrendAnalyzer._data_cache = None
-    TrendAnalyzer._cache_timestamp = None
+    TrendAnalyzer.invalidate_cache()
 
 
 async def _process_single_file(file: UploadFile) -> dict:
