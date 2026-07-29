@@ -8,6 +8,7 @@ import json
 
 from app.config import settings
 from app.database import get_session, HealthRecord, AppleHealthData
+from app.analysis.units import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +99,12 @@ class TrendAnalyzer:
                         value = _to_float(parts[0])
                 else:
                     value = _to_float(value)
+                value, unit = normalize(metric_type, value, record.unit)
                 all_metrics.append({
                     'date': record.record_date,
                     'metric': metric_type,
                     'value': value,
-                    'unit': record.unit,
+                    'unit': unit,
                     'source': record.source,
                 })
             session.close()
@@ -128,11 +130,14 @@ class TrendAnalyzer:
             for record in apple_records:
                 metric_name = apple_to_metric_map.get(record.record_type)
                 if metric_name and record.value is not None:
+                    # Apple Health reports in the phone's regional units, so a
+                    # glucose reading may be mg/dL while the thresholds are SI.
+                    value, unit = normalize(metric_name, float(record.value), record.unit)
                     all_metrics.append({
                         'date': record.start_date,
                         'metric': metric_name,
-                        'value': float(record.value),
-                        'unit': record.unit,
+                        'value': value,
+                        'unit': unit,
                         'source': 'apple_health',
                     })
             session.close()

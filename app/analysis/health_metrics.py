@@ -6,6 +6,7 @@ import json
 
 from app.config import settings
 from app.database import get_session, HealthRecord
+from app.analysis.units import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +55,12 @@ class HealthMetricsAnalyzer:
                         value = _to_float(parts[0])
                 else:
                     value = _to_float(value)
+                value, unit = normalize(record.metric_type, value, record.unit)
                 all_metrics.append({
                     'metric': record.metric_type,
                     'value': value,
                     'date': record.record_date,
-                    'unit': record.unit,
+                    'unit': unit,
                     'source': record.source,
                 })
             session.close()
