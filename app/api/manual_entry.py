@@ -357,7 +357,7 @@ async def get_health_records(metric_type: Optional[str] = None, limit: int = 100
         for record in records:
             result.append({
                 "id": record.id,
-                "record_date": record.record_date.isoformat(),
+                "record_date": record.record_date.isoformat() if record.record_date else None,
                 "metric_type": record.metric_type,
                 "value": record.value,
                 "unit": record.unit,

@@ -21,7 +21,12 @@ class Settings(BaseSettings):
         "https://medicalai.peterholic.com",
         "http://localhost:3000",
         "http://localhost:8000",
+        "http://localhost:5173",
     ]
+
+    # Vercel deployment URLs for this project (production alias + per-deploy previews).
+    # Scoped to the medicalai-* project so it is not an open allowlist for all of vercel.app.
+    ALLOWED_ORIGIN_REGEX: str = r"https://medicalai[a-z0-9-]*\.vercel\.app"
 
     # Claude API
     ANTHROPIC_API_KEY: str = ""
