@@ -17,6 +17,10 @@ from pathlib import Path
 _MAX_UPLOAD_BYTES = 600 * 1024 * 1024
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
 
+# Background import jobs, keyed by job id. In-process only: if the container
+# restarts mid-import the job is gone anyway, so there is nothing to persist.
+_import_jobs: Dict[str, Dict[str, Any]] = {}
+
 from ..database.models import AppleHealthData, get_session
 
 router = APIRouter(prefix="/api/apple-health", tags=["apple_health"])
@@ -233,7 +237,7 @@ def parse_apple_health_xml(xml_source, on_record=None) -> Dict[str, Any]:
         raise Exception(f"Chyba pri parsovaní Apple Health XML: {str(e)}")
 
 
-def _stream_import(xml_path, batch_id: str):
+def _stream_import(xml_path, batch_id: str, progress=None):
     """Parse and insert in one streaming pass.
 
     Records are handed over one at a time and flushed in batches, so a
@@ -298,6 +302,8 @@ def _stream_import(xml_path, batch_id: str):
         if len(batch) >= BATCH_SIZE:
             flush()
             print(f"[APPLE HEALTH] Progress: {counts['saved']:,} records imported...")
+            if progress is not None:
+                progress(dict(counts))
 
     try:
         parsed = parse_apple_health_xml(xml_path, on_record=handle)
@@ -307,58 +313,64 @@ def _stream_import(xml_path, batch_id: str):
         session.close()
 
 
+def _validate_upload_name(filename: str):
+    if not (filename or '').lower().endswith('.xml'):
+        raise HTTPException(
+            status_code=400,
+            detail="Neplatný súbor. Musí mať príponu .xml (napr. export.xml, export_small.xml)"
+        )
+
+    # export.zip contains two XML files. export_cda.xml is a Clinical Document
+    # Architecture file with no <Record> elements, so importing it always
+    # yields nothing — say so instead of reporting a successful empty import.
+    if 'cda' in Path(filename).stem.lower():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Toto je súbor export_cda.xml, ktorý obsahuje klinické dokumenty "
+                "v inom formáte a žiadne merania. Nahrajte prosím export.xml — "
+                "nájdete ho v tom istom priečinku apple_health_export."
+            ),
+        )
+
+
+async def _spool_upload(file: UploadFile) -> tuple[Path, int]:
+    """Stream the upload to a temp file in chunks.
+
+    A full export is hundreds of MB; reading it into memory would exhaust the
+    container.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.xml') as tmp:
+        tmp_path = Path(tmp.name)
+        bytes_written = 0
+        while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
+            bytes_written += len(chunk)
+            if bytes_written > _MAX_UPLOAD_BYTES:
+                tmp_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Súbor je príliš veľký (limit "
+                        f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."
+                    ),
+                )
+            tmp.write(chunk)
+    return tmp_path, bytes_written
+
+
 @router.post("/import")
 async def import_apple_health_data(file: UploadFile = File(...)):
     """
     Import Apple Health XML súboru (akýkoľvek .xml súbor)
-    
-    Ako exportovať dáta z iPhone:
-    1. Otvorte Health app
-    2. Kliknite na svoj profil (hore vpravo)
-    3. Scroll dole na "Export All Health Data"
-    4. Kliknite "Export"
-    5. Uložte export.zip
-    6. Rozbaľte ZIP → získate export.xml
-    7. Nahrajte export.xml (alebo export_small.xml, alebo iný .xml súbor) sem
+
+    Pre veľké exporty použite /import-async — Railway zatvára HTTP spojenie
+    po 5 minútach bez prenosu dát, takže synchrónny import veľkého súboru
+    nedobehne.
     """
     tmp_path = None
     try:
-        # Skontrolovať typ súboru - akceptuje AKÝKOĽVEK .xml súbor
-        if not file.filename.lower().endswith('.xml'):
-            raise HTTPException(
-                status_code=400,
-                detail="Neplatný súbor. Musí mať príponu .xml (napr. export.xml, export_small.xml)"
-            )
-
-        # export.zip contains two XML files. export_cda.xml is a Clinical Document
-        # Architecture file with no <Record> elements, so importing it always
-        # yields nothing — say so instead of reporting a successful empty import.
-        if 'cda' in Path(file.filename).stem.lower():
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Toto je súbor export_cda.xml, ktorý obsahuje klinické dokumenty "
-                    "v inom formáte a žiadne merania. Nahrajte prosím export.xml — "
-                    "nájdete ho v tom istom priečinku apple_health_export."
-                ),
-            )
-
-        # Stream the upload to disk in chunks. A full export is hundreds of MB and
-        # reading it into memory would exhaust the container.
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xml') as tmp:
-            tmp_path = Path(tmp.name)
-            bytes_written = 0
-            while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
-                bytes_written += len(chunk)
-                if bytes_written > _MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"Súbor je príliš veľký (limit "
-                            f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."
-                        ),
-                    )
-                tmp.write(chunk)
+        _validate_upload_name(file.filename)
+        tmp_path, bytes_written = await _spool_upload(file)
 
         print(f"[APPLE HEALTH] Received {bytes_written / (1024*1024):.1f} MB, parsing {file.filename}...")
 
@@ -417,6 +429,103 @@ async def import_apple_health_data(file: UploadFile = File(...)):
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
+
+
+def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename: str):
+    """Run an import outside the request cycle, recording progress as it goes."""
+    job = _import_jobs[job_id]
+    job.update(status="running", started_at=datetime.now().isoformat())
+
+    def progress(counts):
+        job["counts"] = counts
+
+    try:
+        stats, counts = _stream_import(tmp_path, batch_id, progress=progress)
+        job["counts"] = counts
+
+        if stats["total_records"] == 0:
+            job.update(
+                status="failed",
+                error=(
+                    "V súbore sa nenašli žiadne merania. Uistite sa, že nahrávate "
+                    "export.xml z priečinka apple_health_export."
+                ),
+            )
+            return
+
+        from app.analysis.trend_analyzer import TrendAnalyzer
+        TrendAnalyzer.invalidate_cache()
+
+        job.update(
+            status="completed",
+            finished_at=datetime.now().isoformat(),
+            result={
+                "batch_id": batch_id,
+                "filename": filename,
+                "total_records": stats["total_records"],
+                "saved": counts["saved"],
+                "skipped": counts["skipped"],
+                "duplicates": counts["duplicates"],
+                "by_type": stats["by_type"],
+                "date_range": {
+                    "start": stats["date_range"]["start"].isoformat() if stats["date_range"]["start"] else None,
+                    "end": stats["date_range"]["end"].isoformat() if stats["date_range"]["end"] else None,
+                },
+            },
+        )
+        print(f"[APPLE HEALTH] Job {job_id} completed: {counts['saved']} saved")
+    except Exception as e:
+        print(f"[APPLE HEALTH] Job {job_id} failed: {e}")
+        job.update(status="failed", error=str(e), finished_at=datetime.now().isoformat())
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/import-async")
+async def import_apple_health_async(file: UploadFile = File(...)):
+    """Import a large export without holding the HTTP connection open.
+
+    Railway closes a request after 5 minutes with no data transferred, so a
+    full export cannot be imported synchronously. This returns as soon as the
+    upload lands and processes in the background; poll /import-status/{job_id}.
+    """
+    _validate_upload_name(file.filename)
+    tmp_path, bytes_written = await _spool_upload(file)
+
+    job_id = str(uuid.uuid4())[:12]
+    batch_id = str(uuid.uuid4())[:8]
+    _import_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "filename": file.filename,
+        "size_mb": round(bytes_written / (1024 * 1024), 1),
+        "counts": {"saved": 0, "skipped": 0, "duplicates": 0},
+        "created_at": datetime.now().isoformat(),
+    }
+
+    asyncio.create_task(
+        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, file.filename)
+    )
+
+    print(f"[APPLE HEALTH] Queued job {job_id} for {file.filename} "
+          f"({bytes_written / (1024*1024):.1f} MB)")
+
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id,
+        "status": "queued",
+        "size_mb": _import_jobs[job_id]["size_mb"],
+        "status_url": f"/api/apple-health/import-status/{job_id}",
+        "message": "Import beží na pozadí. Stav zistíte na status_url.",
+    })
+
+
+@router.get("/import-status/{job_id}")
+async def import_status(job_id: str):
+    """Progress of a background import."""
+    job = _import_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Neznáme job_id")
+    return job
 
 
 @router.get("/stats")
