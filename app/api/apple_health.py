@@ -594,6 +594,52 @@ async def import_status(job_id: str):
     return job
 
 
+@router.get("/imports")
+async def list_imports():
+    """History of Apple Health imports, newest first.
+
+    Reconstructed from the stored rows rather than the in-memory job list, so
+    it survives restarts and covers imports made before this endpoint existed.
+    """
+    from sqlalchemy import func
+
+    session = get_session()
+    try:
+        rows = (
+            session.query(
+                AppleHealthData.import_batch_id.label('batch_id'),
+                func.count(AppleHealthData.id).label('records'),
+                func.min(AppleHealthData.imported_at).label('imported_at'),
+                func.min(AppleHealthData.start_date).label('period_start'),
+                func.max(AppleHealthData.start_date).label('period_end'),
+            )
+            .group_by(AppleHealthData.import_batch_id)
+            .order_by(func.min(AppleHealthData.imported_at).desc())
+            .all()
+        )
+
+        imports = [
+            {
+                "batch_id": r.batch_id,
+                "records": r.records,
+                "imported_at": r.imported_at.isoformat() if r.imported_at else None,
+                "period": {
+                    "start": r.period_start.isoformat() if r.period_start else None,
+                    "end": r.period_end.isoformat() if r.period_end else None,
+                },
+            }
+            for r in rows
+        ]
+
+        return {
+            "count": len(imports),
+            "total_records": sum(i["records"] for i in imports),
+            "imports": imports,
+        }
+    finally:
+        session.close()
+
+
 @router.get("/stats")
 async def get_apple_health_stats():
     """Získať štatistiky importovaných Apple Health dát"""

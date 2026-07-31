@@ -72,7 +72,9 @@ async def _process_single_file(file: UploadFile) -> dict:
     else:
         # Run blocking Claude API call in a thread so other files can process concurrently
         text_content = await asyncio.to_thread(doc_processor.process_document, file_path)
-        health_data = await asyncio.to_thread(data_extractor.extract_health_metrics, text_content)
+        health_data = await asyncio.to_thread(
+            data_extractor.extract_health_metrics, text_content, file.filename
+        )
 
     return {
         "filename": safe_filename,
@@ -138,16 +140,77 @@ async def download_csv_template():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/history")
+async def upload_history():
+    """History of processed documents, newest first.
+
+    Built from the extracted records rather than the upload directory, which
+    lives on the container filesystem and is wiped on every deploy.
+    """
+    from sqlalchemy import func
+    from app.database import get_session, HealthRecord
+
+    session = get_session()
+    try:
+        rows = (
+            session.query(
+                HealthRecord.source_file.label('filename'),
+                func.count(HealthRecord.id).label('metrics'),
+                func.min(HealthRecord.created_at).label('uploaded_at'),
+                func.min(HealthRecord.record_date).label('period_start'),
+                func.max(HealthRecord.record_date).label('period_end'),
+            )
+            .filter(HealthRecord.source == 'ocr')
+            .filter(HealthRecord.source_file.isnot(None))
+            .group_by(HealthRecord.source_file)
+            .order_by(func.min(HealthRecord.created_at).desc())
+            .all()
+        )
+
+        documents = [
+            {
+                "filename": r.filename,
+                "metrics": r.metrics,
+                "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None,
+                "period": {
+                    "start": r.period_start.isoformat() if r.period_start else None,
+                    "end": r.period_end.isoformat() if r.period_end else None,
+                },
+            }
+            for r in rows
+        ]
+
+        # Records extracted before filenames were stored still count, but cannot
+        # be attributed to a document — report them rather than hiding them.
+        untracked = (
+            session.query(func.count(HealthRecord.id))
+            .filter(HealthRecord.source == 'ocr')
+            .filter(HealthRecord.source_file.is_(None))
+            .scalar()
+        ) or 0
+
+        return {
+            "count": len(documents),
+            "documents": documents,
+            "metrics_without_source": untracked,
+        }
+    finally:
+        session.close()
+
+
 @router.get("/documents")
 async def list_documents():
+    """Files currently on disk. Ephemeral — kept for debugging only."""
     try:
         files = list(settings.RAW_DATA_DIR.glob("*"))
         return {
             "count": len(files),
+            "note": "Container storage is wiped on deploy. Use /api/upload/history instead.",
             "files": [
                 {"name": f.name, "size": f.stat().st_size, "created": f.stat().st_ctime}
                 for f in files if f.is_file()
             ],
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error('Listing documents failed: %s', e)
+        raise HTTPException(status_code=500, detail="Could not list documents")

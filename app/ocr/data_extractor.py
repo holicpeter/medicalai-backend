@@ -11,7 +11,7 @@ class HealthDataExtractor:
     def __init__(self):
         pass
 
-    def extract_health_metrics(self, text: str) -> List[Dict]:
+    def extract_health_metrics(self, text: str, source_file: Optional[str] = None) -> List[Dict]:
         """Parse Claude's JSON response, fall back to regex if needed."""
         metrics = self._parse_json(text)
         if not metrics:
@@ -19,7 +19,7 @@ class HealthDataExtractor:
             metrics = self._regex_extract(text)
 
         logger.info('Found %d health metrics', len(metrics))
-        self._save_extracted_data(metrics)
+        self._save_extracted_data(metrics, source_file)
         return metrics
 
     # ------------------------------------------------------------------ #
@@ -164,7 +164,7 @@ class HealthDataExtractor:
     # Database persistence
     # ------------------------------------------------------------------ #
 
-    def _save_extracted_data(self, metrics: List[Dict]):
+    def _save_extracted_data(self, metrics: List[Dict], source_file: Optional[str] = None):
         if not metrics:
             return
         try:
@@ -190,6 +190,10 @@ class HealthDataExtractor:
                         record_type='lab_test',
                         record_date=record_date,
                         source='ocr',
+                        # Keeping the filename is what makes an upload history
+                        # possible — without it a record cannot be traced back
+                        # to the document it came from.
+                        source_file=source_file,
                         metric_type=metric.get('metric'),
                         value=value_str,
                         unit=metric.get('unit', ''),
