@@ -7,8 +7,7 @@ from pathlib import Path
 import json
 
 from app.config import settings
-from app.database import get_session, HealthRecord, AppleHealthData
-from app.analysis.units import normalize
+from app.analysis.sources import load_all_measurements
 
 logger = logging.getLogger(__name__)
 
@@ -76,73 +75,9 @@ class TrendAnalyzer:
             except Exception as e:
                 logger.warning('Error loading %s: %s', json_file, e)
 
-        # 2. Health records from DB — both OCR-extracted and manually entered
-        try:
-            session = get_session()
-            db_records = (
-                session.query(HealthRecord)
-                .filter(HealthRecord.source.in_(["manual", "ocr"]))
-                .all()
-            )
-            logger.info('Loaded %d health records from database (ocr + manual)', len(db_records))
-            for record in db_records:
-                metric_type = record.metric_type
-                if metric_type == 'pulse':
-                    metric_type = 'heart_rate'
-                # Parse blood-pressure stored as "120/80"
-                value = record.value
-                if value and '/' in str(value):
-                    parts = str(value).split('/')
-                    try:
-                        value = {'systolic': float(parts[0]), 'diastolic': float(parts[1])}
-                    except Exception:
-                        value = _to_float(parts[0])
-                else:
-                    value = _to_float(value)
-                value, unit = normalize(metric_type, value, record.unit)
-                all_metrics.append({
-                    'date': record.record_date,
-                    'metric': metric_type,
-                    'value': value,
-                    'unit': unit,
-                    'source': record.source,
-                })
-            session.close()
-        except Exception as e:
-            logger.warning('Error loading health records from DB: %s', e)
-
-        # 3. Apple Health data
-        try:
-            session = get_session()
-            apple_to_metric_map = {
-                'HKQuantityTypeIdentifierBodyMass': 'weight',
-                'HKQuantityTypeIdentifierHeight': 'height',
-                'HKQuantityTypeIdentifierHeartRate': 'heart_rate',
-                'HKQuantityTypeIdentifierBloodPressureSystolic': 'blood_pressure_systolic',
-                'HKQuantityTypeIdentifierBloodPressureDiastolic': 'blood_pressure_diastolic',
-                'HKQuantityTypeIdentifierBodyMassIndex': 'bmi',
-                'HKQuantityTypeIdentifierBloodGlucose': 'glucose',
-            }
-            apple_records = session.query(AppleHealthData).filter(
-                AppleHealthData.record_type.in_(list(apple_to_metric_map.keys()))
-            ).all()
-            logger.info('Loaded %d Apple Health records', len(apple_records))
-            for record in apple_records:
-                metric_name = apple_to_metric_map.get(record.record_type)
-                if metric_name and record.value is not None:
-                    # Apple Health reports in the phone's regional units, so a
-                    # glucose reading may be mg/dL while the thresholds are SI.
-                    value, unit = normalize(metric_name, float(record.value), record.unit)
-                    all_metrics.append({
-                        'date': record.start_date,
-                        'metric': metric_name,
-                        'value': value,
-                        'unit': unit,
-                        'source': 'apple_health',
-                    })
-            session.close()
-        except Exception as e:
-            logger.warning('Error loading Apple Health records: %s', e)
+        # Every stored source, loaded in one place so this and the dashboard
+        # analyzer can never drift apart on which tables they read.
+        all_metrics.extend(load_all_measurements())
 
         if not all_metrics:
             return pd.DataFrame()

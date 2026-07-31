@@ -5,8 +5,7 @@ from typing import Dict, Optional
 import json
 
 from app.config import settings
-from app.database import get_session, HealthRecord
-from app.analysis.units import normalize
+from app.analysis.sources import load_all_measurements
 
 logger = logging.getLogger(__name__)
 
@@ -37,35 +36,9 @@ class HealthMetricsAnalyzer:
             except Exception as e:
                 logger.warning('Error loading %s: %s', json_file, e)
 
-        # DB health records (ocr + manual)
-        try:
-            session = get_session()
-            db_records = (
-                session.query(HealthRecord)
-                .filter(HealthRecord.source.in_(["manual", "ocr"]))
-                .all()
-            )
-            for record in db_records:
-                value = record.value
-                if value and '/' in str(value):
-                    parts = str(value).split('/')
-                    try:
-                        value = {'systolic': float(parts[0]), 'diastolic': float(parts[1])}
-                    except Exception:
-                        value = _to_float(parts[0])
-                else:
-                    value = _to_float(value)
-                value, unit = normalize(record.metric_type, value, record.unit)
-                all_metrics.append({
-                    'metric': record.metric_type,
-                    'value': value,
-                    'date': record.record_date,
-                    'unit': unit,
-                    'source': record.source,
-                })
-            session.close()
-        except Exception as e:
-            logger.warning('Error loading health records from DB: %s', e)
+        # Every stored source, including Apple Health — which this analyzer
+        # used to skip, so an import left the dashboard reading zero.
+        all_metrics.extend(load_all_measurements())
 
         if not all_metrics:
             return pd.DataFrame()
