@@ -2,7 +2,7 @@
 Apple Health API - Import dát z iPhone Health appky
 Podporuje import z export.xml súboru
 """
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 import asyncio
 import tempfile
@@ -508,6 +508,72 @@ async def import_apple_health_async(file: UploadFile = File(...)):
     )
 
     print(f"[APPLE HEALTH] Queued job {job_id} for {file.filename} "
+          f"({bytes_written / (1024*1024):.1f} MB)")
+
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id,
+        "status": "queued",
+        "size_mb": _import_jobs[job_id]["size_mb"],
+        "status_url": f"/api/apple-health/import-status/{job_id}",
+        "message": "Import beží na pozadí. Stav zistíte na status_url.",
+    })
+
+
+@router.post("/import-raw")
+async def import_apple_health_raw(request: Request, filename: str = "export.xml"):
+    """Import an export sent as the raw request body, with no multipart wrapper.
+
+    Multipart uploads need a form field named exactly `file`; clients that build
+    the request by hand (iOS Shortcuts, curl --data-binary) get a 422 when that
+    name is wrong, which is easy to hit and hard to diagnose. Here the body *is*
+    the file, so there is nothing to name. Processing is identical to
+    /import-async: this returns 202 and the work continues in the background.
+    """
+    _validate_upload_name(filename)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xml') as tmp:
+            tmp_path = Path(tmp.name)
+            bytes_written = 0
+            async for chunk in request.stream():
+                bytes_written += len(chunk)
+                if bytes_written > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Súbor je príliš veľký (limit "
+                            f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."
+                        ),
+                    )
+                tmp.write(chunk)
+
+        if bytes_written == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Telo požiadavky je prázdne — pošlite obsah súboru ako telo požiadavky.",
+            )
+    except HTTPException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+    job_id = str(uuid.uuid4())[:12]
+    batch_id = str(uuid.uuid4())[:8]
+    _import_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "filename": filename,
+        "size_mb": round(bytes_written / (1024 * 1024), 1),
+        "counts": {"saved": 0, "skipped": 0, "duplicates": 0},
+        "created_at": datetime.now().isoformat(),
+    }
+
+    asyncio.create_task(
+        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, filename)
+    )
+
+    print(f"[APPLE HEALTH] Queued raw job {job_id} "
           f"({bytes_written / (1024*1024):.1f} MB)")
 
     return JSONResponse(status_code=202, content={
