@@ -47,9 +47,10 @@ def test_trends_is_empty_mapping():
     assert "error" not in result
 
 
-def test_risks_keep_full_shape():
+def test_risks_keep_full_shape(monkeypatch):
     p = RiskPredictor.__new__(RiskPredictor)
     p.data = pd.DataFrame()
+    monkeypatch.setattr(p, "refresh", lambda: None)
     risks = p.predict_risks()
     for key in ("cardiovascular", "diabetes", "metabolic_syndrome",
                 "overall_risk_score", "high_risk_conditions"):
