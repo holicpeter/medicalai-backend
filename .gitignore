@@ -33,3 +33,7 @@ Thumbs.db
 
 # Railway
 .railway/
+
+# Watcher runtime state — machine-specific, not source
+processed_files.txt
+scripts/processed_files.txt
