@@ -16,6 +16,18 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = _DEFAULT_SECRET_KEY
 
+    # Shared secret with the Cloudflare Worker that fronts this API.
+    #
+    # Cloudflare Access guards medicalai.peterholic.com, but this Railway
+    # hostname is public and Access never sees a request sent straight to it.
+    # When this is set, only requests carrying it in X-Proxy-Secret are served,
+    # which makes the Worker the sole route in.
+    #
+    # Empty means the check is off. That default is deliberate: the code can be
+    # deployed before the variable exists without locking anyone out, and
+    # clearing the variable is the way back in if the Worker ever breaks.
+    PROXY_SHARED_SECRET: str = ""
+
     # CORS — override via ALLOWED_ORIGINS env var (JSON array or comma-separated)
     ALLOWED_ORIGINS: List[str] = [
         "https://medicalai.peterholic.com",
@@ -57,6 +69,14 @@ settings = Settings()
 
 if settings.SECRET_KEY == _DEFAULT_SECRET_KEY:
     logger.warning('SECRET_KEY is set to the insecure default — set SECRET_KEY in your .env file')
+
+if settings.PROXY_SHARED_SECRET:
+    logger.info('Proxy shared secret loaded — direct requests will be rejected')
+else:
+    logger.warning(
+        'PROXY_SHARED_SECRET is not set — this API is reachable by anyone who '
+        'knows its hostname'
+    )
 
 if settings.ANTHROPIC_API_KEY:
     logger.info('Claude API key loaded')
