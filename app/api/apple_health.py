@@ -1,12 +1,14 @@
 """
 Apple Health API - Import dát z iPhone Health appky
-Podporuje import z export.xml súboru
+Podporuje import z export.xml, export.xml.gz a export.zip
 """
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 import asyncio
 import tempfile
 import xml.etree.ElementTree as ET
+import zipfile
+import zlib
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uuid
@@ -15,6 +17,11 @@ from pathlib import Path
 # A full Apple Health export runs to hundreds of MB; cap it rather than let an
 # oversized upload fill the container's disk.
 _MAX_UPLOAD_BYTES = 600 * 1024 * 1024
+# The export is highly repetitive text and compresses about 27x, so a gzip or
+# zip upload well inside the cap above can still expand past the disk. This is
+# the ceiling on what gets written, and it is what makes accepting an archive
+# from an unauthenticated endpoint safe.
+_MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 # Background import jobs, keyed by job id. In-process only: if the container
@@ -313,17 +320,33 @@ def _stream_import(xml_path, batch_id: str, progress=None):
         session.close()
 
 
-def _validate_upload_name(filename: str):
-    if not (filename or '').lower().endswith('.xml'):
+def _validate_upload_name(filename: str) -> str:
+    """Check the name and return which format the bytes are in.
+
+    Returns 'xml', 'gzip' or 'zip'.
+    """
+    name = (filename or '').lower()
+
+    if name.endswith('.zip'):
+        fmt = 'zip'
+    elif name.endswith('.gz') or name.endswith('.gzip'):
+        fmt = 'gzip'
+    elif name.endswith('.xml'):
+        fmt = 'xml'
+    else:
         raise HTTPException(
             status_code=400,
-            detail="Neplatný súbor. Musí mať príponu .xml (napr. export.xml, export_small.xml)"
+            detail=(
+                "Neplatný súbor. Podporované sú .xml, .xml.gz a .zip "
+                "(napr. export.xml, export.xml.gz, export.zip)."
+            ),
         )
 
     # export.zip contains two XML files. export_cda.xml is a Clinical Document
     # Architecture file with no <Record> elements, so importing it always
     # yields nothing — say so instead of reporting a successful empty import.
-    if 'cda' in Path(filename).stem.lower():
+    # A .zip is exempt: the member is chosen inside the archive, not by this name.
+    if fmt != 'zip' and 'cda' in Path(name).stem.lower():
         raise HTTPException(
             status_code=400,
             detail=(
@@ -333,29 +356,150 @@ def _validate_upload_name(filename: str):
             ),
         )
 
+    return fmt
+
+
+def _too_large(limit: int) -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail=f"Súbor je príliš veľký (limit {limit // (1024 * 1024)} MB).",
+    )
+
+
+def _pick_zip_member(archive: 'zipfile.ZipFile') -> 'zipfile.ZipInfo':
+    """Find the measurements XML inside an Apple Health export.zip.
+
+    The archive holds apple_health_export/export.xml alongside export_cda.xml
+    and a workout-routes/ folder full of GPX, so the member cannot just be the
+    first entry.
+    """
+    candidates = [
+        info for info in archive.infolist()
+        if not info.is_dir()
+        and info.filename.lower().endswith('.xml')
+        and 'cda' not in Path(info.filename).stem.lower()
+    ]
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "V archíve nie je žiadny export.xml. Nahrajte prosím export.zip "
+                "z Health appky, alebo priamo export.xml."
+            ),
+        )
+    # Prefer the canonical name; otherwise the biggest XML is the measurements one.
+    for info in candidates:
+        if Path(info.filename).name.lower() == 'export.xml':
+            return info
+    return max(candidates, key=lambda i: i.file_size)
+
+
+def _extract_zip_member(zip_path: Path) -> Path:
+    """Unpack the measurements XML out of a spooled archive into its own file."""
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            member = _pick_zip_member(archive)
+            # See _spool_stream: close before unlinking, or Windows refuses.
+            dst = tempfile.NamedTemporaryFile(delete=False, suffix='.xml')
+            xml_path = Path(dst.name)
+            try:
+                try:
+                    with archive.open(member) as src:
+                        written = 0
+                        while chunk := src.read(_UPLOAD_CHUNK_SIZE):
+                            written += len(chunk)
+                            if written > _MAX_DECOMPRESSED_BYTES:
+                                raise _too_large(_MAX_DECOMPRESSED_BYTES)
+                            dst.write(chunk)
+                finally:
+                    dst.close()
+            except BaseException:
+                xml_path.unlink(missing_ok=True)
+                raise
+    except zipfile.BadZipFile:
+        raise HTTPException(
+            status_code=400,
+            detail="Súbor sa nedá rozbaliť — nie je to platný .zip archív.",
+        )
+    return xml_path
+
+
+async def _spool_stream(chunks, fmt: str) -> tuple[Path, int]:
+    """Spool an upload to a temp .xml file, decompressing on the way.
+
+    Returns the path to plain XML and how many bytes came over the wire, which
+    for a compressed upload is much less than the file written.
+
+    Both sizes are capped. The received cap protects the network path; the
+    decompressed cap is what stops a small archive from filling the container's
+    disk as it expands.
+
+    `chunks` is any async iterable of bytes, so a multipart UploadFile and a raw
+    request body go through the same path.
+    """
+    # zip needs its central directory, which sits at the end of the file, so it
+    # cannot be decoded from a forward-only stream — spool it, then extract.
+    suffix = '.zip' if fmt == 'zip' else '.xml'
+    decompressor = (
+        zlib.decompressobj(16 + zlib.MAX_WBITS) if fmt == 'gzip' else None
+    )
+
+    # Not a `with`: on Windows an open file cannot be unlinked, so every error
+    # path has to close the handle before cleaning up or the 4xx we meant to
+    # raise surfaces as a 500.
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = Path(tmp.name)
+    bytes_received = 0
+    bytes_written = 0
+    try:
+        try:
+            async for chunk in chunks:
+                bytes_received += len(chunk)
+                if bytes_received > _MAX_UPLOAD_BYTES:
+                    raise _too_large(_MAX_UPLOAD_BYTES)
+
+                data = decompressor.decompress(chunk) if decompressor else chunk
+                bytes_written += len(data)
+                if bytes_written > _MAX_DECOMPRESSED_BYTES:
+                    raise _too_large(_MAX_DECOMPRESSED_BYTES)
+                tmp.write(data)
+
+            if decompressor:
+                tmp.write(decompressor.flush())
+        finally:
+            tmp.close()
+    except zlib.error:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Súbor sa nedá rozbaliť — nie je to platný gzip. Skontrolujte, "
+                "či prípona .gz zodpovedá obsahu."
+            ),
+        )
+    except HTTPException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    if fmt == 'zip':
+        try:
+            xml_path = _extract_zip_member(tmp_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return xml_path, bytes_received
+
+    return tmp_path, bytes_received
+
+
+async def _iter_upload(file: UploadFile):
+    while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
+        yield chunk
+
 
 async def _spool_upload(file: UploadFile) -> tuple[Path, int]:
-    """Stream the upload to a temp file in chunks.
-
-    A full export is hundreds of MB; reading it into memory would exhaust the
-    container.
-    """
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.xml') as tmp:
-        tmp_path = Path(tmp.name)
-        bytes_written = 0
-        while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
-            bytes_written += len(chunk)
-            if bytes_written > _MAX_UPLOAD_BYTES:
-                tmp_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Súbor je príliš veľký (limit "
-                        f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."
-                    ),
-                )
-            tmp.write(chunk)
-    return tmp_path, bytes_written
+    """Stream a multipart upload to a temp XML file, decompressing if needed."""
+    fmt = _validate_upload_name(file.filename)
+    return await _spool_stream(_iter_upload(file), fmt)
 
 
 @router.post("/import")
@@ -369,7 +513,6 @@ async def import_apple_health_data(file: UploadFile = File(...)):
     """
     tmp_path = None
     try:
-        _validate_upload_name(file.filename)
         tmp_path, bytes_written = await _spool_upload(file)
 
         print(f"[APPLE HEALTH] Received {bytes_written / (1024*1024):.1f} MB, parsing {file.filename}...")
@@ -489,7 +632,6 @@ async def import_apple_health_async(file: UploadFile = File(...)):
     full export cannot be imported synchronously. This returns as soon as the
     upload lands and processes in the background; poll /import-status/{job_id}.
     """
-    _validate_upload_name(file.filename)
     tmp_path, bytes_written = await _spool_upload(file)
 
     job_id = str(uuid.uuid4())[:12]
@@ -529,34 +671,16 @@ async def import_apple_health_raw(request: Request, filename: str = "export.xml"
     the file, so there is nothing to name. Processing is identical to
     /import-async: this returns 202 and the work continues in the background.
     """
-    _validate_upload_name(filename)
+    fmt = _validate_upload_name(filename)
 
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xml') as tmp:
-            tmp_path = Path(tmp.name)
-            bytes_written = 0
-            async for chunk in request.stream():
-                bytes_written += len(chunk)
-                if bytes_written > _MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"Súbor je príliš veľký (limit "
-                            f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)."
-                        ),
-                    )
-                tmp.write(chunk)
+    tmp_path, bytes_written = await _spool_stream(request.stream(), fmt)
 
-        if bytes_written == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Telo požiadavky je prázdne — pošlite obsah súboru ako telo požiadavky.",
-            )
-    except HTTPException:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-        raise
+    if bytes_written == 0:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail="Telo požiadavky je prázdne — pošlite obsah súboru ako telo požiadavky.",
+        )
 
     job_id = str(uuid.uuid4())[:12]
     batch_id = str(uuid.uuid4())[:8]
