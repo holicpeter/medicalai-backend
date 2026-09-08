@@ -19,6 +19,14 @@ except Exception as e:
     get_calendar_connector = None  # type: ignore
     CALENDAR_AVAILABLE = False
 
+try:
+    from app.integrations.withings_connector import get_withings_connector
+    WITHINGS_AVAILABLE = True
+except Exception as e:
+    print(f"[INTEGRATIONS] Withings connector not available: {e}")
+    get_withings_connector = None  # type: ignore
+    WITHINGS_AVAILABLE = False
+
 router = APIRouter(prefix="/api/integrations", tags=["integrations"])
 
 
@@ -108,6 +116,119 @@ async def sync_garmin_data(request: SyncRequest, background_tasks: BackgroundTas
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
+# WITHINGS — ScanWatch 2 + Body Scan
+# =====================================================================
+
+def _require_withings():
+    if not WITHINGS_AVAILABLE or get_withings_connector is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Withings integrácia nie je dostupná (chýba balík alebo závislosti).",
+        )
+    connector = get_withings_connector()
+    if not connector.is_authenticated:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated. Please authenticate first.",
+        )
+    return connector
+
+
+@router.get("/withings/auth")
+async def authenticate_withings():
+    """
+    Vráti URL, na ktorú treba používateľa presmerovať (OAuth2 consent screen)
+    """
+    if not WITHINGS_AVAILABLE or get_withings_connector is None:
+        raise HTTPException(status_code=503, detail="Withings integrácia nie je dostupná.")
+    connector = get_withings_connector()
+    return {
+        "authorize_url": connector.get_authorize_url(),
+        "authenticated": connector.is_authenticated,
+    }
+
+
+@router.get("/withings/callback")
+async def withings_callback(code: str, state: str = ""):
+    """
+    OAuth callback. Code expiruje za 30 sekúnd, preto sa vymieňa synchrónne.
+    """
+    if not WITHINGS_AVAILABLE or get_withings_connector is None:
+        raise HTTPException(status_code=503, detail="Withings integrácia nie je dostupná.")
+    connector = get_withings_connector()
+    if not await connector.exchange_code(code):
+        raise HTTPException(status_code=401, detail="Authentication failed")
+    return {"success": True, "message": "Successfully authenticated to Withings"}
+
+
+@router.get("/withings/sleep")
+async def get_withings_sleep(days: int = 30):
+    """
+    Spánok z hodiniek — fázy, prebúdzania, tep, dychové poruchy
+    """
+    try:
+        return {"sleep": await _require_withings().get_sleep(days)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/withings/activity")
+async def get_withings_activity(days: int = 30):
+    """
+    Denná aktivita — kroky, vzdialenosť, poschodia, pásma tepu
+    """
+    try:
+        return {"activity": await _require_withings().get_activity(days)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/withings/measures")
+async def get_withings_measures(days: int = 30):
+    """
+    Merania — tep, SpO2, teplota, VO2max, EKG intervaly
+    """
+    try:
+        return {"measures": await _require_withings().get_measures(days)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/withings/ecg")
+async def get_withings_ecg(with_signal: bool = False):
+    """
+    EKG záznamy. with_signal=true stiahne aj surové krivky
+    (9000 vzoriek na záznam, ~29 KB) — nepoužívaj pri každom načítaní stránky.
+    """
+    try:
+        return {"ecg": await _require_withings().get_ecg(with_signal)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/withings/sync")
+async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundTasks):
+    """
+    Synchronizovať historické dáta z Withings (na pozadí)
+    """
+    _require_withings()
+    background_tasks.add_task(sync_withings_background, request.days)
+    return {
+        "success": True,
+        "message": f"Sync started for last {request.days} days",
+        "status": "processing",
+    }
 
 
 @router.get("/calendar/auth")
@@ -221,6 +342,33 @@ async def sync_garmin_background(days: int):
     
     except Exception as e:
         print(f"[GARMIN ERROR] Background sync failed: {e}")
+
+
+async def sync_withings_background(days: int):
+    """Background task pre synchronizáciu Withings dát"""
+    try:
+        if not WITHINGS_AVAILABLE or get_withings_connector is None:
+            print("[WITHINGS] Sync skipped: Withings integrácia nie je dostupná.")
+            return
+        connector = get_withings_connector()
+        data = await connector.get_historical_data(days)
+
+        from pathlib import Path
+        import json
+
+        data_dir = Path("data/withings")
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"withings_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = data_dir / filename
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        print(f"[WITHINGS] Sync completed. Saved to {filepath}")
+
+    except Exception as e:
+        print(f"[WITHINGS ERROR] Background sync failed: {e}")
 
 
 def _analyze_health_event_correlations(
