@@ -15,7 +15,7 @@ Setup:
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
@@ -56,6 +56,19 @@ MEASTYPES = {
 
 # Čo produkuje ScanWatch 2 (bez váhy a bioimpedancie)
 WATCH_MEASTYPES = [11, 12, 54, 71, 73, 91, 123, 135, 136, 137, 138, 139]
+
+
+
+def _iso(epoch) -> str:
+    """
+    Epoch -> ISO 8601 s explicitným UTC offsetom.
+
+    `datetime.fromtimestamp(x)` bez tz berie časovú zónu servera. Na Railway je
+    to UTC a výsledok nemá žiadne označenie zóny, takže sa tvári ako lokálny
+    čas. Noc, ktorá v Health Mate začala 23:47 SELČ, by sa potom zobrazila ako
+    21:47. Frontend si offset prepočíta sám, ale musí ho dostať.
+    """
+    return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
 
 
 class WithingsConnector:
@@ -202,7 +215,7 @@ class WithingsConnector:
 
         out: List[Dict] = []
         for grp in body.get("measuregrps", []):
-            ts = datetime.fromtimestamp(grp["date"]).isoformat()
+            ts = _iso(grp["date"])
             for m in grp.get("measures", []):
                 mapping = MEASTYPES.get(m["type"])
                 if not mapping:
@@ -242,9 +255,11 @@ class WithingsConnector:
             deep = d.get("deepsleepduration") or 0
             rem = d.get("remsleepduration") or 0
             out.append({
-                "date": datetime.fromtimestamp(s["startdate"]).strftime("%Y-%m-%d"),
-                "from": datetime.fromtimestamp(s["startdate"]).isoformat(),
-                "to": datetime.fromtimestamp(s["enddate"]).isoformat(),
+                "date": datetime.fromtimestamp(
+                    s["startdate"], tz=timezone.utc
+                ).strftime("%Y-%m-%d"),
+                "from": _iso(s["startdate"]),
+                "to": _iso(s["enddate"]),
                 "total_sleep_seconds": d.get("total_sleep_time") or (light + deep + rem),
                 "light_seconds": light,
                 "deep_seconds": deep,
@@ -280,13 +295,16 @@ class WithingsConnector:
             "elevation_m": a.get("elevation"),
             "calories_active": a.get("calories"),
             "calories_total": a.get("totalcalories"),
-            "minutes_soft": a.get("soft"),
-            "minutes_moderate": a.get("moderate"),
-            "minutes_intense": a.get("intense"),
+            # POZOR: soft/moderate/intense chodia zo Withings v SEKUNDÁCH,
+            # nie v minútach. 11237 nie je 187 hodín, ale 3 h 7 min.
+            "seconds_soft": a.get("soft"),
+            "seconds_moderate": a.get("moderate"),
+            "seconds_intense": a.get("intense"),
             "hr_average": a.get("hr_average"),
             "hr_min": a.get("hr_min"),
             "hr_max": a.get("hr_max"),
-            "hr_zones": [a.get(f"hr_zone_{i}") for i in range(4)],
+            # Rovnako sekundy strávené v jednotlivých pásmach tepu.
+            "hr_zone_seconds": [a.get(f"hr_zone_{i}") for i in range(4)],
         } for a in body.get("activities", [])]
 
     async def get_ecg(self, with_signal: bool = False) -> List[Dict]:
@@ -306,7 +324,7 @@ class WithingsConnector:
         for rec in body.get("series", []):
             ecg = rec.get("ecg") or {}
             item = {
-                "recorded_at": datetime.fromtimestamp(rec["timestamp"]).isoformat(),
+                "recorded_at": _iso(rec["timestamp"]),
                 "signal_id": ecg.get("signalid"),
                 "afib_classification": ecg.get("afib"),
                 "heart_rate": rec.get("heart_rate"),
