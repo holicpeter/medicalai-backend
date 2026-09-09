@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     # Mistral API
     MISTRAL_API_KEY: str = ""
 
+    # Withings API (ScanWatch 2 + Body Scan)
+    #
+    # WITHINGS_REDIRECT_URI must match the Callback URL registered at
+    # developer.withings.com character for character, or the token exchange
+    # fails with a status the HTTP layer reports as 200.
+    WITHINGS_CLIENT_ID: str = ""
+    WITHINGS_CLIENT_SECRET: str = ""
+    WITHINGS_REDIRECT_URI: str = ""
+
     # OCR Settings
     TESSERACT_LANG: str = "slk"
 
@@ -63,6 +72,11 @@ class Settings(BaseSettings):
         env_file = str(Path(__file__).parent.parent / ".env")
         case_sensitive = True
         env_file_encoding = 'utf-8'
+        # An env var that no field here declares must not take the whole app
+        # down at import time. Without this, adding a variable in Railway
+        # before the matching field exists crashes every deploy — Settings()
+        # runs at module import, so FastAPI never starts.
+        extra = "ignore"
 
 
 settings = Settings()
@@ -87,6 +101,11 @@ if settings.MISTRAL_API_KEY:
     logger.info('Mistral API key loaded')
 else:
     logger.warning('MISTRAL_API_KEY not found in .env file')
+
+if settings.WITHINGS_CLIENT_ID and settings.WITHINGS_CLIENT_SECRET:
+    logger.info('Withings credentials loaded')
+else:
+    logger.warning('WITHINGS_CLIENT_ID / WITHINGS_CLIENT_SECRET not set — Withings sync disabled')
 
 # Ensure directories exist
 settings.RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
