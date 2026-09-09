@@ -151,13 +151,23 @@ async def authenticate_withings():
     }
 
 
-@router.get("/withings/callback")
-async def withings_callback(code: str, state: str = ""):
+@router.api_route("/withings/callback", methods=["GET", "HEAD", "POST"])
+async def withings_callback(code: Optional[str] = None, state: str = ""):
     """
     OAuth callback. Code expiruje za 30 sekúnd, preto sa vymieňa synchrónne.
+
+    Prijíma GET, HEAD aj POST, a bez `code` vracia 200. Dôvod: Withings si pri
+    registrácii Callback URL sám overuje, či je adresa dostupná — pošle na ňu
+    request bez parametrov a čaká 200. Keď dostane 405 alebo 422, URL odmietne
+    zaregistrovať a autorizácia potom padá na redirect_uri_mismatch.
     """
     if not WITHINGS_AVAILABLE or get_withings_connector is None:
         raise HTTPException(status_code=503, detail="Withings integrácia nie je dostupná.")
+
+    if not code:
+        # Overovací request od Withings, nie skutočný callback.
+        return {"status": "ready", "message": "Withings callback endpoint is reachable"}
+
     connector = get_withings_connector()
     if not await connector.exchange_code(code):
         raise HTTPException(status_code=401, detail="Authentication failed")
