@@ -4,6 +4,11 @@ Both analyzers need the same rows in the same shape. They used to build that
 separately, and the two implementations drifted: the trend analyzer read Apple
 Health data while the dashboard analyzer did not, so an Apple Health import
 showed up in trends but left the dashboard reading zero.
+
+Withings is stored in health_records the same way manual and OCR entries are,
+written by app.integrations.withings_sync. It deliberately does not get its own
+loader: a third loader is a third thing to forget, which is exactly how the
+Apple Health drift happened.
 """
 import logging
 from typing import Dict, List
@@ -13,9 +18,17 @@ from app.database import get_session, HealthRecord, AppleHealthData
 
 logger = logging.getLogger(__name__)
 
+# Sources stored in health_records. Withings arrives as one row per metric per
+# day; manual and OCR entries are whatever the user or a report provided.
+HEALTH_RECORD_SOURCES = ["manual", "ocr", "withings"]
+
 # Apple Health identifiers that map onto the metrics the app interprets.
 # Types outside this map (step counts, distances, …) are handled by the
 # activity endpoints instead.
+#
+# Metric names here are shared with MEASURE_TO_METRIC in
+# app/integrations/withings_sync.py. Renaming one without the other splits a
+# single quantity into two separate trend lines.
 APPLE_TO_METRIC = {
     'HKQuantityTypeIdentifierBodyMass': 'weight',
     'HKQuantityTypeIdentifierHeight': 'height',
@@ -51,15 +64,16 @@ def _parse_value(raw):
 
 
 def load_health_records() -> List[Dict]:
-    """Manually entered and OCR-extracted records."""
+    """Manually entered, OCR-extracted and Withings records."""
     metrics = []
     session = get_session()
     try:
         records = (
             session.query(HealthRecord)
-            .filter(HealthRecord.source.in_(["manual", "ocr"]))
+            .filter(HealthRecord.source.in_(HEALTH_RECORD_SOURCES))
             .all()
         )
+        by_source: Dict[str, int] = {}
         for record in records:
             metric_type = 'heart_rate' if record.metric_type == 'pulse' else record.metric_type
             value, unit = normalize(metric_type, _parse_value(record.value), record.unit)
@@ -70,7 +84,12 @@ def load_health_records() -> List[Dict]:
                 'unit': unit,
                 'source': record.source,
             })
-        logger.info('Loaded %d health records from database (ocr + manual)', len(records))
+            by_source[record.source] = by_source.get(record.source, 0) + 1
+        logger.info(
+            'Loaded %d health records from database (%s)',
+            len(records),
+            ', '.join(f'{k}: {v}' for k, v in sorted(by_source.items())) or 'none',
+        )
     except Exception as e:
         logger.warning('Error loading health records from DB: %s', e)
     finally:
