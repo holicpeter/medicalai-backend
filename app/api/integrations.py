@@ -243,6 +243,28 @@ async def get_withings_ecg(with_signal: bool = False):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/withings/sync-db")
+async def sync_withings_to_database(days: int = 30, hrv_nights: int = 14):
+    """
+    Zapíše Withings dáta do kanonickej tabuľky health_records.
+
+    Bez tohto kroku Withings vidí len stránka Withings Watch. Chat, Trendy,
+    Riziká a modely čítajú výhradne cez app.analysis.sources, teda z databázy.
+
+    Idempotentné — opakované spustenie riadky prepíše, nezduplikuje.
+    Beží synchrónne, aby si videl výsledok; pri 30 dňoch to trvá pár sekúnd
+    (HRV sa ťahá po nociach).
+    """
+    _require_withings()
+    try:
+        from app.integrations.withings_sync import sync_withings_to_db
+        return await sync_withings_to_db(days=days, hrv_nights=hrv_nights)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/withings/sync")
 async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundTasks):
     """
