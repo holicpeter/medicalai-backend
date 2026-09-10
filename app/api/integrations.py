@@ -213,6 +213,22 @@ async def get_withings_measures(days: int = 30):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/withings/hrv")
+async def get_withings_hrv(nights: int = 14):
+    """
+    Variabilita srdcovej frekvencie zo spánku (rmssd, sdnn_1).
+
+    Pomalšie než ostatné endpointy - jedna noc je jeden request na Withings,
+    lebo /v2/sleep s action=get má obmedzené časové okno.
+    """
+    try:
+        return {"hrv": await _require_withings().get_sleep_hrv(nights)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/withings/ecg")
 async def get_withings_ecg(with_signal: bool = False):
     """
