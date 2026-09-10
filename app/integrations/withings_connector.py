@@ -12,6 +12,7 @@ Setup:
     WITHINGS_CLIENT_SECRET=...
     WITHINGS_REDIRECT_URI=http://localhost:3000/api/auth/callback/withings
 """
+import asyncio
 import json
 import os
 import time
@@ -79,6 +80,10 @@ class WithingsConnector:
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._expires_at: float = 0
+        # Bez zámku sa paralelné requesty pokúsia obnoviť token naraz tým istým
+        # refresh tokenom. Withings druhý pokus odmietne so statusom 601
+        # ("Same arguments in less than 10 seconds") a requesty spadnú na 500.
+        self._refresh_lock = asyncio.Lock()
         self._load_tokens()
 
     # ------------------------------------------------------------------
@@ -169,10 +174,25 @@ class WithingsConnector:
     # HTTP
     # ------------------------------------------------------------------
 
+    async def _refresh_locked(self, stale_token: Optional[str]) -> bool:
+        """
+        Obnoví token, ale len ak ho medzitým neobnovil niekto iný.
+
+        Stránka volá /sleep, /activity, /measures a /ecg naraz. Keby každý
+        z nich spustil vlastný refresh, Withings by tri z nich odmietol -
+        refresh token totiž pri každom použití rotuje.
+        """
+        async with self._refresh_lock:
+            if self._access_token and self._access_token != stale_token:
+                return True  # obnovil ho iný request, kým sme čakali
+            return await self._refresh()
+
     async def _call(self, path: str, action: str, **params) -> Dict[str, Any]:
-        if not self._access_token or time.time() >= self._expires_at:
-            if not await self._refresh():
+        token = self._access_token
+        if not token or time.time() >= self._expires_at:
+            if not await self._refresh_locked(token):
                 raise RuntimeError("Withings: token vypršal, treba znovu autorizovať")
+            token = self._access_token
 
         payload = {"action": action,
                    **{k: v for k, v in params.items() if v is not None}}
@@ -181,7 +201,7 @@ class WithingsConnector:
             resp = await client.post(
                 f"{API_BASE}{path}",
                 data=payload,
-                headers={"Authorization": f"Bearer {self._access_token}"},
+                headers={"Authorization": f"Bearer {token}"},
             )
 
         body = resp.json()
@@ -189,7 +209,7 @@ class WithingsConnector:
 
         # Withings vracia HTTP 200 aj pri chybe - status je v tele odpovede
         if status == 401:
-            if await self._refresh():
+            if await self._refresh_locked(token):
                 return await self._call(path, action, **params)
             raise RuntimeError("Withings: neplatný token")
 
