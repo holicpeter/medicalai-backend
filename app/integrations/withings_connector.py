@@ -22,12 +22,52 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 import httpx
+from sqlalchemy import create_engine, text
 
 API_BASE = "https://wbsapi.withings.net"
 ACCOUNT_BASE = "https://account.withings.com"
 
 DATA_DIR = Path("data/withings")
+# Súbor zostáva ako záloha pre lokálny beh bez databázy. Na Railway je
+# filesystem efemérny - pri každom deployi sa zmaže a autorizácia padne.
 TOKEN_FILE = DATA_DIR / "tokens.json"
+
+DB_URL = os.environ.get("DATABASE_URL", "")
+
+_TOKEN_DDL = """
+CREATE TABLE IF NOT EXISTS withings_tokens (
+    id               integer PRIMARY KEY,
+    withings_user_id bigint,
+    access_token     text NOT NULL,
+    refresh_token    text NOT NULL,
+    expires_at       double precision NOT NULL,
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT withings_tokens_single_row CHECK (id = 1)
+)
+"""
+
+_engine = None
+
+
+def _db():
+    """
+    Engine pre uloženie tokenov, alebo None keď DATABASE_URL nie je nastavená.
+
+    Tabuľku vytvárame lenivo pri prvom použití - je to jedna tabuľka s jedným
+    riadkom a takto netreba samostatnú migráciu.
+    """
+    global _engine
+    if not DB_URL:
+        return None
+    if _engine is None:
+        # Railway niekedy dáva starý prefix postgres://, ktorý SQLAlchemy 2.0
+        # už neakceptuje.
+        url = DB_URL.replace("postgres://", "postgresql://", 1)
+        eng = create_engine(url, pool_pre_ping=True, future=True)
+        with eng.begin() as conn:
+            conn.execute(text(_TOKEN_DDL))
+        _engine = eng
+    return _engine
 
 # meastype kódy. Hodnota v API = value * 10^unit
 MEASTYPES = {
@@ -146,6 +186,24 @@ class WithingsConnector:
         return True
 
     def _load_tokens(self) -> None:
+        """Najprv databáza, potom súbor. Súborová vetva slúži aj na migráciu."""
+        engine = _db()
+        if engine is not None:
+            try:
+                with engine.begin() as conn:
+                    row = conn.execute(text(
+                        "SELECT access_token, refresh_token, expires_at "
+                        "FROM withings_tokens WHERE id = 1"
+                    )).first()
+                if row:
+                    self._access_token = row[0]
+                    self._refresh_token = row[1]
+                    self._expires_at = float(row[2])
+                    print("[WITHINGS] Tokeny načítané z databázy")
+                    return
+            except Exception as e:
+                print(f"[WITHINGS] Tokeny sa nepodarilo načítať z DB: {e}")
+
         if not TOKEN_FILE.exists():
             return
         try:
@@ -153,10 +211,44 @@ class WithingsConnector:
             self._access_token = data.get("access_token")
             self._refresh_token = data.get("refresh_token")
             self._expires_at = data.get("expires_at", 0)
+            print("[WITHINGS] Tokeny načítané zo súboru")
+            if engine is not None and self._refresh_token:
+                # Prenesieme starý súborový token do DB, nech netreba
+                # autorizovať znova.
+                self._save_tokens(data.get("userid"))
         except Exception as e:
             print(f"[WITHINGS] Tokeny sa nepodarilo načítať: {e}")
 
     def _save_tokens(self, userid: Optional[int] = None) -> None:
+        engine = _db()
+        if engine is not None:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO withings_tokens
+                            (id, withings_user_id, access_token, refresh_token,
+                             expires_at, updated_at)
+                        VALUES (1, :uid, :at, :rt, :exp, now())
+                        ON CONFLICT (id) DO UPDATE SET
+                            withings_user_id = COALESCE(
+                                EXCLUDED.withings_user_id,
+                                withings_tokens.withings_user_id
+                            ),
+                            access_token  = EXCLUDED.access_token,
+                            refresh_token = EXCLUDED.refresh_token,
+                            expires_at    = EXCLUDED.expires_at,
+                            updated_at    = now()
+                    """), {
+                        "uid": userid,
+                        "at": self._access_token,
+                        "rt": self._refresh_token,
+                        "exp": self._expires_at,
+                    })
+                return
+            except Exception as e:
+                # Pád zápisu do DB nesmie zhodiť autorizáciu - spadneme na súbor.
+                print(f"[WITHINGS] Tokeny sa nepodarilo uložiť do DB: {e}")
+
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         TOKEN_FILE.write_text(json.dumps({
             "access_token": self._access_token,
