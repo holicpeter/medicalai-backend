@@ -427,22 +427,37 @@ class WithingsConnector:
                 print(f"[WITHINGS] HRV pre noc {night['startdate']} zlyhalo: {e}")
                 continue
 
-            buckets: Dict[str, List[float]] = {
-                "hr": [], "rr": [], "sdnn_1": [], "rmssd": [], "mvt_score": [],
+            # Kľúčom je časová značka, nie poradie. Withings vracia noc
+            # rozdelenú na segmenty, ktoré sa vedia časovo prekrývať - bez
+            # deduplikácie by sa tá istá minúta započítala viackrát a počet
+            # vzoriek by prekročil dĺžku noci.
+            by_ts: Dict[str, Dict[int, float]] = {
+                "hr": {}, "rr": {}, "sdnn_1": {}, "rmssd": {}, "mvt_score": {},
             }
-            rmssd_series: List[List[float]] = []
 
             for seg in body.get("series", []):
-                for field in buckets:
+                for field in by_ts:
                     raw = seg.get(field)
                     if not isinstance(raw, dict):
                         continue
                     for ts, val in raw.items():
                         if val is None:
                             continue
-                        buckets[field].append(float(val))
-                        if field == "rmssd":
-                            rmssd_series.append([int(ts), float(val)])
+                        value = float(val)
+                        # Nulová variabilita je fyziologicky nemožná - sú to
+                        # artefakty z momentov bez dobrého kontaktu so zápästím.
+                        # Ak by sme ich nechali, ťahali by priemer nadol.
+                        if field in ("sdnn_1", "rmssd") and value <= 0:
+                            continue
+                        by_ts[field][int(ts)] = value
+
+            buckets: Dict[str, List[float]] = {
+                k: list(v.values()) for k, v in by_ts.items()
+            }
+            rmssd_series: List[List[float]] = sorted(
+                ([ts, val] for ts, val in by_ts["rmssd"].items()),
+                key=lambda x: x[0],
+            )
 
             if not buckets["rmssd"] and not buckets["sdnn_1"]:
                 continue
@@ -454,7 +469,6 @@ class WithingsConnector:
                 "max": round(max(v), 1) if v else None,
             }
 
-            rmssd_series.sort(key=lambda x: x[0])
             out.append({
                 "date": datetime.fromtimestamp(
                     night["startdate"], tz=timezone.utc
