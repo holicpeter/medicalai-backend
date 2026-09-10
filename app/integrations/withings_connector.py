@@ -15,6 +15,7 @@ Setup:
 import asyncio
 import json
 import os
+import statistics
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -390,6 +391,89 @@ class WithingsConnector:
             })
         return out
 
+    async def get_sleep_hrv(self, nights: int = 14) -> List[Dict]:
+        """
+        Variabilita srdcovej frekvencie a minútové rady zo spánku.
+
+        Pozor: toto NIE JE getsummary, ktorý dáva jedno číslo za noc. Endpoint
+        /v2/sleep s action=get vracia hodnoty po minútach - rmssd, sdnn_1,
+        tep, dychovú frekvenciu a skóre pohybu v posteli.
+
+        rmssd  = druhá odmocnina priemeru štvorcov rozdielov po sebe idúcich
+                 NN intervalov, počítané cez niekoľko sekúnd
+        sdnn_1 = smerodajná odchýlka NN intervalov za jednu minútu
+
+        Volá sa po jednej noci, lebo endpoint má obmedzené časové okno. Pri
+        14 nociach je to 14 requestov - limit 120/min platí pre celú aplikáciu,
+        takže neťahaj stovky nocí naraz.
+        """
+        since = int((datetime.now() - timedelta(days=nights + 1)).timestamp())
+        summary = await self._call("/v2/sleep", "getsummary", lastupdate=since)
+
+        periods = sorted(
+            summary.get("series", []),
+            key=lambda x: x["startdate"],
+        )[-nights:]
+
+        out: List[Dict] = []
+        for night in periods:
+            try:
+                body = await self._call(
+                    "/v2/sleep", "get",
+                    startdate=night["startdate"], enddate=night["enddate"],
+                    data_fields="hr,rr,sdnn_1,rmssd,mvt_score,snoring",
+                )
+            except Exception as e:
+                print(f"[WITHINGS] HRV pre noc {night['startdate']} zlyhalo: {e}")
+                continue
+
+            buckets: Dict[str, List[float]] = {
+                "hr": [], "rr": [], "sdnn_1": [], "rmssd": [], "mvt_score": [],
+            }
+            rmssd_series: List[List[float]] = []
+
+            for seg in body.get("series", []):
+                for field in buckets:
+                    raw = seg.get(field)
+                    if not isinstance(raw, dict):
+                        continue
+                    for ts, val in raw.items():
+                        if val is None:
+                            continue
+                        buckets[field].append(float(val))
+                        if field == "rmssd":
+                            rmssd_series.append([int(ts), float(val)])
+
+            if not buckets["rmssd"] and not buckets["sdnn_1"]:
+                continue
+
+            agg = lambda v: {  # noqa: E731
+                "avg": round(statistics.fmean(v), 1) if v else None,
+                "median": round(statistics.median(v), 1) if v else None,
+                "min": round(min(v), 1) if v else None,
+                "max": round(max(v), 1) if v else None,
+            }
+
+            rmssd_series.sort(key=lambda x: x[0])
+            out.append({
+                "date": datetime.fromtimestamp(
+                    night["startdate"], tz=timezone.utc
+                ).strftime("%Y-%m-%d"),
+                "from": _iso(night["startdate"]),
+                "to": _iso(night["enddate"]),
+                "rmssd": agg(buckets["rmssd"]),
+                "sdnn": agg(buckets["sdnn_1"]),
+                "hr": agg(buckets["hr"]),
+                "respiration": agg(buckets["rr"]),
+                "movement": agg(buckets["mvt_score"]),
+                "samples": len(buckets["rmssd"]),
+                # Krivku posielame len pre poslednú noc, inak by odpoveď
+                # narástla o stovky bodov na každú noc.
+                "series": rmssd_series if night is periods[-1] else None,
+            })
+
+        return out
+
     async def get_activity(self, days: int = 30) -> List[Dict]:
         """Denná aktivita. Tiež vlastný endpoint, cez getmeas nepríde."""
         since = int((datetime.now() - timedelta(days=days)).timestamp())
@@ -458,6 +542,7 @@ class WithingsConnector:
             "sleep": await self.get_sleep(days),
             "activity": await self.get_activity(days),
             "ecg": await self.get_ecg(),
+            "hrv": await self.get_sleep_hrv(),
             "synced_at": datetime.now().isoformat(),
             "days": days,
         }
