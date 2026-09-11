@@ -10,6 +10,7 @@ from app.config import settings
 from app.ocr.document_processor import DocumentProcessor
 from app.ocr.data_extractor import HealthDataExtractor
 from app.ocr.csv_importer import CSVImporter
+from app.rag import document_inventory, index_document, search as search_documents
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,20 @@ def _invalidate_analyzers():
     TrendAnalyzer.invalidate_cache()
 
 
+def _document_date(health_data: List[dict]):
+    """Date of the report, taken as the newest date its metrics carry."""
+    dates = []
+    for metric in health_data or []:
+        raw = metric.get('date') if isinstance(metric, dict) else None
+        if not raw:
+            continue
+        try:
+            dates.append(datetime.strptime(raw, '%Y-%m-%d').date())
+        except (TypeError, ValueError):
+            continue
+    return max(dates) if dates else None
+
+
 async def _process_single_file(file: UploadFile) -> dict:
     """Save and process one uploaded file. Runs Claude call in a thread."""
     file_ext = _resolve_extension(file)
@@ -76,11 +91,31 @@ async def _process_single_file(file: UploadFile) -> dict:
             data_extractor.extract_health_metrics, text_content, file.filename
         )
 
+    # The transcription used to end here: the metrics were parsed out and the
+    # text discarded, which threw away everything that is not a number — the
+    # conclusion, the medication, the recommendation. Storing it is also the
+    # only durable copy, since the uploaded file itself sits on container
+    # storage that is wiped on every deploy.
+    indexed = False
+    if file_ext != '.csv':
+        document_id = await asyncio.to_thread(
+            index_document,
+            file.filename or safe_filename,
+            text_content,
+            str(file_path),
+            file_ext.lstrip('.'),
+            file_path.stat().st_size if file_path.exists() else None,
+            _document_date(health_data),
+            'lab_report',
+        )
+        indexed = document_id is not None
+
     return {
         "filename": safe_filename,
         "original_name": file.filename,
         "extracted_text_length": len(text_content),
         "health_metrics_found": len(health_data),
+        "text_indexed": indexed,
     }
 
 
@@ -196,6 +231,22 @@ async def upload_history():
         }
     finally:
         session.close()
+
+
+@router.get("/search")
+async def search_documents_endpoint(q: str, limit: int = 5):
+    """Passages retrieval returns for a query — the chat calls the same function.
+
+    Exposed so a bad answer can be traced: if the chat missed something that is
+    in a report, this shows whether retrieval failed or the model ignored what
+    it was given.
+    """
+    documents = document_inventory()
+    return {
+        "query": q,
+        "documents_indexed": sum(1 for d in documents if d.get("has_text")),
+        "results": search_documents(q, limit=limit),
+    }
 
 
 @router.get("/documents")

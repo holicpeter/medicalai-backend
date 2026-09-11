@@ -27,6 +27,7 @@ import pandas as pd
 from app.analysis.health_metrics import HealthMetricsAnalyzer
 from app.analysis.trend_analyzer import TrendAnalyzer
 from app.database import FamilyMember, Patient, get_session
+from app.rag import document_inventory, search as search_documents
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,16 @@ MAX_DAYS_PER_METRIC = 30
 # Hard ceiling on the rendered context. Claude Haiku's window is far larger,
 # but an unbounded prompt is how a cheap endpoint quietly becomes expensive.
 MAX_CONTEXT_CHARS = 16000
+
+# Retrieved passages per question. Few on purpose: the numbers are already in
+# the context as aggregates, so the passages only have to carry the wording
+# around them — a doctor's conclusion, a prescribed medication, a referral.
+MAX_PASSAGES = 5
+
+# Documents are listed by name and date regardless of what retrieval matched,
+# so the assistant never claims a report does not exist when it simply did not
+# match the query terms.
+MAX_LISTED_DOCUMENTS = 25
 
 # Status thresholds, the health score and the alert wording live in
 # HealthMetricsAnalyzer and must not be copied here — duplicated thresholds are
@@ -287,8 +298,38 @@ def _risks() -> Dict[str, Any]:
         return {}
 
 
-def build_health_context(recent_days: int = DEFAULT_RECENT_DAYS) -> Dict[str, Any]:
-    """Everything the assistant is allowed to reason from, in one dict."""
+def _documents(question: Optional[str]) -> Dict[str, Any]:
+    """What is on file, plus the passages that match this particular question.
+
+    The structured metrics answer "koľko"; this answers "čo k tomu napísal
+    lekár". Retrieval is only run when there is a question to run it against —
+    a context built for any other purpose still gets the inventory.
+    """
+    try:
+        inventory = document_inventory()[:MAX_LISTED_DOCUMENTS]
+    except Exception as e:
+        logger.warning("chat context: cannot list documents: %s", e)
+        inventory = []
+
+    passages: List[Dict[str, Any]] = []
+    if question:
+        try:
+            passages = search_documents(question, limit=MAX_PASSAGES)
+        except Exception as e:
+            logger.warning("chat context: document search failed: %s", e)
+
+    return {"inventory": inventory, "passages": passages}
+
+
+def build_health_context(
+    recent_days: int = DEFAULT_RECENT_DAYS,
+    question: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Everything the assistant is allowed to reason from, in one dict.
+
+    `question` is what retrieval runs against; without it the context still
+    describes the numbers and lists the documents, just without passages.
+    """
     inventory, recent = _measurements(recent_days)
     context: Dict[str, Any] = {
         "today": date.today().isoformat(),
@@ -301,6 +342,7 @@ def build_health_context(recent_days: int = DEFAULT_RECENT_DAYS) -> Dict[str, An
         "trends": _trends(),
         "family": _family(),
         "risks": _risks(),
+        "documents": _documents(question),
     }
     return context
 
@@ -315,7 +357,8 @@ def format_health_context(context: Dict[str, Any]) -> str:
     """Render the context as the text block that goes into the prompt."""
     inventory = context.get("inventory") or {}
     by_metric = inventory.get("by_metric") or {}
-    if not by_metric and not context.get("family"):
+    documents = context.get("documents") or {}
+    if not by_metric and not context.get("family") and not documents.get("inventory"):
         return ""
 
     parts: List[str] = [f"DNEŠNÝ DÁTUM: {context.get('today')}"]
@@ -368,32 +411,6 @@ def format_health_context(context: Dict[str, Any]) -> str:
         ]
         parts.append("\n=== VAROVANIA ===\n" + "\n".join(lines))
 
-    recent = context.get("recent") or {}
-    if recent:
-        lines = []
-        for metric in sorted(recent):
-            days = recent[metric]
-            lines.append(f"\n{metric.upper().replace('_', ' ')}:")
-            for day in days:
-                if day["n"] > 1:
-                    lines.append(
-                        f"  - {day['date']}: priemer {_format_number(day['avg'])} "
-                        f"(min {_format_number(day['min'])}, max {_format_number(day['max'])}, "
-                        f"{day['n']} meraní)"
-                    )
-                else:
-                    lines.append(f"  - {day['date']}: {_format_number(day['avg'])}")
-        parts.append(
-            f"\n=== MERANIA ZA POSLEDNÝCH {context.get('recent_days')} DNÍ "
-            "(denné agregáty) ===" + "\n".join(lines)
-        )
-    else:
-        parts.append(
-            f"\n=== MERANIA ZA POSLEDNÝCH {context.get('recent_days')} DNÍ ===\n"
-            "  Za toto obdobie nie sú žiadne merania. Najnovšie dostupné hodnoty "
-            "a ich dátumy sú vyššie."
-        )
-
     trends = context.get("trends") or {}
     if trends:
         lines = []
@@ -437,6 +454,57 @@ def format_health_context(context: Dict[str, Any]) -> str:
         if risks.get("data_complete") is False:
             lines.append("  - pozn.: rizikový model nemá kompletné vstupy, ide o orientačný odhad")
         parts.append("\n=== PREDIKCIA RIZÍK (ML model) ===\n" + "\n".join(lines))
+
+    doc_inventory = documents.get("inventory") or []
+    if doc_inventory:
+        lines = []
+        for document in doc_inventory:
+            when = document.get("date") or (document.get("uploaded_at") or "")[:10] or "bez dátumu"
+            note = "" if document.get("has_text") else " (text nie je uložený)"
+            lines.append(f"  - {document.get('filename')} — {when}{note}")
+        parts.append(
+            f"\n=== NAHRANÉ LEKÁRSKE DOKUMENTY ({len(doc_inventory)}) ===\n" + "\n".join(lines)
+        )
+
+    passages = documents.get("passages") or []
+    if passages:
+        lines = []
+        for passage in passages:
+            when = f", {passage['date']}" if passage.get("date") else ""
+            lines.append(f"\n[{passage.get('document')}{when}]\n{passage.get('text')}")
+        parts.append(
+            "\n=== RELEVANTNÉ ÚRYVKY Z DOKUMENTOV (vyhľadané k tejto otázke) ==="
+            + "\n".join(lines)
+        )
+
+    # Daily aggregates go last, and deliberately so: they are by far the
+    # bulkiest section (every metric × every day), and the cap below trims from
+    # the end. Everything that must survive truncation — latest values, alerts,
+    # trends, family history, the retrieved passages — is already above.
+    recent = context.get("recent") or {}
+    if recent:
+        lines = []
+        for metric in sorted(recent):
+            lines.append(f"\n{metric.upper().replace('_', ' ')}:")
+            for day in recent[metric]:
+                if day["n"] > 1:
+                    lines.append(
+                        f"  - {day['date']}: priemer {_format_number(day['avg'])} "
+                        f"(min {_format_number(day['min'])}, max {_format_number(day['max'])}, "
+                        f"{day['n']} meraní)"
+                    )
+                else:
+                    lines.append(f"  - {day['date']}: {_format_number(day['avg'])}")
+        parts.append(
+            f"\n=== MERANIA ZA POSLEDNÝCH {context.get('recent_days')} DNÍ "
+            "(denné agregáty) ===" + "\n".join(lines)
+        )
+    else:
+        parts.append(
+            f"\n=== MERANIA ZA POSLEDNÝCH {context.get('recent_days')} DNÍ ===\n"
+            "  Za toto obdobie nie sú žiadne merania. Najnovšie dostupné hodnoty "
+            "a ich dátumy sú vyššie."
+        )
 
     text = "\n".join(parts)
     if len(text) > MAX_CONTEXT_CHARS:

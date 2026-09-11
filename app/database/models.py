@@ -99,6 +99,21 @@ class Document(Base):
     processed_at = Column(DateTime, nullable=True)
 
 
+class DocumentChunk(Base):
+    """A passage of a document's transcribed text, as retrieval sees it.
+
+    The chunks live in their own table rather than being split on the fly so
+    the same text is never re-chunked differently between requests, and so a
+    passage can be traced back to the document and position it came from.
+    """
+    __tablename__ = 'document_chunks'
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey('documents.id'))
+    chunk_index = Column(Integer, default=0)
+    text = Column(Text)
+    created_at = Column(DateTime, default=datetime.now)
+
+
 class GarminData(Base):
     __tablename__ = 'garmin_data'
     id = Column(Integer, primary_key=True)
@@ -248,6 +263,8 @@ _INDEXES = (
     ("ix_health_records_patient_metric", "health_records", "patient_id, metric_type"),
     ("ix_health_records_date", "health_records", "record_date"),
     ("ix_health_records_source", "health_records", "source"),
+    ("ix_document_chunks_document", "document_chunks", "document_id"),
+    ("ix_documents_filename", "documents", "filename"),
 )
 
 

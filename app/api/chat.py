@@ -37,7 +37,7 @@ async def ask_question(request: ChatRequest):
         # always did, because the endpoint it calls did not exist — every
         # question reached the model with no data attached and got "nemám
         # žiadne údaje" as the honest answer to an empty context.
-        context = format_health_context(build_health_context())
+        context = format_health_context(build_health_context(question=request.question))
 
         if not context:
             # Nothing stored yet. A client-supplied snapshot is still accepted
@@ -56,6 +56,10 @@ DÔLEŽITÉ PRAVIDLÁ:
   neexistujú. Povedz, že za dané obdobie nie sú merania, a odpovedz na základe
   najnovších dostupných hodnôt — vždy uveď, z ktorého dátumu pochádzajú
 - Pri hodnotách uvádzaj dátum merania a zdroj, ak je relevantný
+- Ak čerpáš z úryvku lekárskej správy, uveď názov dokumentu a jeho dátum
+- Úryvky sú vyhľadané k otázke; ak medzi nimi odpoveď nie je, povedz to a
+  neodvodzuj obsah správy, ktorý nemáš — v zozname vyššie je, aké dokumenty
+  vôbec existujú
 - Nikdy nediagnostikuj choroby - len informuj o hodnotách a trendoch
 - Odporúčaj konzultáciu s lekárom pri akýchkoľvek abnormálnych hodnotách
 - Buď empatický a zrozumiteľný
