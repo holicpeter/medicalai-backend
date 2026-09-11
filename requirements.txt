@@ -16,6 +16,8 @@ pydantic>=2.0.0
 garminconnect>=0.2.0
 pydantic-settings>=2.0.0
 PyPDF2>=3.0.0
+# maintained successor to PyPDF2; document_processor prefers it and falls back
+pypdf>=4.0.0
 sqlalchemy>=2.0.0
 scikit-learn>=1.3.0
 psycopg2-binary>=2.9.0

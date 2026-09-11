@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime
 
 from app.config import settings
-from app.ocr.document_processor import DocumentProcessor
+from app.ocr.document_processor import DocumentProcessor, split_document_output
 from app.ocr.data_extractor import HealthDataExtractor
 from app.ocr.csv_importer import CSVImporter
 from app.rag import document_inventory, index_document, search as search_documents
@@ -81,14 +81,20 @@ async def _process_single_file(file: UploadFile) -> dict:
 
     logger.info('Saved upload: %s', safe_filename)
 
+    record_text = ''
     if file_ext == '.csv':
         health_data = await asyncio.to_thread(csv_importer.import_from_csv, file_path)
         text_content = f"CSV import: {len(health_data)} records"
     else:
         # Run blocking Claude API call in a thread so other files can process concurrently
         text_content = await asyncio.to_thread(doc_processor.process_document, file_path)
+        # The reply holds the written record and the metrics JSON in separate
+        # sections. Only the JSON goes to the extractor — it reads from the
+        # first '[' to the last ']', and a reference range printed as [3.5-5.5]
+        # in the record would otherwise swallow the real array.
+        record_text, metrics_text = split_document_output(text_content)
         health_data = await asyncio.to_thread(
-            data_extractor.extract_health_metrics, text_content, file.filename
+            data_extractor.extract_health_metrics, metrics_text, file.filename
         )
 
     # The transcription used to end here: the metrics were parsed out and the
@@ -97,11 +103,11 @@ async def _process_single_file(file: UploadFile) -> dict:
     # only durable copy, since the uploaded file itself sits on container
     # storage that is wiped on every deploy.
     indexed = False
-    if file_ext != '.csv':
+    if file_ext != '.csv' and record_text:
         document_id = await asyncio.to_thread(
             index_document,
             file.filename or safe_filename,
-            text_content,
+            record_text,
             str(file_path),
             file_ext.lstrip('.'),
             file_path.stat().st_size if file_path.exists() else None,
