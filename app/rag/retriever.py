@@ -65,7 +65,11 @@ _STOPWORDS_RAW = (
     "mozem na nad nam nas nie nich nim no o od pod pre preco pri prosim "
     "s sa si so su ta tak takze tam te teda ten tento to toto tu ty u v vo "
     "vsak vsetko z za ze zo "
-    "daj mi daj urob povedz ake aky aka kolko"
+    # forms of byť/mať and the filler words a spoken question carries; they
+    # appear in nearly every chunk, so they rank nothing and only add noise
+    "som sme ste bol bola boli bude budem budes budu mal mala mali mam mas "
+    "este uz tiez potom preto velmi asi len iba "
+    "daj urob povedz ake aky aka kolko"
 )
 
 

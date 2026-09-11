@@ -1,199 +1,202 @@
-"""Tool-calling tests: metric_history aggregation, run_tool, and the ask loop.
+"""Tools the assistant calls when the prompt does not already carry the answer.
 
-pandas and pydantic are real here; fastapi, anthropic and sqlalchemy are not
-installable in this sandbox, so those and the DB/rag layers are stubbed. The
-frames are built exactly as TrendAnalyzer builds them, so the aggregation is
-exercised against real pandas rather than a hand-rolled fake.
+The context is a snapshot of the recent window, so a question about a longer
+period ("ako mi šiel LDL za dva roky") had to be answered from the latest value
+and a trend label. These cover the history tool that replaced that guess, the
+dispatcher, and the loop that keeps tool use bounded.
 """
 import json
-import sys
-import types
-from pathlib import Path
-from collections import namedtuple
 from datetime import date, timedelta
+from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-# --- real pandas (installed here), frames built like TrendAnalyzer builds them
 import pandas as pd
+import pytest
+
+from app import chat_tools
+from app.analysis import chat_context
+from app.api import chat as chat_api
+
+TODAY = date.today()
 
 
-def _frame(rows):
-    """Same shape TrendAnalyzer._load_data produces: datetime64 dates, dict
-    values left intact for blood pressure, undated rows dropped by the caller."""
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    return df
+def _rows():
+    rows = [
+        {"date": TODAY - timedelta(days=offset), "metric": "weight",
+         "value": 80.0 + (offset % 5), "unit": "kg", "source": "withings"}
+        for offset in range(0, 800, 7)  # weekly weigh-ins over two years
+    ]
+    rows += [
+        {"date": TODAY - timedelta(days=offset), "metric": "glucose",
+         "value": 5.1, "unit": "mmol/L", "source": "manual"}
+        for offset in (1, 2)
+    ]
+    return rows
 
-# --- stub: analyzers, database, rag -----------------------------------------
-hm = types.ModuleType("app.analysis.health_metrics")
-hm.HealthMetricsAnalyzer = type("HealthMetricsAnalyzer", (), {
-    "_get_metric_status": lambda self, m, v: "normal",
-    "_calculate_health_score": lambda self, latest: 100,
-    "_generate_alerts": lambda self, latest: [],
-})
-sys.modules["app.analysis.health_metrics"] = hm
 
-ROWS = []
-today = date.today()
-for offset in range(0, 800, 7):  # ~114 weekly weigh-ins over two years
-    ROWS.append({"date": today - timedelta(days=offset), "metric": "weight",
-                 "value": 80.0 + (offset % 5), "unit": "kg", "source": "withings"})
-for offset in (1, 2):
-    ROWS.append({"date": today - timedelta(days=offset), "metric": "glucose",
-                 "value": 5.1, "unit": "mmol/L", "source": "manual"})
+@pytest.fixture(autouse=True)
+def measurements(monkeypatch):
+    frame = pd.DataFrame(_rows())
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    monkeypatch.setattr(
+        chat_context, "TrendAnalyzer",
+        lambda: SimpleNamespace(data=frame, analyze_trends=dict),
+    )
+    return frame
 
-ta = types.ModuleType("app.analysis.trend_analyzer")
-ta.TrendAnalyzer = type("TrendAnalyzer", (), {
-    "__init__": lambda self: setattr(self, "data", _frame(ROWS)),
-    "analyze_trends": lambda self: {},
-})
-sys.modules["app.analysis.trend_analyzer"] = ta
 
-db = types.ModuleType("app.database")
-db.Patient = type("Patient", (), {})
-db.FamilyMember = type("FamilyMember", (), {})
-db.get_session = lambda: types.SimpleNamespace(
-    query=lambda m: types.SimpleNamespace(first=lambda: None, filter_by=lambda **k: None),
-    close=lambda: None,
-)
-sys.modules["app.database"] = db
+def test_history_lists_every_measurement_day_by_day():
+    history = chat_context.metric_history("weight")
 
-SEARCH_CALLS = []
-rag = types.ModuleType("app.rag")
-rag.document_inventory = lambda: []
-rag.search = lambda q, limit=5: (
-    SEARCH_CALLS.append((q, limit)) or
-    [{"document": "kardio.pdf", "date": "2026-03-14", "chunk_index": 0,
-      "score": 1.2, "text": "Záver: " + "x" * 6000}]
-)
-sys.modules["app.rag"] = rag
+    assert history["granularity"] == "daily"
+    assert history["measurements"] == len(range(0, 800, 7))
+    periods = [point["period"] for point in history["points"]]
+    assert periods == sorted(periods), "a series has to be chronological"
 
-# --- stub: fastapi / pydantic / anthropic -----------------------------------
-fastapi = types.ModuleType("fastapi")
-fastapi.APIRouter = lambda **kw: types.SimpleNamespace(post=lambda *a, **k: (lambda f: f))
-fastapi.HTTPException = type("HTTPException", (Exception,), {
-    "__init__": lambda self, status_code=500, detail="": (
-        setattr(self, "status_code", status_code), setattr(self, "detail", detail), None)[-1]
-})
-sys.modules["fastapi"] = fastapi
 
-anthropic_mod = types.ModuleType("anthropic")
-anthropic_mod.Anthropic = object
-sys.modules["anthropic"] = anthropic_mod
+def test_a_long_range_collapses_to_months_instead_of_being_cut_off():
+    """A truncated series would silently hide half the period it claims to cover."""
+    history = chat_context.metric_history("weight", max_points=20)
 
-from app.analysis import chat_context  # noqa: E402
-from app import chat_tools  # noqa: E402
-from app.api import chat as chat_api  # noqa: E402
+    assert history["granularity"] == "monthly"
+    assert len(history["points"]) <= 20
+    assert all(len(point["period"]) == len("2026-09") for point in history["points"])
 
-# --- metric_history ---------------------------------------------------------
-weekly = chat_context.metric_history("weight")
-assert weekly["measurements"] == len([r for r in ROWS if r["metric"] == "weight"])
-assert weekly["granularity"] == "daily", weekly["granularity"]
-assert weekly["points"][0]["period"] < weekly["points"][-1]["period"], "chronological"
 
-# a long range collapses to months instead of returning a truncated series
-monthly = chat_context.metric_history("weight", max_points=20)
-assert monthly["granularity"] == "monthly", monthly["granularity"]
-assert len(monthly["points"]) <= 20
-assert all(len(p["period"]) == 7 for p in monthly["points"]), monthly["points"][:2]
+def test_dates_narrow_the_series():
+    since = (TODAY - timedelta(days=30)).isoformat()
 
-# date filtering
-recent = chat_context.metric_history(
-    "weight", start_date=(today - timedelta(days=30)).isoformat())
-assert recent["measurements"] < weekly["measurements"]
-assert all(p["period"] >= (today - timedelta(days=30)).isoformat() for p in recent["points"])
+    history = chat_context.metric_history("weight", start_date=since)
 
-# unknown metric: no data, but tell the model what does exist
-unknown = chat_context.metric_history("ldl")
-assert unknown["points"] == []
-assert "weight" in unknown["available_metrics"] and "glucose" in unknown["available_metrics"]
+    assert history["measurements"] < len(range(0, 800, 7))
+    assert all(point["period"] >= since for point in history["points"])
 
-# case-insensitive metric name, garbage dates ignored rather than fatal
-assert chat_context.metric_history("WEIGHT")["measurements"] > 0
-assert chat_context.metric_history("weight", start_date="minuly rok")["measurements"] > 0
 
-# --- run_tool ---------------------------------------------------------------
-payload = json.loads(chat_tools.run_tool("get_metric_history", {"metric": "weight"}))
-assert payload["points"], payload
+def test_an_unknown_metric_says_what_does_exist():
+    """Better than an empty result: the model can retry with a real name."""
+    history = chat_context.metric_history("ldl")
 
-payload = json.loads(chat_tools.run_tool("search_documents", {"query": "kardiológ", "limit": 99}))
-assert SEARCH_CALLS[-1][1] == 8, "limit must be clamped"
-assert len(payload["results"][0]["text"]) <= chat_tools.MAX_DOCUMENT_CHARS + 10
+    assert history["points"] == []
+    assert {"weight", "glucose"} <= set(history["available_metrics"])
 
-assert "Neznámy nástroj" in chat_tools.run_tool("drop_table", {})
-# a failing tool is reported, not raised
-chat_tools._HANDLERS["boom"] = lambda p: (_ for _ in ()).throw(RuntimeError("nope"))
-assert "Nástroj zlyhal" in chat_tools.run_tool("boom", {})
-del chat_tools._HANDLERS["boom"]
 
-# --- the ask loop -----------------------------------------------------------
+@pytest.mark.parametrize("metric", ["weight", "WEIGHT", " Weight "])
+def test_metric_names_are_matched_loosely(metric):
+    assert chat_context.metric_history(metric)["measurements"] > 0
+
+
+def test_an_unparseable_date_is_ignored_rather_than_fatal():
+    assert chat_context.metric_history("weight", start_date="minulý rok")[
+        "measurements"] > 0
+
+
+def test_history_tool_returns_json():
+    payload = json.loads(chat_tools.run_tool("get_metric_history", {"metric": "weight"}))
+
+    assert payload["points"]
+    assert payload["metric"] == "weight"
+
+
+def test_search_tool_clamps_the_limit_and_caps_the_text(monkeypatch):
+    seen = {}
+
+    def _search(query, limit=5):
+        seen["limit"] = limit
+        return [{"document": "kardio.pdf", "date": "2026-03-14", "chunk_index": 0,
+                 "score": 1.2, "text": "Záver: " + "x" * 6000}]
+
+    monkeypatch.setattr(chat_tools, "search_documents", _search)
+
+    payload = json.loads(
+        chat_tools.run_tool("search_documents", {"query": "kardiológ", "limit": 99}))
+
+    assert seen["limit"] == 8
+    assert len(payload["results"][0]["text"]) <= chat_tools.MAX_DOCUMENT_CHARS + 10
+
+
+def test_an_unknown_tool_is_reported_not_raised():
+    assert "Neznámy nástroj" in chat_tools.run_tool("drop_table", {})
+
+
+def test_a_failing_tool_is_reported_not_raised(monkeypatch):
+    """The model can say what it could not look up; a 500 loses the whole answer."""
+    def _boom(payload):
+        raise RuntimeError("nope")
+
+    monkeypatch.setitem(chat_tools._HANDLERS, "boom", _boom)
+
+    assert "Nástroj zlyhal" in chat_tools.run_tool("boom", {})
+
+
 class _Block(dict):
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.__dict__.update(kw)
+    """Stands in for an SDK content block: attribute and mapping access."""
+
+    def __init__(self, **fields):
+        super().__init__(**fields)
+        self.__dict__.update(fields)
 
 
 def _tool_turn(name, payload):
-    return types.SimpleNamespace(
+    return SimpleNamespace(
         stop_reason="tool_use",
         content=[_Block(type="tool_use", id="tu_1", name=name, input=payload)],
     )
 
 
 def _text_turn(text):
-    return types.SimpleNamespace(
-        stop_reason="end_turn", content=[_Block(type="text", text=text)]
-    )
+    return SimpleNamespace(stop_reason="end_turn", content=[_Block(type="text", text=text)])
 
 
-class FakeClient:
+class _ScriptedClient:
     def __init__(self, script):
         self.script = list(script)
         self.calls = []
-        self.messages = types.SimpleNamespace(create=self._create)
+        self.messages = SimpleNamespace(create=self._create)
 
     def _create(self, **kwargs):
         self.calls.append(kwargs)
         return self.script.pop(0)
 
 
-# one lookup, then an answer
-client = FakeClient([
-    _tool_turn("get_metric_history", {"metric": "weight"}),
-    _text_turn("Vaša váha je stabilná."),
-])
-answer = chat_api._ask_claude(client, "system", "otázka")
-assert answer == "Vaša váha je stabilná.", answer
-assert len(client.calls) == 2
-assert "tools" in client.calls[0]
-sent = client.calls[1]["messages"]
-assert sent[1]["role"] == "assistant"
-tool_result = sent[2]["content"][0]
-assert tool_result["type"] == "tool_result" and tool_result["tool_use_id"] == "tu_1"
-assert "points" in tool_result["content"]
+def test_a_question_needing_no_lookup_costs_one_round_trip():
+    client = _ScriptedClient([_text_turn("Priama odpoveď.")])
 
-# model keeps asking for tools: the budget is spent, then it must answer
-client = FakeClient(
-    [_tool_turn("search_documents", {"query": "x"})] * chat_tools.MAX_TOOL_ROUNDS
-    + [_text_turn("Odpoveď z toho, čo mám.")]
-)
-answer = chat_api._ask_claude(client, "system", "otázka")
-assert answer == "Odpoveď z toho, čo mám."
-assert len(client.calls) == chat_tools.MAX_TOOL_ROUNDS + 1
-assert "tools" not in client.calls[-1], "final turn must withhold tools"
+    assert chat_api._ask_claude(client, "system", "otázka") == "Priama odpoveď."
+    assert len(client.calls) == 1
 
-# an empty reply never reaches the patient
-client = FakeClient([_text_turn("   ")])
-assert chat_api._ask_claude(client, "system", "otázka").startswith("Prepáčte")
 
-# no tool call at all is the common path and costs one round trip
-client = FakeClient([_text_turn("Priama odpoveď.")])
-assert chat_api._ask_claude(client, "system", "otázka") == "Priama odpoveď."
-assert len(client.calls) == 1
+def test_a_tool_result_is_fed_back_and_the_answer_returned():
+    client = _ScriptedClient([
+        _tool_turn("get_metric_history", {"metric": "weight"}),
+        _text_turn("Vaša váha je stabilná."),
+    ])
 
-print("TOOLS: ALL ASSERTIONS PASSED")
-print(f"  weight daily points: {len(weekly['points'])}, monthly: {len(monthly['points'])}")
-print(f"  monthly sample: {monthly['points'][-1]}")
+    answer = chat_api._ask_claude(client, "system", "otázka")
+
+    assert answer == "Vaša váha je stabilná."
+    assert "tools" in client.calls[0]
+    messages = client.calls[1]["messages"]
+    assert messages[1]["role"] == "assistant"
+    result = messages[2]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["tool_use_id"] == "tu_1"
+    assert "points" in result["content"]
+
+
+def test_the_tool_budget_ends_in_an_answer_not_an_empty_turn():
+    """A tool_use turn carries no text; returning it would show a blank reply."""
+    client = _ScriptedClient(
+        [_tool_turn("search_documents", {"query": "x"})] * chat_tools.MAX_TOOL_ROUNDS
+        + [_text_turn("Odpoveď z toho, čo mám.")]
+    )
+
+    answer = chat_api._ask_claude(client, "system", "otázka")
+
+    assert answer == "Odpoveď z toho, čo mám."
+    assert len(client.calls) == chat_tools.MAX_TOOL_ROUNDS + 1
+    assert "tools" not in client.calls[-1], "the last turn has to withhold tools"
+
+
+def test_an_empty_reply_never_reaches_the_patient():
+    client = _ScriptedClient([_text_turn("   ")])
+
+    assert chat_api._ask_claude(client, "system", "otázka").startswith("Prepáčte")
