@@ -1,0 +1,661 @@
+From d029bee07883280b52ddb3290798e378c51002ca Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 11 Sep 2026 12:31:27 +0000
+Subject: [PATCH 1/2] Say that measurements are not the health card
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Asked "aké som mal operácie v minulosti", the assistant answered that the
+database holds only measurements and family history — correct — and then, asked
+whether it could not see the scanned card, said yes, it sees everything, and
+listed 246 records from a source called "ocr" as proof. Both halves came from
+the same gap: the context named the source but never said what it contains.
+
+It contains numbers. The extractor pulls measurable values out of a scanned
+report and everything around them — diagnoses, operations, medication, the
+doctor's conclusion — was discarded before it reached the database. So a
+question that can only be answered from the report's prose has no source at all,
+and a source line reading "ocr: 246 meraní" reads to the model like the card
+itself.
+
+The document section now says this explicitly when nothing is indexed: no
+document text is stored, the ocr rows are numbers only, and re-uploading the
+document is what makes its text available. The system prompt gains the matching
+rule, so the model stops treating measurements as evidence that it can read the
+card.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUjLLy2enx9LeWY7if66cK
+---
+ app/analysis/chat_context.py | 25 +++++++++++++++++++++++++
+ app/api/chat.py              |  3 +++
+ tests/test_chat_context.py   | 18 ++++++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/app/analysis/chat_context.py b/app/analysis/chat_context.py
+index 1dd30fe..5ddc545 100644
+--- a/app/analysis/chat_context.py
++++ b/app/analysis/chat_context.py
+@@ -556,6 +556,31 @@ def format_health_context(context: Dict[str, Any]) -> str:
+         parts.append(
+             f"\n=== NAHRANÉ LEKÁRSKE DOKUMENTY ({len(doc_inventory)}) ===\n" + "\n".join(lines)
+         )
++    else:
++        # Without this the model sees a source called "ocr" with hundreds of
++        # measurements and concludes it is looking at the scanned health card.
++        # It is not: the extractor pulled the numbers out of those scans and the
++        # text around them — diagnoses, operations, medication, the doctor's
++        # conclusion — was discarded before it was ever stored. Asked "aké som
++        # mal operácie", the model has to say that and say what would fix it,
++        # not claim it can see the whole card.
++        note = (
++            "  Žiadny dokument nie je uložený aj s textom, takže o obsahu "
++            "lekárskych správ (diagnózy, operácie, lieky, závery lekárov) nemáš "
++            "žiadne informácie."
++        )
++        if "ocr" in by_source:
++            note += (
++                f"\n  Zdroj „ocr“ vyššie ({by_source['ocr']['count']} meraní) sú LEN "
++                "číselné hodnoty vyparsované z naskenovaných správ — ich text "
++                "uložený nie je."
++            )
++        note += (
++            "\n  Ak sa pacient pýta na niečo, čo môže byť len v texte správy, "
++            "povedz priamo, že tieto údaje v systéme nie sú, a navrhni dokument "
++            "nahrať znova cez sekciu Nahrať Dokumenty — vtedy sa uloží aj text."
++        )
++        parts.append("\n=== NAHRANÉ LEKÁRSKE DOKUMENTY (0) ===\n" + note)
+ 
+     passages = documents.get("passages") or []
+     if passages:
+diff --git a/app/api/chat.py b/app/api/chat.py
+index b6864fb..2a738b2 100644
+--- a/app/api/chat.py
++++ b/app/api/chat.py
+@@ -61,6 +61,9 @@ DÔLEŽITÉ PRAVIDLÁ:
+   najnovších dostupných hodnôt — vždy uveď, z ktorého dátumu pochádzajú
+ - Pri hodnotách uvádzaj dátum merania a zdroj, ak je relevantný
+ - Ak čerpáš z úryvku lekárskej správy, uveď názov dokumentu a jeho dátum
++- Merania nie sú to isté čo obsah zdravotnej karty. Nikdy netvrď, že vidíš
++  naskenované správy alebo celú kartu, ak máš k dispozícii len namerané hodnoty —
++  v sekcii NAHRANÉ LEKÁRSKE DOKUMENTY je napísané, čo z dokumentov naozaj máš
+ - Úryvky sú vyhľadané k otázke; ak medzi nimi odpoveď nie je, povedz to a
+   neodvodzuj obsah správy, ktorý nemáš — v zozname vyššie je, aké dokumenty
+   vôbec existujú
+diff --git a/tests/test_chat_context.py b/tests/test_chat_context.py
+index 37846a2..a09c63b 100644
+--- a/tests/test_chat_context.py
++++ b/tests/test_chat_context.py
+@@ -230,6 +230,24 @@ def test_passages_sit_above_the_section_the_size_cap_trims():
+     assert text.index("RELEVANTNÉ ÚRYVKY") < text.index("MERANIA ZA POSLEDNÝCH")
+ 
+ 
++def test_no_stored_documents_says_so_instead_of_implying_the_card_is_readable(monkeypatch):
++    """Measurements are not the health card.
++
++    With hundreds of rows from a source called "ocr" and no document list, the
++    model concluded it was looking at the scanned card and answered questions
++    about operations as if the card simply did not mention any. The extractor
++    only ever kept the numbers; the text around them was discarded.
++    """
++    monkeypatch.setattr(chat_context, "document_inventory", list)
++
++    text = chat_context.format_health_context(chat_context.build_health_context())
++
++    assert "NAHRANÉ LEKÁRSKE DOKUMENTY (0)" in text
++    assert "operácie" in text
++    assert "ocr" in text and "LEN" in text
++    assert "nahrať znova" in text
++
++
+ def test_without_a_question_there_is_an_inventory_but_no_retrieval():
+     text = chat_context.format_health_context(chat_context.build_health_context())
+ 
+-- 
+2.43.0
+
+
+From f88a63bb88766f55f4dac7a13f2fd05ba88de397 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 11 Sep 2026 13:00:12 +0000
+Subject: [PATCH 2/2] Process a scanned card in batches, and keep what is not a
+ number
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Uploading the 33 MB, ~100-page health card failed with 413 request_too_large.
+The whole PDF went into one Messages API call, and that call is capped at 32 MB
+per request — base64 adds a third on top, so a 33 MB scan arrives as ~44 MB —
+and at 100 pages, which a full card reaches on its own. Pages now go in batches
+of ten, three requests at a time, and the replies are merged: metrics as parsed
+data rather than pasted arrays, so one batch answered in an unexpected shape
+cannot corrupt the array for the others.
+
+The quieter half of the problem is why "aké som mal operácie" could not be
+answered no matter how often the card was uploaded. The extraction prompt asked
+for a JSON array of lab values and nothing else, so the operations, diagnoses,
+medication and doctors' conclusions on those pages were never produced in the
+first place — there was no text to store, and the RAG work that came before
+this was indexing the metrics JSON. The prompt now returns two sections: a
+written record of everything that is not a measured value, and the metrics.
+The record is what gets indexed; only the JSON reaches the extractor, because
+it reads from the first '[' to the last ']' and a reference range printed as
+[3.5-5.5] in a report would otherwise swallow the real array.
+
+max_tokens goes to 8192 — the reply now carries the record as well.
+
+Note on cost: transcription is extra output tokens on every page, and this runs
+on claude-opus-4-5. A hundred-page card is a real charge. The model choice
+predates this change and is left alone, but ai-model-selection-strategy.md
+already argues this task belongs on a cheaper model with Opus as escalation.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUjLLy2enx9LeWY7if66cK
+---
+ app/api/upload.py                |  14 ++-
+ app/ocr/document_processor.py    | 203 ++++++++++++++++++++++++++-----
+ requirements.txt                 |   2 +
+ tests/test_document_processor.py | 179 +++++++++++++++++++++++++++
+ 4 files changed, 365 insertions(+), 33 deletions(-)
+ create mode 100644 tests/test_document_processor.py
+
+diff --git a/app/api/upload.py b/app/api/upload.py
+index 677df2c..a96c3a2 100644
+--- a/app/api/upload.py
++++ b/app/api/upload.py
+@@ -7,7 +7,7 @@ from pathlib import Path
+ from datetime import datetime
+ 
+ from app.config import settings
+-from app.ocr.document_processor import DocumentProcessor
++from app.ocr.document_processor import DocumentProcessor, split_document_output
+ from app.ocr.data_extractor import HealthDataExtractor
+ from app.ocr.csv_importer import CSVImporter
+ from app.rag import document_inventory, index_document, search as search_documents
+@@ -81,14 +81,20 @@ async def _process_single_file(file: UploadFile) -> dict:
+ 
+     logger.info('Saved upload: %s', safe_filename)
+ 
++    record_text = ''
+     if file_ext == '.csv':
+         health_data = await asyncio.to_thread(csv_importer.import_from_csv, file_path)
+         text_content = f"CSV import: {len(health_data)} records"
+     else:
+         # Run blocking Claude API call in a thread so other files can process concurrently
+         text_content = await asyncio.to_thread(doc_processor.process_document, file_path)
++        # The reply holds the written record and the metrics JSON in separate
++        # sections. Only the JSON goes to the extractor — it reads from the
++        # first '[' to the last ']', and a reference range printed as [3.5-5.5]
++        # in the record would otherwise swallow the real array.
++        record_text, metrics_text = split_document_output(text_content)
+         health_data = await asyncio.to_thread(
+-            data_extractor.extract_health_metrics, text_content, file.filename
++            data_extractor.extract_health_metrics, metrics_text, file.filename
+         )
+ 
+     # The transcription used to end here: the metrics were parsed out and the
+@@ -97,11 +103,11 @@ async def _process_single_file(file: UploadFile) -> dict:
+     # only durable copy, since the uploaded file itself sits on container
+     # storage that is wiped on every deploy.
+     indexed = False
+-    if file_ext != '.csv':
++    if file_ext != '.csv' and record_text:
+         document_id = await asyncio.to_thread(
+             index_document,
+             file.filename or safe_filename,
+-            text_content,
++            record_text,
+             str(file_path),
+             file_ext.lstrip('.'),
+             file_path.stat().st_size if file_path.exists() else None,
+diff --git a/app/ocr/document_processor.py b/app/ocr/document_processor.py
+index ffed276..bcab5b8 100644
+--- a/app/ocr/document_processor.py
++++ b/app/ocr/document_processor.py
+@@ -1,25 +1,59 @@
++import base64
+ import io
++import json
+ import logging
+ import os
++from concurrent.futures import ThreadPoolExecutor
+ from pathlib import Path
+-from typing import Union
+-import base64
++from typing import List, Tuple, Union
+ 
+ import anthropic
+ from PIL import Image
+ 
++try:  # pypdf is the maintained successor; PyPDF2 3.x exposes the same names
++    from pypdf import PdfReader, PdfWriter
++except ImportError:  # pragma: no cover - depends on which is installed
++    from PyPDF2 import PdfReader, PdfWriter
++
+ logger = logging.getLogger(__name__)
+ 
+ _HEIC_EXTENSIONS = {'.heic', '.heif'}
+ 
+-_EXTRACTION_INSTRUCTION = """\
+-Extract ALL lab values and medical metrics from this Slovak medical document.
+-Return ONLY a JSON array — no other text, no markdown, no explanation.
++# A whole scanned health card does not fit in one request. The Messages API
++# caps a request at 32 MB — and base64 inflates a PDF by a third, so a 33 MB
++# scan arrives as ~44 MB and is refused with 413 request_too_large — and at 100
++# pages per request, which a full card reaches on its own. Pages are therefore
++# sent in batches: small enough that neither limit is anywhere near, and small
++# enough that the reply fits in max_tokens.
++MAX_PAGES_PER_BATCH = 10
++MAX_BATCH_BYTES = 12 * 1024 * 1024
++
++# Batches run concurrently, or a hundred-page card would be a dozen sequential
++# round trips and the upload would sit there for minutes.
++MAX_PARALLEL_BATCHES = 3
++
++RECORD_MARKER = '=== ZÁZNAM ==='
++METRICS_MARKER = '=== METRIKY ==='
++
++_EXTRACTION_INSTRUCTION = f"""\
++Extract information from this Slovak medical document in TWO sections, in this
++exact order and with these exact markers.
++
++{RECORD_MARKER}
++Everything that is NOT a measured value, in Slovak: diagnoses, operations and
++procedures with their dates, hospitalisations, medication, allergies, doctors'
++conclusions and recommendations, referrals. Keep dates, names of procedures and
++medication exactly as written. Be complete — this is the only record of the
++document's text. If a page holds nothing but a table of laboratory values,
++write a single dash for it.
++
++{METRICS_MARKER}
++A JSON array of the lab values and metrics — no markdown, no explanation.
+ 
+ Format:
+ [
+-  {"metric": "glucose", "value": 5.2, "unit": "mmol/l", "date": "2022-08-04", "status": "OK"},
+-  {"metric": "cholesterol", "value": 4.8, "unit": "mmol/l", "date": "2022-08-04", "status": "HIGH"}
++  {{"metric": "glucose", "value": 5.2, "unit": "mmol/l", "date": "2022-08-04", "status": "OK"}},
++  {{"metric": "cholesterol", "value": 4.8, "unit": "mmol/l", "date": "2022-08-04", "status": "HIGH"}}
+ ]
+ 
+ Use these standard metric names:
+@@ -65,6 +99,95 @@ def _load_heif_support():
+ _load_heif_support()
+ 
+ 
++def split_document_output(text: str) -> Tuple[str, str]:
++    """Separate the written record from the metrics JSON.
++
++    The extractor takes everything between the first '[' and the last ']', so
++    the record has to be cut away before it reaches it — a reference range
++    written as [3.5-5.5] in a report would otherwise swallow the real array.
++    Output without the marker is treated as metrics only, which is what older
++    documents and a model that ignores the format both produce.
++    """
++    if METRICS_MARKER not in text:
++        return '', text
++
++    record, _, metrics = text.partition(METRICS_MARKER)
++    record = record.replace(RECORD_MARKER, '').strip()
++    if record in {'-', '—', '–'}:
++        record = ''
++    return record, metrics.strip()
++
++
++def _pdf_batches(file_path: Path) -> List[bytes]:
++    """Split a PDF into page batches that fit comfortably in one request."""
++    reader = PdfReader(str(file_path))
++    page_count = len(reader.pages)
++    if page_count == 0:
++        raise ValueError(f'{file_path.name} has no pages')
++
++    total_bytes = file_path.stat().st_size
++    per_page = max(1, total_bytes // page_count)
++    pages_per_batch = max(1, min(MAX_PAGES_PER_BATCH, MAX_BATCH_BYTES // per_page))
++
++    if page_count <= pages_per_batch and total_bytes <= MAX_BATCH_BYTES:
++        with open(file_path, 'rb') as f:
++            return [f.read()]
++
++    batches: List[bytes] = []
++    for start in range(0, page_count, pages_per_batch):
++        writer = PdfWriter()
++        for page in reader.pages[start:start + pages_per_batch]:
++            writer.add_page(page)
++        buf = io.BytesIO()
++        writer.write(buf)
++        batches.append(buf.getvalue())
++
++    logger.info(
++        'Split %s into %d batches of up to %d pages (%d pages, %.1f MB)',
++        file_path.name, len(batches), pages_per_batch, page_count,
++        total_bytes / (1024 * 1024),
++    )
++    return batches
++
++
++def _merge_outputs(outputs: List[str]) -> str:
++    """Fold per-batch replies back into one document-shaped reply.
++
++    Metrics are merged as data rather than by pasting arrays together, so one
++    batch the model answered in an unexpected shape cannot corrupt the array
++    for all the others; its raw reply is kept in the record instead of being
++    dropped on the floor.
++    """
++    records: List[str] = []
++    metrics: List[dict] = []
++
++    for index, output in enumerate(outputs, start=1):
++        record, metrics_text = split_document_output(output)
++        if record:
++            records.append(record)
++
++        start, end = metrics_text.find('['), metrics_text.rfind(']') + 1
++        parsed = None
++        if start != -1 and end > start:
++            try:
++                parsed = json.loads(metrics_text[start:end])
++            except json.JSONDecodeError as e:
++                logger.warning('Batch %d: metrics are not valid JSON: %s', index, e)
++
++        if isinstance(parsed, list):
++            metrics.extend(parsed)
++        elif metrics_text.strip():
++            logger.warning('Batch %d: keeping unparsed reply in the record', index)
++            records.append(metrics_text.strip())
++
++    return (
++        f'{RECORD_MARKER}\n'
++        + '\n\n'.join(records)
++        + f'\n\n{METRICS_MARKER}\n'
++        + json.dumps(metrics, ensure_ascii=False)
++    )
++
++
+ def _read_image_as_jpeg(file_path: Path) -> bytes:
+     img = Image.open(file_path)
+     if img.mode not in ('RGB', 'L'):
+@@ -89,23 +212,23 @@ class DocumentProcessor:
+         logger.info('Processing document: %s', file_path.name)
+ 
+         if suffix == '.pdf':
+-            with open(file_path, 'rb') as f:
+-                file_data = base64.standard_b64encode(f.read()).decode('utf-8')
+-            content = [
+-                {
+-                    'type': 'document',
+-                    'source': {
+-                        'type': 'base64',
+-                        'media_type': 'application/pdf',
+-                        'data': file_data,
+-                    },
+-                },
+-                {
+-                    'type': 'text',
+-                    'text': _EXTRACTION_INSTRUCTION,
+-                    'cache_control': {'type': 'ephemeral'},
+-                },
+-            ]
++            batches = _pdf_batches(file_path)
++            if len(batches) == 1:
++                text = self._ask(self._pdf_content(batches[0]))
++                logger.info('Extracted %d characters from %s', len(text), file_path.name)
++                return text
++
++            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BATCHES) as pool:
++                outputs = list(pool.map(
++                    lambda data: self._ask(self._pdf_content(data)), batches
++                ))
++
++            text = _merge_outputs(outputs)
++            logger.info(
++                'Extracted %d characters from %s across %d batches',
++                len(text), file_path.name, len(batches),
++            )
++            return text
+         else:
+             if suffix in _HEIC_EXTENSIONS:
+                 logger.info('Converting HEIC/HEIF to JPEG: %s', file_path.name)
+@@ -129,12 +252,34 @@ class DocumentProcessor:
+                 },
+             ]
+ 
++        text = self._ask(content)
++        logger.info('Extracted %d characters from %s', len(text), file_path.name)
++        return text
++
++    @staticmethod
++    def _pdf_content(pdf_bytes: bytes) -> list:
++        return [
++            {
++                'type': 'document',
++                'source': {
++                    'type': 'base64',
++                    'media_type': 'application/pdf',
++                    'data': base64.standard_b64encode(pdf_bytes).decode('utf-8'),
++                },
++            },
++            {
++                'type': 'text',
++                'text': _EXTRACTION_INSTRUCTION,
++                'cache_control': {'type': 'ephemeral'},
++            },
++        ]
++
++    def _ask(self, content: list) -> str:
+         message = self.client.messages.create(
+             model='claude-opus-4-5',
+-            max_tokens=4096,
++            # The reply now carries the document's written record as well as the
++            # metrics, so 4096 is no longer enough for a batch of pages.
++            max_tokens=8192,
+             messages=[{'role': 'user', 'content': content}],
+         )
+-
+-        text = message.content[0].text
+-        logger.info('Extracted %d characters from %s', len(text), file_path.name)
+-        return text
++        return message.content[0].text
+diff --git a/requirements.txt b/requirements.txt
+index 0b6f4a7..02d55a4 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -16,6 +16,8 @@ pydantic>=2.0.0
+ garminconnect>=0.2.0
+ pydantic-settings>=2.0.0
+ PyPDF2>=3.0.0
++# maintained successor to PyPDF2; document_processor prefers it and falls back
++pypdf>=4.0.0
+ sqlalchemy>=2.0.0
+ scikit-learn>=1.3.0
+ psycopg2-binary>=2.9.0
+diff --git a/tests/test_document_processor.py b/tests/test_document_processor.py
+new file mode 100644
+index 0000000..e3c6c9d
+--- /dev/null
++++ b/tests/test_document_processor.py
+@@ -0,0 +1,179 @@
++"""A scanned health card is bigger than one request, and it is not just numbers.
++
++Uploading a 33 MB, ~100-page card failed with 413 request_too_large: the whole
++PDF went into a single Messages API call, which caps a request at 32 MB — and
++base64 adds a third on top — and at 100 pages. Splitting into page batches
++fixes both.
++
++The second half of the problem was quieter: the extraction prompt asked only
++for a JSON array of lab values, so the operations, diagnoses and doctors'
++conclusions on those pages were never produced at all, and "aké som mal
++operácie" had no source to answer from however many times the card was
++uploaded. The reply now carries a written record alongside the metrics, and
++these cover keeping the two apart.
++"""
++import io
++import json
++
++import pytest
++
++from app.ocr import document_processor as dp
++
++
++def _pdf(pages: int, page_size=(612, 792)) -> bytes:
++    writer = dp.PdfWriter()
++    for _ in range(pages):
++        writer.add_blank_page(width=page_size[0], height=page_size[1])
++    buf = io.BytesIO()
++    writer.write(buf)
++    return buf.getvalue()
++
++
++@pytest.fixture
++def pdf_file(tmp_path):
++    def _make(pages):
++        path = tmp_path / f"scan_{pages}.pdf"
++        path.write_bytes(_pdf(pages))
++        return path
++    return _make
++
++
++# --- splitting the reply ----------------------------------------------------
++
++def test_record_and_metrics_are_separated():
++    reply = (
++        f"{dp.RECORD_MARKER}\n"
++        "Operácia: apendektómia, 12. 3. 2019, NsP Trenčín.\n"
++        "Referenčné rozpätie [3.5-5.5] je uvedené v správe.\n"
++        f"{dp.METRICS_MARKER}\n"
++        '[{"metric": "glucose", "value": 5.2}]'
++    )
++
++    record, metrics = dp.split_document_output(reply)
++
++    assert "apendektómia" in record
++    assert dp.RECORD_MARKER not in record
++    # the bracket in the record must not reach the extractor, which reads from
++    # the first '[' to the last ']'
++    assert "[3.5-5.5]" not in metrics
++    assert json.loads(metrics)[0]["metric"] == "glucose"
++
++
++def test_a_reply_without_the_marker_is_treated_as_metrics_only():
++    """What an older document, or a model ignoring the format, produces."""
++    reply = '[{"metric": "ldl", "value": 3.6}]'
++
++    record, metrics = dp.split_document_output(reply)
++
++    assert record == ""
++    assert metrics == reply
++
++
++@pytest.mark.parametrize("dash", ["-", "—", "–"])
++def test_a_page_of_nothing_but_a_lab_table_records_nothing(dash):
++    record, _ = dp.split_document_output(
++        f"{dp.RECORD_MARKER}\n{dash}\n{dp.METRICS_MARKER}\n[]")
++
++    assert record == ""
++
++
++# --- merging batches --------------------------------------------------------
++
++def test_batches_merge_into_one_record_and_one_array():
++    outputs = [
++        f"{dp.RECORD_MARKER}\nOperácia: apendektómia 2019.\n{dp.METRICS_MARKER}\n"
++        '[{"metric": "glucose", "value": 5.2}]',
++        f"{dp.RECORD_MARKER}\nZáver: hypertenzia, Prestarium.\n{dp.METRICS_MARKER}\n"
++        '[{"metric": "ldl", "value": 3.6}]',
++    ]
++
++    record, metrics = dp.split_document_output(dp._merge_outputs(outputs))
++
++    assert "apendektómia" in record and "Prestarium" in record
++    parsed = json.loads(metrics)
++    assert [m["metric"] for m in parsed] == ["glucose", "ldl"]
++
++
++def test_one_malformed_batch_does_not_cost_the_others_their_metrics():
++    outputs = [
++        f"{dp.RECORD_MARKER}\nStrana 1.\n{dp.METRICS_MARKER}\n"
++        '[{"metric": "glucose", "value": 5.2}]',
++        f"{dp.RECORD_MARKER}\nStrana 2.\n{dp.METRICS_MARKER}\nnie som JSON",
++    ]
++
++    record, metrics = dp.split_document_output(dp._merge_outputs(outputs))
++
++    assert json.loads(metrics) == [{"metric": "glucose", "value": 5.2}]
++    # the unparsed reply is kept rather than dropped silently
++    assert "nie som JSON" in record
++
++
++# --- splitting the PDF ------------------------------------------------------
++
++def test_a_small_pdf_is_sent_whole(pdf_file):
++    batches = dp._pdf_batches(pdf_file(3))
++
++    assert len(batches) == 1
++
++
++def test_a_long_pdf_is_split_and_keeps_every_page(pdf_file):
++    path = pdf_file(100)
++
++    batches = dp._pdf_batches(path)
++
++    assert len(batches) == 10, "100 pages at 10 per batch"
++    total = sum(len(dp.PdfReader(io.BytesIO(b)).pages) for b in batches)
++    assert total == 100, "no page may be lost in the split"
++    assert all(len(dp.PdfReader(io.BytesIO(b)).pages) <= dp.MAX_PAGES_PER_BATCH
++               for b in batches)
++
++
++def test_every_batch_stays_well_under_the_request_limit(pdf_file):
++    for batch in dp._pdf_batches(pdf_file(45)):
++        # base64 adds a third; the API refuses a request over 32 MB
++        assert len(batch) * 4 / 3 < 32 * 1024 * 1024
++
++
++def test_an_empty_pdf_is_an_error_not_an_empty_result(pdf_file):
++    with pytest.raises(ValueError):
++        dp._pdf_batches(pdf_file(0))
++
++
++# --- the call itself --------------------------------------------------------
++
++class _FakeMessages:
++    def __init__(self, replies):
++        self.replies = list(replies)
++        self.calls = []
++
++    def create(self, **kwargs):
++        self.calls.append(kwargs)
++        text = self.replies.pop(0) if self.replies else "[]"
++        return type("R", (), {"content": [type("B", (), {"text": text})()]})()
++
++
++def _processor(replies):
++    processor = dp.DocumentProcessor.__new__(dp.DocumentProcessor)
++    processor.client = type("C", (), {"messages": _FakeMessages(replies)})()
++    return processor
++
++
++def test_a_long_pdf_is_one_request_per_batch(pdf_file):
++    processor = _processor([
++        f"{dp.RECORD_MARKER}\nStrana {i}.\n{dp.METRICS_MARKER}\n[]" for i in range(10)
++    ])
++
++    text = processor.process_document(pdf_file(100))
++
++    assert len(processor.client.messages.calls) == 10
++    record, metrics = dp.split_document_output(text)
++    assert "Strana 0." in record and "Strana 9." in record
++    assert json.loads(metrics) == []
++
++
++def test_a_short_pdf_is_a_single_request_returned_unchanged(pdf_file):
++    reply = f"{dp.RECORD_MARKER}\nJedna strana.\n{dp.METRICS_MARKER}\n[]"
++    processor = _processor([reply])
++
++    assert processor.process_document(pdf_file(2)) == reply
++    assert len(processor.client.messages.calls) == 1
+-- 
+2.43.0
+
