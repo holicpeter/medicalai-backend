@@ -87,6 +87,62 @@ async def get_health_summary():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/latest")
+async def get_latest_analysis():
+    """Snapshot of the current state, in the shape the chat page loads on open.
+
+    The frontend has always called this endpoint; it never existed, so the page
+    fell into its error branch on every open and then posted each question with
+    health_data = null. The chat now builds its own context server-side and no
+    longer depends on this, but the endpoint still has to answer: an older
+    deployed frontend is what is calling it, and a 404 there also means the page
+    shows its "no data loaded" greeting.
+
+    Shape is dictated by that client: a flat metrics list plus an analysis
+    object with trends, warnings and the health score.
+    """
+    try:
+        summary = metrics_analyzer.get_comprehensive_summary()
+        latest = summary.get("latest_metrics", {}) or {}
+
+        metrics = []
+        for metric_type, data in latest.items():
+            metrics.append({
+                "type": metric_type,
+                "value": data.get("value"),
+                "unit": data.get("unit"),
+                "date": data.get("date"),
+                "status": data.get("status"),
+            })
+
+        trends = []
+        try:
+            for metric_name, trend_data in (trend_analyzer.analyze_trends() or {}).items():
+                if isinstance(trend_data, dict) and "error" not in trend_data:
+                    trends.append({
+                        "metric": metric_name,
+                        "trend": trend_data.get("trend", "stable"),
+                        "interpretation": trend_data.get("interpretation"),
+                    })
+        except Exception as e:
+            logger.warning('/latest: cannot analyze trends: %s', e)
+
+        return {
+            "generated_at": summary.get("generated_at"),
+            "has_data": summary.get("has_data", bool(metrics)),
+            "metrics": metrics,
+            "analysis": {
+                "trends": trends,
+                "warnings": [alert.get("message") for alert in summary.get("alerts", [])],
+                "health_score": summary.get("health_score", 0),
+            },
+        }
+
+    except Exception as e:
+        logger.exception('/latest failed')
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/refresh-cache")
 async def refresh_trend_cache():
     """Vymaže cache a znova načíta všetky dáta"""

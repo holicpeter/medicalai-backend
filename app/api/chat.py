@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import anthropic
+from app.analysis.chat_context import build_health_context, format_health_context
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -30,17 +31,31 @@ async def ask_question(request: ChatRequest):
     Spracuje otázku používateľa a vráti odpoveď založenú na zdravotných dátach
     """
     try:
-        # Pripravíme kontext zo zdravotných dát
-        context = _prepare_health_context(request.health_data)
-        
+        # The context is built here, from the database, rather than taken from
+        # the request body. The client used to be the only source: it loaded a
+        # snapshot and posted it back, so whenever that load failed — and it
+        # always did, because the endpoint it calls did not exist — every
+        # question reached the model with no data attached and got "nemám
+        # žiadne údaje" as the honest answer to an empty context.
+        context = format_health_context(build_health_context())
+
+        if not context:
+            # Nothing stored yet. A client-supplied snapshot is still accepted
+            # so an older frontend keeps working against a new backend.
+            context = _prepare_health_context(request.health_data)
+
         # Vytvoríme prompt pre Claude AI
-        system_prompt = """Si odborný zdravotný asistent s hlbokými znalosťami medicíny. 
+        system_prompt = """Si odborný zdravotný asistent s hlbokými znalosťami medicíny.
 Tvoja úloha je odpovedať na otázky pacienta o jeho zdravotných výsledkoch.
 
 DÔLEŽITÉ PRAVIDLÁ:
 - Odpovedaj VÝHRADNE v slovenskom jazyku
 - Buď presný, faktický a opieraj sa len o poskytnuté dáta
-- Ak nemáš dostatok informácií, oznám to pacientovi
+- Nikdy si nevymýšľaj hodnoty, ktoré v dátach nie sú
+- Ak sa pacient pýta na obdobie, za ktoré nie sú merania, NEPÍŠ, že žiadne dáta
+  neexistujú. Povedz, že za dané obdobie nie sú merania, a odpovedz na základe
+  najnovších dostupných hodnôt — vždy uveď, z ktorého dátumu pochádzajú
+- Pri hodnotách uvádzaj dátum merania a zdroj, ak je relevantný
 - Nikdy nediagnostikuj choroby - len informuj o hodnotách a trendoch
 - Odporúčaj konzultáciu s lekárom pri akýchkoľvek abnormálnych hodnotách
 - Buď empatický a zrozumiteľný
