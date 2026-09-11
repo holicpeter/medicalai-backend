@@ -1,10 +1,14 @@
+import asyncio
 import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import anthropic
 from app.analysis.chat_context import build_health_context, format_health_context
+from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
 from app.config import settings
+
+_MODEL = "claude-haiku-4-5-20251001"
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +67,14 @@ DÔLEŽITÉ PRAVIDLÁ:
 - Nikdy nediagnostikuj choroby - len informuj o hodnotách a trendoch
 - Odporúčaj konzultáciu s lekárom pri akýchkoľvek abnormálnych hodnotách
 - Buď empatický a zrozumiteľný
-- Vysvetľuj medicínske pojmy jednoducho"""
+- Vysvetľuj medicínske pojmy jednoducho
+
+NÁSTROJE:
+Kontext obsahuje len posledné obdobie. Ak sa otázka týka dlhšieho obdobia alebo
+vývoja hodnoty v čase, zavolaj get_metric_history namiesto odhadovania z
+poslednej hodnoty. Ak potrebuješ iný obsah lekárskej správy než sú priložené
+úryvky, zavolaj search_documents. Neospravedlňuj sa za volanie nástroja a
+nespomínaj ho v odpovedi — pacienta zaujíma výsledok."""
 
         user_prompt = f"""ZDRAVOTNÉ DÁTA PACIENTA:
 {context}
@@ -88,13 +99,11 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
             answer = response.choices[0].message.content
         elif settings.ANTHROPIC_API_KEY:
             client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-            message = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=2048,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+            # Off the event loop: the SDK call is blocking and there can now be
+            # several of them in one question.
+            answer = await asyncio.to_thread(
+                _ask_claude, client, system_prompt, user_prompt
             )
-            answer = message.content[0].text
         else:
             raise HTTPException(
                 status_code=500,
@@ -108,6 +117,62 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
     except Exception as e:
         logger.error('Chat error: %s', e)
         raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
+
+
+def _ask_claude(client, system_prompt: str, user_prompt: str) -> str:
+    """Ask, letting the model fetch what the prompt does not already carry.
+
+    The context is a snapshot of the recent window; a question about a longer
+    period used to be answered from the latest value and a trend label, because
+    that was all the model had. Now it can call for the series instead. The
+    loop is short — a couple of lookups, then an answer.
+    """
+    messages = [{"role": "user", "content": user_prompt}]
+    response = None
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = client.messages.create(
+            model=_MODEL,
+            max_tokens=2048,
+            system=system_prompt,
+            tools=TOOL_SCHEMAS,
+            messages=messages,
+        )
+        if response.stop_reason != "tool_use":
+            break
+
+        messages.append({"role": "assistant", "content": response.content})
+        results = []
+        for block in response.content:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            logger.info("chat: tool %s(%s)", block.name, block.input)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": run_tool(block.name, block.input),
+            })
+        messages.append({"role": "user", "content": results})
+    else:
+        # Still asking for tools with the budget spent. One more turn with the
+        # tools withheld, so the model has to answer from what it already
+        # gathered — a tool_use turn carries no text, and returning that would
+        # show the patient an empty reply.
+        logger.info("chat: tool budget exhausted, answering without tools")
+        response = client.messages.create(
+            model=_MODEL,
+            max_tokens=2048,
+            system=system_prompt,
+            messages=messages,
+        )
+
+    answer = "".join(
+        block.text
+        for block in (response.content if response is not None else [])
+        if getattr(block, "type", None) == "text"
+    ).strip()
+
+    return answer or "Prepáčte, na túto otázku sa mi nepodarilo zostaviť odpoveď."
 
 
 def _prepare_health_context(health_data: Optional[Dict[str, Any]]) -> str:

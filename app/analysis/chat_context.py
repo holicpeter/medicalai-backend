@@ -186,6 +186,97 @@ def _measurements(recent_days: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return inventory, recent
 
 
+def metric_history(
+    metric: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    max_points: int = 120,
+) -> Dict[str, Any]:
+    """Aggregated history of one metric over an arbitrary range.
+
+    The context carries only a recent window, because a full series for every
+    metric would not fit. This is how the assistant reaches past it — asked
+    about "LDL za posledné dva roky" it fetches exactly that series instead of
+    guessing from the latest value and a trend label.
+
+    The granularity adapts: daily while the range is short enough to list day
+    by day, monthly once it is not, so the answer is never a truncated series
+    that silently hides half the period.
+    """
+    try:
+        rows = _rows_from_frame(TrendAnalyzer().data)
+    except Exception as e:
+        logger.warning("metric history: cannot load measurements: %s", e)
+        return {"metric": metric, "points": [], "error": "dáta sa nepodarilo načítať"}
+
+    wanted = str(metric).strip().lower()
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+
+    selected = [
+        (day, value)
+        for day, name, value, _unit, _source in rows
+        if name.lower() == wanted
+        and (start is None or day >= start)
+        and (end is None or day <= end)
+    ]
+    if not selected:
+        available = sorted({name for _d, name, _v, _u, _s in rows})
+        return {
+            "metric": metric,
+            "points": [],
+            "note": "Pre túto metriku v zadanom období nie sú merania.",
+            "available_metrics": available[:40],
+        }
+
+    by_day: Dict[date, List[float]] = {}
+    for day, value in selected:
+        by_day.setdefault(day, []).append(value)
+
+    granularity = "daily"
+    if len(by_day) > max_points:
+        granularity = "monthly"
+        by_period: Dict[str, List[float]] = {}
+        for day, values in by_day.items():
+            by_period.setdefault(day.strftime("%Y-%m"), []).extend(values)
+        buckets = by_period
+    else:
+        buckets = {day.isoformat(): values for day, values in by_day.items()}
+
+    keys = sorted(buckets)
+    if len(keys) > max_points:  # monthly over a decade would still overflow
+        keys = keys[-max_points:]
+
+    points = [
+        {
+            "period": key,
+            "n": len(buckets[key]),
+            "avg": round(sum(buckets[key]) / len(buckets[key]), 2),
+            "min": round(min(buckets[key]), 2),
+            "max": round(max(buckets[key]), 2),
+        }
+        for key in keys
+    ]
+
+    return {
+        "metric": metric,
+        "granularity": granularity,
+        "from": keys[0],
+        "to": keys[-1],
+        "measurements": len(selected),
+        "points": points,
+    }
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
 def _status(metric: str, value: Any) -> str:
     try:
         return _scorer._get_metric_status(metric, value)
