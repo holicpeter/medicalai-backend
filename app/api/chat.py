@@ -7,8 +7,19 @@ import anthropic
 from app.analysis.chat_context import build_health_context, format_health_context
 from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
 from app.config import settings
+from app.database import ChatMessage, Patient, get_session
 
 _MODEL = "claude-haiku-4-5-20251001"
+
+# Turns replayed into the prompt. Enough for "a čo tie lieky?" to know what was
+# just discussed, short enough that an old conversation is not paid for on
+# every question.
+MAX_HISTORY_TURNS = 6
+
+# A stored answer can run to a couple of thousand characters. The full text is
+# kept for the history endpoint; the replay is trimmed, because what a
+# follow-up needs is the subject, not the whole report.
+MAX_REPLAYED_CHARS = 800
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +113,11 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
             answer = response.choices[0].message.content
         elif settings.ANTHROPIC_API_KEY:
             client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            history = await asyncio.to_thread(load_history)
             # Off the event loop: the SDK call is blocking and there can now be
             # several of them in one question.
             answer = await asyncio.to_thread(
-                _ask_claude, client, system_prompt, user_prompt
+                _ask_claude, client, system_prompt, user_prompt, history
             )
         else:
             raise HTTPException(
@@ -113,6 +125,7 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
                 detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
             )
 
+        await asyncio.to_thread(_save_turn, request.question, answer)
         return ChatResponse(answer=answer)
 
     except HTTPException:
@@ -122,7 +135,67 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
         raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
 
 
-def _ask_claude(client, system_prompt: str, user_prompt: str) -> str:
+def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
+    """The last turns, oldest first, in the shape the Messages API expects.
+
+    A failure here must not cost the patient an answer: a chat without memory
+    is worse than one with it, and far better than a 500.
+    """
+    session = None
+    try:
+        # Acquired inside the try: if the database is unreachable, get_session
+        # itself raises, and a chat without memory beats a chat that 500s.
+        session = get_session()
+        rows = (
+            session.query(ChatMessage)
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(limit)
+            .all()
+        )
+        rows.reverse()
+        history = []
+        for row in rows:
+            content = row.content or ''
+            if not full and len(content) > MAX_REPLAYED_CHARS:
+                content = content[:MAX_REPLAYED_CHARS] + ' […]'
+            entry = {"role": row.role or 'user', "content": content}
+            if full:
+                entry["created_at"] = row.created_at.isoformat() if row.created_at else None
+            history.append(entry)
+        return history
+    except Exception as e:
+        logger.warning('chat history: cannot load: %s', e)
+        return []
+    finally:
+        if session is not None:
+            session.close()
+
+
+def _save_turn(question: str, answer: str) -> None:
+    session = None
+    try:
+        session = get_session()
+        patient = session.query(Patient).first()
+        patient_id = patient.id if patient else None
+        session.add(ChatMessage(patient_id=patient_id, role='user', content=question))
+        session.add(ChatMessage(patient_id=patient_id, role='assistant', content=answer))
+        session.commit()
+    except Exception as e:
+        if session is not None:
+            session.rollback()
+        logger.warning('chat history: cannot save turn: %s', e)
+    finally:
+        if session is not None:
+            session.close()
+
+
+@router.get("/history")
+async def get_chat_history(limit: int = 50):
+    """Every question and answer, with its timestamp, oldest first."""
+    return {"messages": load_history(limit=max(1, min(limit, 500)), full=True)}
+
+
+def _ask_claude(client, system_prompt: str, user_prompt: str, history: Optional[list] = None) -> str:
     """Ask, letting the model fetch what the prompt does not already carry.
 
     The context is a snapshot of the recent window; a question about a longer
@@ -130,7 +203,11 @@ def _ask_claude(client, system_prompt: str, user_prompt: str) -> str:
     that was all the model had. Now it can call for the series instead. The
     loop is short — a couple of lookups, then an answer.
     """
-    messages = [{"role": "user", "content": user_prompt}]
+    # Earlier turns go in front of this question, so a follow-up that says
+    # "a čo tie lieky?" knows what "tie" refers to. Only the questions and
+    # answers are replayed — the health context is rebuilt fresh each time and
+    # would otherwise be paid for once per remembered turn.
+    messages = list(history or []) + [{"role": "user", "content": user_prompt}]
     response = None
 
     for _ in range(MAX_TOOL_ROUNDS):

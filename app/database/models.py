@@ -99,6 +99,23 @@ class Document(Base):
     processed_at = Column(DateTime, nullable=True)
 
 
+class ChatMessage(Base):
+    """One turn of the assistant conversation.
+
+    Nothing about the chat used to survive the request: the answer went back to
+    the browser, the browser kept it in component state, and a refresh erased
+    it. That cost two things — a follow-up question had no idea what had just
+    been discussed, and there was no record of what the app had told the
+    patient, which a health product eventually has to be able to show.
+    """
+    __tablename__ = 'chat_messages'
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey('patients.id'), nullable=True)
+    role = Column(String(20))  # 'user' or 'assistant'
+    content = Column(Text)
+    created_at = Column(DateTime, default=datetime.now)
+
+
 class DocumentChunk(Base):
     """A passage of a document's transcribed text, as retrieval sees it.
 
@@ -264,6 +281,7 @@ _INDEXES = (
     ("ix_health_records_date", "health_records", "record_date"),
     ("ix_health_records_source", "health_records", "source"),
     ("ix_document_chunks_document", "document_chunks", "document_id"),
+    ("ix_chat_messages_created", "chat_messages", "created_at"),
     ("ix_documents_filename", "documents", "filename"),
 )
 
