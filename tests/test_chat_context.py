@@ -223,6 +223,40 @@ def test_documents_are_listed_and_passages_retrieved_for_a_question():
     assert "Prestarium" in text
 
 
+def test_a_crowded_profile_does_not_push_the_passages_out(monkeypatch, rows):
+    """The failure this guards against answered a question it had the answer to.
+
+    After a scanned card was imported, the metric and trend sections grew until
+    the size cap cut the context off above the retrieved passages. The model was
+    handed a profile full of numbers, never saw the passage naming an operation,
+    and replied that the system holds no record of any operation.
+    """
+    for index in range(200):
+        rows.append({"date": TODAY - timedelta(days=1), "metric": f"metrika_{index}",
+                     "value": float(index), "unit": "u", "source": "ocr"})
+
+    class _Crowded:
+        def __init__(self):
+            self.data = _frame(rows)
+
+        def analyze_trends(self):
+            return {
+                f"metrika_{i}": {"trend": "stable", "interpretation": "Hodnota je v norme" * 3}
+                for i in range(200)
+            }
+
+    monkeypatch.setattr(chat_context, "TrendAnalyzer", _Crowded)
+
+    text = chat_context.format_health_context(
+        chat_context.build_health_context(question="aké som mal operácie?"))
+
+    assert "kontext skrátený" in text, "this profile has to overflow the cap"
+    assert len(text) <= chat_context.MAX_CONTEXT_CHARS + 40
+    assert "RELEVANTNÉ ÚRYVKY" in text, "retrieval must survive the cap"
+    assert "Prestarium" in text
+    assert "NAHRANÉ LEKÁRSKE DOKUMENTY" in text
+
+
 def test_passages_sit_above_the_section_the_size_cap_trims():
     text = chat_context.format_health_context(
         chat_context.build_health_context(question="kardiológ"))

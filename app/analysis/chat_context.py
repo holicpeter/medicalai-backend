@@ -42,7 +42,14 @@ MAX_DAYS_PER_METRIC = 30
 
 # Hard ceiling on the rendered context. Claude Haiku's window is far larger,
 # but an unbounded prompt is how a cheap endpoint quietly becomes expensive.
-MAX_CONTEXT_CHARS = 16000
+# Sections are ordered so that what this cuts is the least useful: the daily
+# aggregates first, then the tail of the trend list. Retrieved passages and the
+# document list sit above both.
+MAX_CONTEXT_CHARS = 20000
+
+# One line per metric, and a scanned card can add dozens of them. Past this the
+# list stops informing and starts crowding out the sections below it.
+MAX_TRENDS = 25
 
 # Retrieved passages per question. Few on purpose: the numbers are already in
 # the context as aggregates, so the passages only have to carry the wording
@@ -444,6 +451,61 @@ def _format_number(value: Any) -> str:
     return str(value)
 
 
+def _document_sections(context: Dict[str, Any], by_source: Dict[str, Any]) -> List[str]:
+    """The document list and the passages retrieved for the question."""
+    documents = context.get("documents") or {}
+    parts: List[str] = []
+
+    doc_inventory = documents.get("inventory") or []
+    if doc_inventory:
+        lines = []
+        for document in doc_inventory:
+            when = document.get("date") or (document.get("uploaded_at") or "")[:10] or "bez dátumu"
+            note = "" if document.get("has_text") else " (text nie je uložený)"
+            lines.append(f"  - {document.get('filename')} — {when}{note}")
+        parts.append(
+            f"\n=== NAHRANÉ LEKÁRSKE DOKUMENTY ({len(doc_inventory)}) ===\n" + "\n".join(lines)
+        )
+    else:
+        # Without this the model sees a source called "ocr" with hundreds of
+        # measurements and concludes it is looking at the scanned health card.
+        # It is not: the extractor pulled the numbers out of those scans and the
+        # text around them — diagnoses, operations, medication, the doctor's
+        # conclusion — was discarded before it was ever stored. Asked "aké som
+        # mal operácie", the model has to say that and say what would fix it,
+        # not claim it can see the whole card.
+        note = (
+            "  Žiadny dokument nie je uložený aj s textom, takže o obsahu "
+            "lekárskych správ (diagnózy, operácie, lieky, závery lekárov) nemáš "
+            "žiadne informácie."
+        )
+        if "ocr" in by_source:
+            note += (
+                f"\n  Zdroj „ocr“ vyššie ({by_source['ocr']['count']} meraní) sú LEN "
+                "číselné hodnoty vyparsované z naskenovaných správ — ich text "
+                "uložený nie je."
+            )
+        note += (
+            "\n  Ak sa pacient pýta na niečo, čo môže byť len v texte správy, "
+            "povedz priamo, že tieto údaje v systéme nie sú, a navrhni dokument "
+            "nahrať znova cez sekciu Nahrať Dokumenty — vtedy sa uloží aj text."
+        )
+        parts.append("\n=== NAHRANÉ LEKÁRSKE DOKUMENTY (0) ===\n" + note)
+
+    passages = documents.get("passages") or []
+    if passages:
+        lines = []
+        for passage in passages:
+            when = f", {passage['date']}" if passage.get("date") else ""
+            lines.append(f"\n[{passage.get('document')}{when}]\n{passage.get('text')}")
+        parts.append(
+            "\n=== RELEVANTNÉ ÚRYVKY Z DOKUMENTOV (vyhľadané k tejto otázke) ==="
+            + "\n".join(lines)
+        )
+
+    return parts
+
+
 def format_health_context(context: Dict[str, Any]) -> str:
     """Render the context as the text block that goes into the prompt."""
     inventory = context.get("inventory") or {}
@@ -502,6 +564,15 @@ def format_health_context(context: Dict[str, Any]) -> str:
         ]
         parts.append("\n=== VAROVANIA ===\n" + "\n".join(lines))
 
+    # Documents and the passages retrieved for this question come before the
+    # per-metric sections, not after. They used to sit further down, and once a
+    # scanned card added dozens of metrics and trends the size cap cut the
+    # context off above them: the assistant was handed a passage naming an
+    # operation and never saw it, so it answered that the system holds no
+    # record of any operation. Retrieval that reaches the prompt is worth more
+    # than the tail of a trend list.
+    parts.extend(_document_sections(context, by_source))
+
     trends = context.get("trends") or {}
     if trends:
         lines = []
@@ -510,6 +581,8 @@ def format_health_context(context: Dict[str, Any]) -> str:
                 trend = data.get("trend", "n/a")
                 interpretation = data.get("interpretation", "")
                 lines.append(f"  - {metric}: trend {trend}. {interpretation}".rstrip())
+        if len(lines) > MAX_TRENDS:
+            lines = lines[:MAX_TRENDS] + [f"  … a ďalších {len(lines) - MAX_TRENDS} metrík"]
         if lines:
             parts.append("\n=== TRENDY ===\n" + "\n".join(lines))
 
@@ -546,52 +619,6 @@ def format_health_context(context: Dict[str, Any]) -> str:
             lines.append("  - pozn.: rizikový model nemá kompletné vstupy, ide o orientačný odhad")
         parts.append("\n=== PREDIKCIA RIZÍK (ML model) ===\n" + "\n".join(lines))
 
-    doc_inventory = documents.get("inventory") or []
-    if doc_inventory:
-        lines = []
-        for document in doc_inventory:
-            when = document.get("date") or (document.get("uploaded_at") or "")[:10] or "bez dátumu"
-            note = "" if document.get("has_text") else " (text nie je uložený)"
-            lines.append(f"  - {document.get('filename')} — {when}{note}")
-        parts.append(
-            f"\n=== NAHRANÉ LEKÁRSKE DOKUMENTY ({len(doc_inventory)}) ===\n" + "\n".join(lines)
-        )
-    else:
-        # Without this the model sees a source called "ocr" with hundreds of
-        # measurements and concludes it is looking at the scanned health card.
-        # It is not: the extractor pulled the numbers out of those scans and the
-        # text around them — diagnoses, operations, medication, the doctor's
-        # conclusion — was discarded before it was ever stored. Asked "aké som
-        # mal operácie", the model has to say that and say what would fix it,
-        # not claim it can see the whole card.
-        note = (
-            "  Žiadny dokument nie je uložený aj s textom, takže o obsahu "
-            "lekárskych správ (diagnózy, operácie, lieky, závery lekárov) nemáš "
-            "žiadne informácie."
-        )
-        if "ocr" in by_source:
-            note += (
-                f"\n  Zdroj „ocr“ vyššie ({by_source['ocr']['count']} meraní) sú LEN "
-                "číselné hodnoty vyparsované z naskenovaných správ — ich text "
-                "uložený nie je."
-            )
-        note += (
-            "\n  Ak sa pacient pýta na niečo, čo môže byť len v texte správy, "
-            "povedz priamo, že tieto údaje v systéme nie sú, a navrhni dokument "
-            "nahrať znova cez sekciu Nahrať Dokumenty — vtedy sa uloží aj text."
-        )
-        parts.append("\n=== NAHRANÉ LEKÁRSKE DOKUMENTY (0) ===\n" + note)
-
-    passages = documents.get("passages") or []
-    if passages:
-        lines = []
-        for passage in passages:
-            when = f", {passage['date']}" if passage.get("date") else ""
-            lines.append(f"\n[{passage.get('document')}{when}]\n{passage.get('text')}")
-        parts.append(
-            "\n=== RELEVANTNÉ ÚRYVKY Z DOKUMENTOV (vyhľadané k tejto otázke) ==="
-            + "\n".join(lines)
-        )
 
     # Daily aggregates go last, and deliberately so: they are by far the
     # bulkiest section (every metric × every day), and the cap below trims from
@@ -623,6 +650,17 @@ def format_health_context(context: Dict[str, Any]) -> str:
         )
 
     text = "\n".join(parts)
-    if len(text) > MAX_CONTEXT_CHARS:
+    truncated = len(text) > MAX_CONTEXT_CHARS
+    if truncated:
         text = text[:MAX_CONTEXT_CHARS] + "\n[... kontext skrátený ...]"
+
+    # Logged because the failure this prevents is invisible from the outside:
+    # the assistant answers as if data were missing, and nothing in the request
+    # or the reply says the context was cut short of it.
+    logger.info(
+        'chat context: %d chars%s, %d passages, %d documents',
+        len(text), ' (TRUNCATED)' if truncated else '',
+        len((context.get("documents") or {}).get("passages") or []),
+        len((context.get("documents") or {}).get("inventory") or []),
+    )
     return text
