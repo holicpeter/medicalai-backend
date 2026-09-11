@@ -556,6 +556,31 @@ def format_health_context(context: Dict[str, Any]) -> str:
         parts.append(
             f"\n=== NAHRANÉ LEKÁRSKE DOKUMENTY ({len(doc_inventory)}) ===\n" + "\n".join(lines)
         )
+    else:
+        # Without this the model sees a source called "ocr" with hundreds of
+        # measurements and concludes it is looking at the scanned health card.
+        # It is not: the extractor pulled the numbers out of those scans and the
+        # text around them — diagnoses, operations, medication, the doctor's
+        # conclusion — was discarded before it was ever stored. Asked "aké som
+        # mal operácie", the model has to say that and say what would fix it,
+        # not claim it can see the whole card.
+        note = (
+            "  Žiadny dokument nie je uložený aj s textom, takže o obsahu "
+            "lekárskych správ (diagnózy, operácie, lieky, závery lekárov) nemáš "
+            "žiadne informácie."
+        )
+        if "ocr" in by_source:
+            note += (
+                f"\n  Zdroj „ocr“ vyššie ({by_source['ocr']['count']} meraní) sú LEN "
+                "číselné hodnoty vyparsované z naskenovaných správ — ich text "
+                "uložený nie je."
+            )
+        note += (
+            "\n  Ak sa pacient pýta na niečo, čo môže byť len v texte správy, "
+            "povedz priamo, že tieto údaje v systéme nie sú, a navrhni dokument "
+            "nahrať znova cez sekciu Nahrať Dokumenty — vtedy sa uloží aj text."
+        )
+        parts.append("\n=== NAHRANÉ LEKÁRSKE DOKUMENTY (0) ===\n" + note)
 
     passages = documents.get("passages") or []
     if passages:

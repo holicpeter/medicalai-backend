@@ -230,6 +230,24 @@ def test_passages_sit_above_the_section_the_size_cap_trims():
     assert text.index("RELEVANTNÉ ÚRYVKY") < text.index("MERANIA ZA POSLEDNÝCH")
 
 
+def test_no_stored_documents_says_so_instead_of_implying_the_card_is_readable(monkeypatch):
+    """Measurements are not the health card.
+
+    With hundreds of rows from a source called "ocr" and no document list, the
+    model concluded it was looking at the scanned card and answered questions
+    about operations as if the card simply did not mention any. The extractor
+    only ever kept the numbers; the text around them was discarded.
+    """
+    monkeypatch.setattr(chat_context, "document_inventory", list)
+
+    text = chat_context.format_health_context(chat_context.build_health_context())
+
+    assert "NAHRANÉ LEKÁRSKE DOKUMENTY (0)" in text
+    assert "operácie" in text
+    assert "ocr" in text and "LEN" in text
+    assert "nahrať znova" in text
+
+
 def test_without_a_question_there_is_an_inventory_but_no_retrieval():
     text = chat_context.format_health_context(chat_context.build_health_context())
 
