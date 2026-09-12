@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from app.api import health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health
+from app.api import health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
 from app.config import settings
 from app.database import init_database, create_default_patient
 
@@ -87,6 +87,7 @@ app.include_router(chat.router)
 app.include_router(integrations.router)
 app.include_router(manual_entry.router)
 app.include_router(apple_health.router)
+app.include_router(nutrition.router)
 
 
 @app.get("/")

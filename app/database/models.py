@@ -30,6 +30,7 @@ class Patient(Base):
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     health_records = relationship("HealthRecord", back_populates="patient")
     family_members = relationship("FamilyMember", back_populates="patient")
+    nutrition_entries = relationship("NutritionEntry", back_populates="patient")
 
 
 class FamilyMember(Base):
@@ -79,6 +80,29 @@ class HealthRecord(Base):
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     patient = relationship("Patient", back_populates="health_records")
+
+
+class NutritionEntry(Base):
+    """Jedno zaznamenané jedlo z feature Nutrition (foto -> AI odhad nutričných hodnôt).
+
+    Fotka samotná sa neukladá natrvalo (Railway maže disk pri každom nasadení,
+    rovnaký problém ako pri Document/upload — pozri komentár v services/api.ts
+    na frontende), ukladá sa len vyextrahovaný štruktúrovaný výsledok.
+    """
+    __tablename__ = 'nutrition_entries'
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey('patients.id'))
+    logged_at = Column(DateTime, default=datetime.now)
+    items = Column(JSON)  # [{name, estimated_grams, calories, protein_g, carbs_g, fat_g, confidence}, ...]
+    total_calories = Column(Float)
+    total_protein_g = Column(Float)
+    total_carbs_g = Column(Float)
+    total_fat_g = Column(Float)
+    overall_confidence = Column(Float, nullable=True)
+    recommendation = Column(Text, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
+    patient = relationship("Patient", back_populates="nutrition_entries")
 
 
 class Document(Base):
@@ -283,6 +307,7 @@ _INDEXES = (
     ("ix_document_chunks_document", "document_chunks", "document_id"),
     ("ix_chat_messages_created", "chat_messages", "created_at"),
     ("ix_documents_filename", "documents", "filename"),
+    ("ix_nutrition_entries_patient_logged", "nutrition_entries", "patient_id, logged_at"),
 )
 
 
