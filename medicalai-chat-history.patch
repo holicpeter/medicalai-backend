@@ -1,0 +1,393 @@
+From 7b545e64c28b102ca1e0f1c3275e61fb031c3833 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 11 Sep 2026 13:59:09 +0000
+Subject: [PATCH] Store the conversation and replay the last turns
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Nothing about a chat survived the request. The answer went back to the browser,
+the browser held it in component state, and a refresh erased it. Two things
+followed from that: a follow-up question reached the model with no idea what
+had just been discussed, so "a čo tie lieky?" had no referent for "tie"; and
+there was no record of what the app had told the patient, which a health
+product has to be able to produce.
+
+chat_messages stores both sides of every turn with a timestamp. The last six
+are replayed ahead of the question — questions and answers only, since the
+health context is rebuilt from the database each time and would otherwise be
+paid for once per remembered turn, and a replayed answer is trimmed because a
+follow-up needs the subject, not the whole report.
+
+GET /api/chat/history returns the conversation with timestamps and the full
+text of every answer. The deployed frontend needs no change for the memory to
+work; this endpoint is how the history can be read until the UI shows it.
+
+Loading and saving are both best-effort: the session is acquired inside the
+try, so an unreachable database costs the memory rather than the answer.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SUjLLy2enx9LeWY7if66cK
+---
+ app/api/chat.py            |  83 ++++++++++++++++++-
+ app/database/__init__.py   |   2 +
+ app/database/models.py     |  18 +++++
+ tests/test_chat_history.py | 162 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 262 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_chat_history.py
+
+diff --git a/app/api/chat.py b/app/api/chat.py
+index 2a738b2..ebef2cd 100644
+--- a/app/api/chat.py
++++ b/app/api/chat.py
+@@ -7,9 +7,20 @@ import anthropic
+ from app.analysis.chat_context import build_health_context, format_health_context
+ from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
+ from app.config import settings
++from app.database import ChatMessage, Patient, get_session
+ 
+ _MODEL = "claude-haiku-4-5-20251001"
+ 
++# Turns replayed into the prompt. Enough for "a čo tie lieky?" to know what was
++# just discussed, short enough that an old conversation is not paid for on
++# every question.
++MAX_HISTORY_TURNS = 6
++
++# A stored answer can run to a couple of thousand characters. The full text is
++# kept for the history endpoint; the replay is trimmed, because what a
++# follow-up needs is the subject, not the whole report.
++MAX_REPLAYED_CHARS = 800
++
+ logger = logging.getLogger(__name__)
+ 
+ try:
+@@ -102,10 +113,11 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
+             answer = response.choices[0].message.content
+         elif settings.ANTHROPIC_API_KEY:
+             client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
++            history = await asyncio.to_thread(load_history)
+             # Off the event loop: the SDK call is blocking and there can now be
+             # several of them in one question.
+             answer = await asyncio.to_thread(
+-                _ask_claude, client, system_prompt, user_prompt
++                _ask_claude, client, system_prompt, user_prompt, history
+             )
+         else:
+             raise HTTPException(
+@@ -113,6 +125,7 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
+                 detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
+             )
+ 
++        await asyncio.to_thread(_save_turn, request.question, answer)
+         return ChatResponse(answer=answer)
+ 
+     except HTTPException:
+@@ -122,7 +135,67 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
+         raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
+ 
+ 
+-def _ask_claude(client, system_prompt: str, user_prompt: str) -> str:
++def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
++    """The last turns, oldest first, in the shape the Messages API expects.
++
++    A failure here must not cost the patient an answer: a chat without memory
++    is worse than one with it, and far better than a 500.
++    """
++    session = None
++    try:
++        # Acquired inside the try: if the database is unreachable, get_session
++        # itself raises, and a chat without memory beats a chat that 500s.
++        session = get_session()
++        rows = (
++            session.query(ChatMessage)
++            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
++            .limit(limit)
++            .all()
++        )
++        rows.reverse()
++        history = []
++        for row in rows:
++            content = row.content or ''
++            if not full and len(content) > MAX_REPLAYED_CHARS:
++                content = content[:MAX_REPLAYED_CHARS] + ' […]'
++            entry = {"role": row.role or 'user', "content": content}
++            if full:
++                entry["created_at"] = row.created_at.isoformat() if row.created_at else None
++            history.append(entry)
++        return history
++    except Exception as e:
++        logger.warning('chat history: cannot load: %s', e)
++        return []
++    finally:
++        if session is not None:
++            session.close()
++
++
++def _save_turn(question: str, answer: str) -> None:
++    session = None
++    try:
++        session = get_session()
++        patient = session.query(Patient).first()
++        patient_id = patient.id if patient else None
++        session.add(ChatMessage(patient_id=patient_id, role='user', content=question))
++        session.add(ChatMessage(patient_id=patient_id, role='assistant', content=answer))
++        session.commit()
++    except Exception as e:
++        if session is not None:
++            session.rollback()
++        logger.warning('chat history: cannot save turn: %s', e)
++    finally:
++        if session is not None:
++            session.close()
++
++
++@router.get("/history")
++async def get_chat_history(limit: int = 50):
++    """Every question and answer, with its timestamp, oldest first."""
++    return {"messages": load_history(limit=max(1, min(limit, 500)), full=True)}
++
++
++def _ask_claude(client, system_prompt: str, user_prompt: str, history: Optional[list] = None) -> str:
+     """Ask, letting the model fetch what the prompt does not already carry.
+ 
+     The context is a snapshot of the recent window; a question about a longer
+@@ -130,7 +203,11 @@ def _ask_claude(client, system_prompt: str, user_prompt: str) -> str:
+     that was all the model had. Now it can call for the series instead. The
+     loop is short — a couple of lookups, then an answer.
+     """
+-    messages = [{"role": "user", "content": user_prompt}]
++    # Earlier turns go in front of this question, so a follow-up that says
++    # "a čo tie lieky?" knows what "tie" refers to. Only the questions and
++    # answers are replayed — the health context is rebuilt fresh each time and
++    # would otherwise be paid for once per remembered turn.
++    messages = list(history or []) + [{"role": "user", "content": user_prompt}]
+     response = None
+ 
+     for _ in range(MAX_TOOL_ROUNDS):
+diff --git a/app/database/__init__.py b/app/database/__init__.py
+index 5491b29..e025b42 100644
+--- a/app/database/__init__.py
++++ b/app/database/__init__.py
+@@ -6,6 +6,7 @@ from .models import (
+     HealthRecord,
+     Document,
+     DocumentChunk,
++    ChatMessage,
+     GarminData,
+     CalendarEvent,
+     AppleHealthData,
+@@ -21,6 +22,7 @@ __all__ = [
+     "HealthRecord",
+     "Document",
+     "DocumentChunk",
++    "ChatMessage",
+     "GarminData",
+     "CalendarEvent",
+     "AppleHealthData",
+diff --git a/app/database/models.py b/app/database/models.py
+index 46d95af..af24234 100644
+--- a/app/database/models.py
++++ b/app/database/models.py
+@@ -99,6 +99,23 @@ class Document(Base):
+     processed_at = Column(DateTime, nullable=True)
+ 
+ 
++class ChatMessage(Base):
++    """One turn of the assistant conversation.
++
++    Nothing about the chat used to survive the request: the answer went back to
++    the browser, the browser kept it in component state, and a refresh erased
++    it. That cost two things — a follow-up question had no idea what had just
++    been discussed, and there was no record of what the app had told the
++    patient, which a health product eventually has to be able to show.
++    """
++    __tablename__ = 'chat_messages'
++    id = Column(Integer, primary_key=True)
++    patient_id = Column(Integer, ForeignKey('patients.id'), nullable=True)
++    role = Column(String(20))  # 'user' or 'assistant'
++    content = Column(Text)
++    created_at = Column(DateTime, default=datetime.now)
++
++
+ class DocumentChunk(Base):
+     """A passage of a document's transcribed text, as retrieval sees it.
+ 
+@@ -264,6 +281,7 @@ _INDEXES = (
+     ("ix_health_records_date", "health_records", "record_date"),
+     ("ix_health_records_source", "health_records", "source"),
+     ("ix_document_chunks_document", "document_chunks", "document_id"),
++    ("ix_chat_messages_created", "chat_messages", "created_at"),
+     ("ix_documents_filename", "documents", "filename"),
+ )
+ 
+diff --git a/tests/test_chat_history.py b/tests/test_chat_history.py
+new file mode 100644
+index 0000000..2a29bf6
+--- /dev/null
++++ b/tests/test_chat_history.py
+@@ -0,0 +1,162 @@
++"""The conversation is stored, and the last turns are replayed into the prompt.
++
++Nothing about a chat used to survive the request. The answer went to the
++browser, the browser held it in component state, and a refresh erased it — so
++"a čo tie lieky?" reached the model with no idea what "tie" referred to, and
++there was no record of what the app had told the patient.
++"""
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++
++import pytest
++
++from app.api import chat as chat_api
++
++
++class _Row:
++    def __init__(self, role, content, created_at):
++        self.role = role
++        self.content = content
++        self.created_at = created_at
++
++
++class _Query:
++    """Enough of the SQLAlchemy query chain for the two calls under test."""
++
++    def __init__(self, rows, saved):
++        self.rows = rows
++        self.saved = saved
++        self._limit = None
++
++    def order_by(self, *args):
++        return self
++
++    def limit(self, count):
++        self._limit = count
++        return self
++
++    def all(self):
++        # newest first, as the query asks for
++        ordered = sorted(self.rows, key=lambda r: r.created_at, reverse=True)
++        return ordered[:self._limit] if self._limit else ordered
++
++    def first(self):
++        return SimpleNamespace(id=1)
++
++
++class _Session:
++    def __init__(self, rows, saved):
++        self.rows = rows
++        self.saved = saved
++        self.committed = False
++
++    def query(self, model):
++        if model is chat_api.Patient:
++            return _Query([], self.saved)
++        return _Query(self.rows, self.saved)
++
++    def add(self, row):
++        self.saved.append(row)
++
++    def commit(self):
++        self.committed = True
++
++    def rollback(self):
++        pass
++
++    def close(self):
++        pass
++
++
++@pytest.fixture
++def stored():
++    base = datetime(2026, 9, 11, 14, 0, 0)
++    return [
++        _Row("user", "aké mám hodnoty cholesterolu?", base),
++        _Row("assistant", "LDL 3,63 mmol/l k 19. 11. 2024.", base + timedelta(seconds=8)),
++    ]
++
++
++@pytest.fixture
++def saved():
++    return []
++
++
++@pytest.fixture(autouse=True)
++def session(monkeypatch, stored, saved):
++    monkeypatch.setattr(chat_api, "get_session", lambda: _Session(stored, saved))
++
++
++def test_history_comes_back_oldest_first_in_message_shape():
++    history = chat_api.load_history()
++
++    assert [m["role"] for m in history] == ["user", "assistant"]
++    assert history[0]["content"].startswith("aké mám hodnoty")
++    assert "created_at" not in history[0], "the replay carries no timestamps"
++
++
++def test_the_history_endpoint_keeps_timestamps_and_the_whole_answer(stored):
++    stored[1].content = "x" * 5000
++
++    history = chat_api.load_history(limit=50, full=True)
++
++    assert history[1]["content"] == "x" * 5000
++    assert history[1]["created_at"] == "2026-09-11T14:00:08"
++
++
++def test_a_long_answer_is_trimmed_before_it_is_replayed(stored):
++    stored[1].content = "x" * 5000
++
++    replayed = chat_api.load_history()[1]["content"]
++
++    assert len(replayed) <= chat_api.MAX_REPLAYED_CHARS + 10
++    assert replayed.endswith("[…]")
++
++
++def test_only_the_last_turns_are_replayed(stored):
++    base = datetime(2026, 9, 11, 12, 0, 0)
++    for index in range(20):
++        stored.append(_Row("user", f"otázka {index}", base + timedelta(minutes=index)))
++
++    assert len(chat_api.load_history()) == chat_api.MAX_HISTORY_TURNS
++
++
++def test_a_broken_database_costs_the_memory_not_the_answer(monkeypatch):
++    def _boom():
++        raise RuntimeError("db down")
++
++    monkeypatch.setattr(chat_api, "get_session", _boom)
++
++    assert chat_api.load_history() == []
++
++
++def test_both_sides_of_the_turn_are_saved(saved):
++    chat_api._save_turn("aké som mal operácie?", "Orchiopexia, 27. 1. 1993.")
++
++    assert [row.role for row in saved] == ["user", "assistant"]
++    assert saved[0].content == "aké som mal operácie?"
++    assert saved[1].content == "Orchiopexia, 27. 1. 1993."
++
++
++def test_earlier_turns_are_sent_ahead_of_the_question():
++    """What makes a follow-up question resolvable at all."""
++    class _Client:
++        def __init__(self):
++            self.calls = []
++            self.messages = SimpleNamespace(create=self._create)
++
++        def _create(self, **kwargs):
++            self.calls.append(kwargs)
++            return SimpleNamespace(
++                stop_reason="end_turn",
++                content=[SimpleNamespace(type="text", text="Odpoveď.")],
++            )
++
++    client = _Client()
++
++    chat_api._ask_claude(client, "system", "a čo tie lieky?", chat_api.load_history())
++
++    sent = client.calls[0]["messages"]
++    assert len(sent) == 3
++    assert sent[0]["content"].startswith("aké mám hodnoty")
++    assert sent[-1]["content"] == "a čo tie lieky?"
+-- 
+2.43.0
+
