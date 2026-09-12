@@ -1,0 +1,546 @@
+diff --git a/app/api/nutrition.py b/app/api/nutrition.py
+new file mode 100644
+index 0000000..149247d
+--- /dev/null
++++ b/app/api/nutrition.py
+@@ -0,0 +1,256 @@
++import asyncio
++import logging
++from datetime import date, datetime, timedelta
++from typing import List, Optional
++
++from fastapi import APIRouter, HTTPException, UploadFile, File
++from pydantic import BaseModel
++
++from app.database import get_session, Patient, NutritionEntry
++from app.nutrition.analyzer import MealAnalyzer
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/api/nutrition", tags=["nutrition"])
++analyzer = MealAnalyzer()
++
++_ALLOWED_MEDIA_TYPES = {'image/jpeg', 'image/jpg', 'image/png', 'image/heic', 'image/heif'}
++_MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB — fotka z mobilu s rezervou
++
++# Orientačné denné ciele, zatiaľ jednotné pre všetkých používateľov.
++# Fáza 2/3: nahradiť hodnotami odvodenými z profilu pacienta (Patient).
++_DEFAULT_DAILY_TARGETS = {
++    'calories': 2000,
++    'protein_g': 90,
++    'carbs_g': 250,
++    'fat_g': 70,
++}
++
++
++class FoodItemModel(BaseModel):
++    name: str
++    estimated_grams: float
++    calories: float
++    protein_g: float
++    carbs_g: float
++    fat_g: float
++    confidence: float = 0.5
++
++
++class NutritionEntryCreate(BaseModel):
++    items: List[FoodItemModel]
++    total_calories: float
++    total_protein_g: float
++    total_carbs_g: float
++    total_fat_g: float
++    overall_confidence: Optional[float] = None
++    recommendation: Optional[str] = None
++    notes: Optional[str] = None
++
++
++def _get_default_patient(session) -> Patient:
++    patient = session.query(Patient).first()
++    if not patient:
++        raise HTTPException(status_code=404, detail="Patient not found")
++    return patient
++
++
++def _serialize_entry(entry: NutritionEntry) -> dict:
++    return {
++        "id": entry.id,
++        "logged_at": entry.logged_at.isoformat() if entry.logged_at else None,
++        "items": entry.items or [],
++        "total_calories": entry.total_calories,
++        "total_protein_g": entry.total_protein_g,
++        "total_carbs_g": entry.total_carbs_g,
++        "total_fat_g": entry.total_fat_g,
++        "overall_confidence": entry.overall_confidence,
++        "recommendation": entry.recommendation,
++        "notes": entry.notes,
++    }
++
++
++def _day_bounds(day: date) -> tuple:
++    start = datetime.combine(day, datetime.min.time())
++    return start, start + timedelta(days=1)
++
++
++@router.post("/analyze")
++async def analyze_meal_photo(file: UploadFile = File(...)):
++    """Odfotené jedlo -> Claude vision -> štruktúrovaný odhad nutričných hodnôt.
++
++    Toto len analyzuje a vráti výsledok, neukladá nič do denníka — uloženie
++    (prípadne po úprave porcie používateľom) ide cez POST /entries.
++    """
++    content_type = (file.content_type or '').split(';')[0].strip().lower()
++    if content_type not in _ALLOWED_MEDIA_TYPES:
++        raise HTTPException(
++            status_code=400,
++            detail=f"Nepodporovaný typ obrázka '{content_type or 'unknown'}'. "
++                   f"Povolené: {sorted(_ALLOWED_MEDIA_TYPES)}",
++        )
++
++    image_bytes = await file.read()
++    if not image_bytes:
++        raise HTTPException(status_code=400, detail="Prázdny súbor.")
++    if len(image_bytes) > _MAX_UPLOAD_BYTES:
++        raise HTTPException(status_code=413, detail="Fotka je príliš veľká (max 8 MB).")
++
++    try:
++        # Blocking Claude API call beží v samostatnom threade, rovnaký prístup
++        # ako pri OCR (app/api/upload.py), nech neblokuje event loop.
++        result = await asyncio.to_thread(
++            analyzer.analyze_meal_photo, image_bytes, content_type,
++        )
++    except RuntimeError as e:
++        logger.error('Meal analysis not configured: %s', e)
++        raise HTTPException(status_code=500, detail=str(e))
++    except ValueError as e:
++        logger.warning('Meal analysis returned unparseable output: %s', e)
++        raise HTTPException(
++            status_code=502,
++            detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s jasnejšou fotkou.",
++        )
++    except Exception as e:
++        logger.error('Meal analysis failed: %s', e)
++        raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze fotky.")
++
++    result['disclaimer'] = (
++        'Toto je len orientačný odhad na základe fotky, nie presné laboratórne meranie. '
++        'Skutočná gramáž a nutričné hodnoty sa môžu líšiť, najmä pri zmiešaných jedlách. '
++        'Uprav porciu, ak si myslíš, že odhad nesedí.'
++    )
++    return result
++
++
++@router.post("/entries")
++async def save_nutrition_entry(data: NutritionEntryCreate):
++    """Uloží (prípadne používateľom upravenú) analýzu jedla do denníka."""
++    session = get_session()
++    try:
++        patient = _get_default_patient(session)
++
++        entry = NutritionEntry(
++            patient_id=patient.id,
++            logged_at=datetime.now(),
++            items=[item.model_dump() for item in data.items],
++            total_calories=data.total_calories,
++            total_protein_g=data.total_protein_g,
++            total_carbs_g=data.total_carbs_g,
++            total_fat_g=data.total_fat_g,
++            overall_confidence=data.overall_confidence,
++            recommendation=data.recommendation,
++            notes=data.notes,
++        )
++        session.add(entry)
++        session.commit()
++        session.refresh(entry)
++
++        return _serialize_entry(entry)
++    finally:
++        session.close()
++
++
++@router.get("/entries")
++async def list_nutrition_entries(target_date: Optional[date] = None):
++    """Zoznam zaznamenaných jedál pre daný deň (default: dnes), najnovšie prvé."""
++    day = target_date or date.today()
++    start, end = _day_bounds(day)
++
++    session = get_session()
++    try:
++        patient = _get_default_patient(session)
++        entries = (
++            session.query(NutritionEntry)
++            .filter(
++                NutritionEntry.patient_id == patient.id,
++                NutritionEntry.logged_at >= start,
++                NutritionEntry.logged_at < end,
++            )
++            .order_by(NutritionEntry.logged_at.desc())
++            .all()
++        )
++        return [_serialize_entry(e) for e in entries]
++    finally:
++        session.close()
++
++
++@router.delete("/entries/{entry_id}")
++async def delete_nutrition_entry(entry_id: int):
++    session = get_session()
++    try:
++        entry = session.query(NutritionEntry).filter_by(id=entry_id).first()
++        if not entry:
++            raise HTTPException(status_code=404, detail="Záznam sa nenašiel.")
++        session.delete(entry)
++        session.commit()
++        return {"success": True}
++    finally:
++        session.close()
++
++
++@router.get("/summary")
++async def get_daily_summary(target_date: Optional[date] = None):
++    """Súčet kalórií/makier za daný deň + jednoduché pravidlové odporúčanie.
++
++    Toto je zámerne "hlúpe" pravidlové odporúčanie, nie AI — plná personalizácia
++    naviazaná na anamnézu a rodinné riziká je Fáza 3 (feature-analysis-nutrition-photo.md).
++    """
++    day = target_date or date.today()
++    start, end = _day_bounds(day)
++
++    session = get_session()
++    try:
++        patient = _get_default_patient(session)
++        entries = (
++            session.query(NutritionEntry)
++            .filter(
++                NutritionEntry.patient_id == patient.id,
++                NutritionEntry.logged_at >= start,
++                NutritionEntry.logged_at < end,
++            )
++            .all()
++        )
++    finally:
++        session.close()
++
++    totals = {
++        'calories': round(sum(e.total_calories or 0 for e in entries), 1),
++        'protein_g': round(sum(e.total_protein_g or 0 for e in entries), 1),
++        'carbs_g': round(sum(e.total_carbs_g or 0 for e in entries), 1),
++        'fat_g': round(sum(e.total_fat_g or 0 for e in entries), 1),
++    }
++
++    return {
++        'date': day.isoformat(),
++        'totals': totals,
++        'targets': _DEFAULT_DAILY_TARGETS,
++        'meals_logged': len(entries),
++        'recommendation': _build_recommendation(totals, len(entries)),
++    }
++
++
++def _build_recommendation(totals: dict, meals_logged: int) -> str:
++    if meals_logged == 0:
++        return 'Zatiaľ dnes nemáš zaznamenané žiadne jedlo. Odfoť svoje prvé jedlo a začni sledovať príjem.'
++
++    targets = _DEFAULT_DAILY_TARGETS
++    notes = []
++
++    protein_ratio = totals['protein_g'] / targets['protein_g'] if targets['protein_g'] else 0
++    calories_ratio = totals['calories'] / targets['calories'] if targets['calories'] else 0
++
++    if protein_ratio < 0.6:
++        notes.append('príjem bielkovín je zatiaľ nízky vzhľadom na denný cieľ – zváž pridať zdroj bielkovín k ďalšiemu jedlu')
++    elif protein_ratio > 1.3:
++        notes.append('príjem bielkovín dnes prekročil bežný denný cieľ')
++
++    if calories_ratio > 1.1:
++        notes.append('celkový kalorický príjem už prekročil orientačný denný cieľ')
++    elif calories_ratio < 0.4 and meals_logged >= 2:
++        notes.append('celkový kalorický príjem je zatiaľ dosť nízky vzhľadom na počet zaznamenaných jedál – over, či niečo nechýba v denníku')
++
++    if not notes:
++        return 'Dnešný príjem vyzerá zatiaľ vyvážený vzhľadom na orientačné denné ciele.'
++
++    return f"Poznámka k dnešnému dňu: {'; '.join(notes)}."
+diff --git a/app/database/__init__.py b/app/database/__init__.py
+index db0264b..bb1c35b 100644
+--- a/app/database/__init__.py
++++ b/app/database/__init__.py
+@@ -4,6 +4,7 @@ from .models import (
+     Patient,
+     FamilyMember,
+     HealthRecord,
++    NutritionEntry,
+     Document,
+     GarminData,
+     CalendarEvent,
+@@ -18,6 +19,7 @@ __all__ = [
+     "Patient",
+     "FamilyMember",
+     "HealthRecord",
++    "NutritionEntry",
+     "Document",
+     "GarminData",
+     "CalendarEvent",
+diff --git a/app/database/models.py b/app/database/models.py
+index 96e23c7..a816e3c 100644
+--- a/app/database/models.py
++++ b/app/database/models.py
+@@ -30,6 +30,7 @@ class Patient(Base):
+     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+     health_records = relationship("HealthRecord", back_populates="patient")
+     family_members = relationship("FamilyMember", back_populates="patient")
++    nutrition_entries = relationship("NutritionEntry", back_populates="patient")
+ 
+ 
+ class FamilyMember(Base):
+@@ -81,6 +82,29 @@ class HealthRecord(Base):
+     patient = relationship("Patient", back_populates="health_records")
+ 
+ 
++class NutritionEntry(Base):
++    """Jedno zaznamenané jedlo z feature Nutrition (foto -> AI odhad nutričných hodnôt).
++
++    Fotka samotná sa neukladá natrvalo (Railway maže disk pri každom nasadení,
++    rovnaký problém ako pri Document/upload — pozri komentár v services/api.ts
++    na frontende), ukladá sa len vyextrahovaný štruktúrovaný výsledok.
++    """
++    __tablename__ = 'nutrition_entries'
++    id = Column(Integer, primary_key=True)
++    patient_id = Column(Integer, ForeignKey('patients.id'))
++    logged_at = Column(DateTime, default=datetime.now)
++    items = Column(JSON)  # [{name, estimated_grams, calories, protein_g, carbs_g, fat_g, confidence}, ...]
++    total_calories = Column(Float)
++    total_protein_g = Column(Float)
++    total_carbs_g = Column(Float)
++    total_fat_g = Column(Float)
++    overall_confidence = Column(Float, nullable=True)
++    recommendation = Column(Text, nullable=True)
++    notes = Column(Text, nullable=True)
++    created_at = Column(DateTime, default=datetime.now)
++    patient = relationship("Patient", back_populates="nutrition_entries")
++
++
+ class Document(Base):
+     __tablename__ = 'documents'
+     id = Column(Integer, primary_key=True)
+@@ -248,6 +272,7 @@ _INDEXES = (
+     ("ix_health_records_patient_metric", "health_records", "patient_id, metric_type"),
+     ("ix_health_records_date", "health_records", "record_date"),
+     ("ix_health_records_source", "health_records", "source"),
++    ("ix_nutrition_entries_patient_logged", "nutrition_entries", "patient_id, logged_at"),
+ )
+ 
+ 
+diff --git a/app/main.py b/app/main.py
+index 99517a6..6186f40 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import JSONResponse
+ import uvicorn
+ 
+-from app.api import health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health
++from app.api import health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
+ from app.config import settings
+ from app.database import init_database, create_default_patient
+ 
+@@ -87,6 +87,7 @@ app.include_router(chat.router)
+ app.include_router(integrations.router)
+ app.include_router(manual_entry.router)
+ app.include_router(apple_health.router)
++app.include_router(nutrition.router)
+ 
+ 
+ @app.get("/")
+diff --git a/app/nutrition/__init__.py b/app/nutrition/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/nutrition/analyzer.py b/app/nutrition/analyzer.py
+new file mode 100644
+index 0000000..8b1acd3
+--- /dev/null
++++ b/app/nutrition/analyzer.py
+@@ -0,0 +1,184 @@
++import io
++import json
++import logging
++import os
++import re
++from typing import Dict, List, Optional
++
++import anthropic
++from PIL import Image
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
++# Malý/lacný model zámerne — ide o úzku, vysokofrekvenčnú extrakčnú úlohu
++# (3-5x/deň/používateľ), nie o hlboké uvažovanie. Pozri projektový dokument
++# ai-model-selection-strategy.md pre zdôvodnenie tohto výberu.
++
++_ANALYSIS_INSTRUCTION = """\
++You are analyzing a photo of a meal for a health-tracking app. Identify every
++distinct food item visible, estimate its portion size in grams using visual
++cues (plate size, cutlery, common serving sizes), and estimate its calories
++and macronutrients at that estimated portion.
++
++Be honest that portion estimation from a single photo has real limits,
++especially for mixed dishes with hidden ingredients (oil, sauces, sugar) —
++reflect that in the confidence values rather than always returning a high
++number.
++
++Return ONLY a JSON object — no other text, no markdown, no explanation.
++
++Format:
++{
++  "items": [
++    {"name": "grilované kuracie prsia", "estimated_grams": 150, "calories": 248, "protein_g": 46.5, "carbs_g": 0, "fat_g": 5.4, "confidence": 0.6},
++    {"name": "ryža", "estimated_grams": 180, "calories": 234, "protein_g": 4.9, "carbs_g": 50.6, "fat_g": 0.4, "confidence": 0.5}
++  ],
++  "total_calories": 482,
++  "total_protein_g": 51.4,
++  "total_carbs_g": 50.6,
++  "total_fat_g": 5.8,
++  "overall_confidence": 0.55,
++  "recommendation": "Jedna až dve krátke vety po slovensky, praktické a neklinické, NIE diagnóza."
++}
++
++Rules:
++- estimated_grams, calories, protein_g, carbs_g, fat_g must be numbers >= 0
++- confidence and overall_confidence are numbers between 0.0 and 1.0
++- name should be in Slovak
++- recommendation must be in Slovak
++- include every distinct food item you can identify, even small ones
++"""
++
++
++def _read_image_as_jpeg(image_bytes: bytes) -> bytes:
++    """Normalise any supported input (incl. HEIC, via the app-wide heif opener
++    registered in app.ocr.document_processor) to a JPEG Claude will accept."""
++    img = Image.open(io.BytesIO(image_bytes))
++    if img.mode not in ('RGB', 'L'):
++        img = img.convert('RGB')
++    buf = io.BytesIO()
++    img.save(buf, format='JPEG', quality=90)
++    return buf.getvalue()
++
++
++class MealAnalyzer:
++    """Claude vision integrácia pre analýzu jedla z fotky."""
++
++    def __init__(self):
++        from app.config import settings
++        api_key = settings.ANTHROPIC_API_KEY or os.environ.get('ANTHROPIC_API_KEY')
++        self.client = anthropic.Anthropic(api_key=api_key) if api_key else None
++
++    def analyze_meal_photo(self, image_bytes: bytes, media_type: str) -> Dict:
++        """Zavolá Claude vision na fotke jedla a vráti spracovaný (validovaný) dict.
++
++        Vyhadzuje RuntimeError, ak klient nie je nakonfigurovaný, alebo
++        ValueError, ak sa z odpovede nedá vyparsovať platný výsledok.
++        """
++        if self.client is None:
++            raise RuntimeError('ANTHROPIC_API_KEY is not set')
++
++        if media_type not in ('image/jpeg', 'image/png'):
++            # HEIC a pod. prevedieme na JPEG (rovnaký prístup ako pri OCR skenoch).
++            image_bytes = _read_image_as_jpeg(image_bytes)
++            media_type = 'image/jpeg'
++
++        import base64
++        file_data = base64.standard_b64encode(image_bytes).decode('utf-8')
++
++        content = [
++            {
++                'type': 'image',
++                'source': {'type': 'base64', 'media_type': media_type, 'data': file_data},
++            },
++            {
++                'type': 'text',
++                'text': _ANALYSIS_INSTRUCTION,
++                'cache_control': {'type': 'ephemeral'},
++            },
++        ]
++
++        message = self.client.messages.create(
++            model=DEFAULT_MODEL,
++            max_tokens=1024,
++            messages=[{'role': 'user', 'content': content}],
++        )
++
++        text = message.content[0].text
++        logger.info('Meal analysis response: %d characters', len(text))
++        return parse_meal_analysis(text)
++
++
++def parse_meal_analysis(text: str) -> Dict:
++    """Parsuje JSON objekt z odpovede Claude, s rovnakým prístupom ako
++    HealthDataExtractor._parse_json — strip markdown fences, nájdi {...},
++    validuj a znormalizuj polia."""
++    stripped = text.strip()
++    stripped = re.sub(r'^```(?:json)?\s*', '', stripped)
++    stripped = re.sub(r'\s*```$', '', stripped)
++    start = stripped.find('{')
++    end = stripped.rfind('}') + 1
++    if start == -1 or end <= start:
++        raise ValueError('No JSON object found in model response')
++
++    raw = json.loads(stripped[start:end])
++
++    raw_items = raw.get('items') if isinstance(raw, dict) else None
++    items: List[Dict] = []
++    for item in (raw_items or []):
++        if not isinstance(item, dict):
++            continue
++        name = str(item.get('name') or '').strip()
++        if not name:
++            continue
++        items.append({
++            'name': name,
++            'estimated_grams': _to_number(item.get('estimated_grams')),
++            'calories': _to_number(item.get('calories')),
++            'protein_g': _to_number(item.get('protein_g')),
++            'carbs_g': _to_number(item.get('carbs_g')),
++            'fat_g': _to_number(item.get('fat_g')),
++            'confidence': _clamp01(_to_number(item.get('confidence'), default=0.5)),
++        })
++
++    if items:
++        total_calories = round(sum(i['calories'] for i in items), 1)
++        total_protein_g = round(sum(i['protein_g'] for i in items), 1)
++        total_carbs_g = round(sum(i['carbs_g'] for i in items), 1)
++        total_fat_g = round(sum(i['fat_g'] for i in items), 1)
++    else:
++        total_calories = _to_number(raw.get('total_calories'))
++        total_protein_g = _to_number(raw.get('total_protein_g'))
++        total_carbs_g = _to_number(raw.get('total_carbs_g'))
++        total_fat_g = _to_number(raw.get('total_fat_g'))
++
++    recommendation = raw.get('recommendation')
++    if not isinstance(recommendation, str) or not recommendation.strip():
++        recommendation = 'Skús udržať vyváženú porciu bielkovín, sacharidov a tukov pri ďalšom jedle.'
++
++    return {
++        'items': items,
++        'total_calories': total_calories,
++        'total_protein_g': total_protein_g,
++        'total_carbs_g': total_carbs_g,
++        'total_fat_g': total_fat_g,
++        'overall_confidence': _clamp01(_to_number(raw.get('overall_confidence'), default=0.5)),
++        'recommendation': recommendation,
++    }
++
++
++def _to_number(value, default: float = 0.0) -> float:
++    if value is None:
++        return default
++    try:
++        n = float(str(value).replace(',', '.'))
++    except (ValueError, TypeError):
++        return default
++    return round(n, 1) if n >= 0 else default
++
++
++def _clamp01(value: Optional[float]) -> float:
++    if value is None:
++        return 0.5
++    return max(0.0, min(1.0, value))
