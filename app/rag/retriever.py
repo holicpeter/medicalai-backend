@@ -195,27 +195,36 @@ class _Index:
         return scores
 
 
-_index: Optional[_Index] = None
-_index_built_at: Optional[datetime] = None
+_index_cache: Dict[int, _Index] = {}
+_index_built_at: Dict[int, datetime] = {}
 
 
-def invalidate_cache() -> None:
+def invalidate_cache(patient_id: Optional[int] = None) -> None:
     """Drop the in-memory index so the next search reloads from the database.
 
     Called after an upload, for the same reason TrendAnalyzer.invalidate_cache
     is: without it a freshly uploaded report stays invisible for the TTL.
+    Keyed per patient for the same reason TrendAnalyzer's cache is — one flat
+    process-wide index would return one patient's medical report passages to
+    another patient's chat. Omit patient_id to clear every patient's index at
+    once (used by tests and maintenance scripts).
     """
-    global _index, _index_built_at
-    _index = None
-    _index_built_at = None
+    global _index_cache, _index_built_at
+    if patient_id is None:
+        _index_cache = {}
+        _index_built_at = {}
+    else:
+        _index_cache.pop(patient_id, None)
+        _index_built_at.pop(patient_id, None)
 
 
-def _load_chunks() -> List[_IndexedChunk]:
+def _load_chunks(patient_id: int) -> List[_IndexedChunk]:
     session = get_session()
     try:
         rows = (
             session.query(DocumentChunk, Document)
-            .outerjoin(Document, DocumentChunk.document_id == Document.id)
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .filter(Document.patient_id == patient_id)
             .all()
         )
         chunks = []
@@ -235,7 +244,7 @@ def _load_chunks() -> List[_IndexedChunk]:
             )
             indexed.tokens = _tokenize(indexed.text)
             chunks.append(indexed)
-        logger.info("RAG: indexed %d chunks from documents", len(chunks))
+        logger.info("RAG: indexed %d chunks from documents for patient %s", len(chunks), patient_id)
         return chunks
     except Exception as e:
         logger.warning("RAG: cannot load document chunks: %s", e)
@@ -244,26 +253,26 @@ def _load_chunks() -> List[_IndexedChunk]:
         session.close()
 
 
-def _get_index() -> _Index:
-    global _index, _index_built_at
+def _get_index(patient_id: int) -> _Index:
+    built_at = _index_built_at.get(patient_id)
     fresh = (
-        _index is not None
-        and _index_built_at is not None
-        and (datetime.now() - _index_built_at).total_seconds() < _CACHE_TTL_SECONDS
+        patient_id in _index_cache
+        and built_at is not None
+        and (datetime.now() - built_at).total_seconds() < _CACHE_TTL_SECONDS
     )
     if not fresh:
-        _index = _Index(_load_chunks())
-        _index_built_at = datetime.now()
-    return _index
+        _index_cache[patient_id] = _Index(_load_chunks(patient_id))
+        _index_built_at[patient_id] = datetime.now()
+    return _index_cache[patient_id]
 
 
-def search(query: str, limit: int = DEFAULT_TOP_K) -> List[Dict]:
-    """Passages most relevant to the question, best first."""
+def search(query: str, patient_id: int, limit: int = DEFAULT_TOP_K) -> List[Dict]:
+    """Passages most relevant to the question, best first — one patient's documents only."""
     tokens = _tokenize(query or "")
     if not tokens:
         return []
 
-    index = _get_index()
+    index = _get_index(patient_id)
     if not index.total:
         return []
 
@@ -288,8 +297,8 @@ def search(query: str, limit: int = DEFAULT_TOP_K) -> List[Dict]:
     return results
 
 
-def document_inventory() -> List[Dict]:
-    """Every stored document, so the assistant knows what exists at all.
+def document_inventory(patient_id: int) -> List[Dict]:
+    """Every stored document for one patient, so the assistant knows what exists at all.
 
     Retrieval can miss; a list of what is on file cannot. It is small enough to
     carry in every prompt and stops the model from claiming a report is not
@@ -297,7 +306,12 @@ def document_inventory() -> List[Dict]:
     """
     session = get_session()
     try:
-        documents = session.query(Document).order_by(Document.uploaded_at.desc()).all()
+        documents = (
+            session.query(Document)
+            .filter(Document.patient_id == patient_id)
+            .order_by(Document.uploaded_at.desc())
+            .all()
+        )
         inventory = []
         for document in documents:
             inventory.append({
@@ -318,6 +332,7 @@ def document_inventory() -> List[Dict]:
 def index_document(
     filename: str,
     text: str,
+    patient_id: int,
     file_path: Optional[str] = None,
     file_type: Optional[str] = None,
     file_size_bytes: Optional[int] = None,
@@ -328,16 +343,23 @@ def index_document(
 
     Re-uploading the same filename replaces the previous text and chunks rather
     than stacking a second copy, so retrieval cannot return the same passage
-    twice with different wording.
+    twice with different wording. The lookup for "is this a re-upload" is
+    scoped to the same patient — two different patients uploading a file with
+    the same name (e.g. both named it "vysledky.pdf") must not overwrite each
+    other's document.
     """
     if not text or not text.strip():
         return None
 
     session = get_session()
     try:
-        document = session.query(Document).filter_by(filename=filename).first()
+        document = (
+            session.query(Document)
+            .filter_by(filename=filename, patient_id=patient_id)
+            .first()
+        )
         if document is None:
-            document = Document(filename=filename)
+            document = Document(filename=filename, patient_id=patient_id)
             session.add(document)
 
         document.file_path = file_path or document.file_path or ""
@@ -365,7 +387,7 @@ def index_document(
         session.commit()
         document_id = document.id
         logger.info("RAG: stored document %s (id=%s)", filename, document_id)
-        invalidate_cache()
+        invalidate_cache(patient_id)
         return document_id
 
     except Exception as e:
