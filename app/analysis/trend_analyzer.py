@@ -3,10 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
-from pathlib import Path
-import json
 
-from app.config import settings
 from app.analysis.sources import load_all_measurements
 
 logger = logging.getLogger(__name__)
@@ -22,62 +19,79 @@ def _to_float(value):
 
 
 class TrendAnalyzer:
-    _data_cache = None
-    _cache_timestamp = None
-    _cache_ttl = 300  # seconds
+    """Loads and caches one patient's measurements.
 
-    def __init__(self):
+    The cache used to be a single shared slot (`_data_cache`/`_cache_timestamp`
+    held one DataFrame for the whole process) because there was only ever one
+    patient to cache. It is now a dict keyed by patient_id — the risk of
+    getting this wrong is not just a stale cache, it is one patient's request
+    reading another patient's cached rows, so every access below goes through
+    the patient_id key rather than a bare class attribute.
+    """
+
+    _cache_ttl = 300  # seconds
+    _data_cache: Dict[int, pd.DataFrame] = {}
+    _cache_timestamp: Dict[int, datetime] = {}
+
+    def __init__(self, patient_id: int):
+        self.patient_id = patient_id
         self.refresh()
 
     @classmethod
-    def invalidate_cache(cls):
-        """Drop the shared cache so the next request reloads from the database.
+    def invalidate_cache(cls, patient_id: Optional[int] = None):
+        """Drop the cache for one patient, or every patient if none is given.
 
         Call this from every endpoint that writes health data, otherwise new
-        records stay invisible in /trends for up to the cache TTL.
+        records stay invisible in /trends for up to the cache TTL. Passing the
+        specific patient_id is preferred — clearing everyone's cache because
+        one patient wrote a record is safe (nothing leaks) but forces every
+        other patient's next request to recompute for no reason. A caller that
+        does not have a patient_id handy (e.g. a maintenance script) can still
+        omit it to clear all of them.
         """
-        cls._data_cache = None
-        cls._cache_timestamp = None
+        if patient_id is None:
+            cls._data_cache.clear()
+            cls._cache_timestamp.clear()
+        else:
+            cls._data_cache.pop(patient_id, None)
+            cls._cache_timestamp.pop(patient_id, None)
 
     def refresh(self):
         """Load data, reusing the shared cache while it is still fresh.
 
-        This has to run per request, not once in __init__. The router keeps a
-        single module-level analyzer, so doing the TTL check at construction
-        time froze self.data for the life of the process — newly imported
-        records never showed up in /trends until a restart.
+        This has to run per request, not once in __init__. The router used to
+        keep a single module-level analyzer, so doing the TTL check at
+        construction time froze self.data for the life of the process — newly
+        imported records never showed up in /trends until a restart. Analyzers
+        are now built per request (see app/api/analysis.py), so this mostly
+        guards against a caller that keeps one around across requests.
         """
-        if (
-            TrendAnalyzer._data_cache is not None
-            and TrendAnalyzer._cache_timestamp
-            and (datetime.now() - TrendAnalyzer._cache_timestamp).total_seconds() < TrendAnalyzer._cache_ttl
-        ):
-            self.data = TrendAnalyzer._data_cache
-            logger.debug('Using cached trend data (%d rows)', len(self.data))
+        cached_at = TrendAnalyzer._cache_timestamp.get(self.patient_id)
+        fresh = (
+            self.patient_id in TrendAnalyzer._data_cache
+            and cached_at is not None
+            and (datetime.now() - cached_at).total_seconds() < TrendAnalyzer._cache_ttl
+        )
+        if fresh:
+            self.data = TrendAnalyzer._data_cache[self.patient_id]
+            logger.debug('Using cached trend data for patient %s (%d rows)', self.patient_id, len(self.data))
         else:
             self.data = self._load_data()
-            TrendAnalyzer._data_cache = self.data
-            TrendAnalyzer._cache_timestamp = datetime.now()
-            logger.info('Loaded fresh trend data (%d rows), cached for %ds', len(self.data), TrendAnalyzer._cache_ttl)
+            TrendAnalyzer._data_cache[self.patient_id] = self.data
+            TrendAnalyzer._cache_timestamp[self.patient_id] = datetime.now()
+            logger.info(
+                'Loaded fresh trend data for patient %s (%d rows), cached for %ds',
+                self.patient_id, len(self.data), TrendAnalyzer._cache_ttl,
+            )
 
     def _load_data(self) -> pd.DataFrame:
-        all_metrics = []
-
-        # 1. Legacy JSON files (older exports)
-        for json_file in settings.PROCESSED_DATA_DIR.glob("extracted_data_*.json"):
-            try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    metrics = json.load(f)
-                    for metric in metrics:
-                        if metric.get('metric') == 'pulse':
-                            metric['metric'] = 'heart_rate'
-                    all_metrics.extend(metrics)
-            except Exception as e:
-                logger.warning('Error loading %s: %s', json_file, e)
-
-        # Every stored source, loaded in one place so this and the dashboard
+        # Legacy JSON exports (extracted_data_*.json) predate per-patient
+        # scoping and carry no patient_id of their own — see the identical
+        # note in app.analysis.health_metrics for why that path was dropped
+        # rather than attributed to every patient. Every stored source is now
+        # loaded through the one DB-backed loader, so this and the dashboard
         # analyzer can never drift apart on which tables they read.
-        all_metrics.extend(load_all_measurements())
+        all_metrics = load_all_measurements(self.patient_id)
 
         if not all_metrics:
             return pd.DataFrame()

@@ -77,20 +77,21 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 
-def _get_metric_history(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _get_metric_history(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
     return metric_history(
         metric=payload.get("metric", ""),
+        patient_id=patient_id,
         start_date=payload.get("start_date"),
         end_date=payload.get("end_date"),
     )
 
 
-def _search_documents(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _search_documents(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
     try:
         limit = int(payload.get("limit") or 5)
     except (TypeError, ValueError):
         limit = 5
-    results = search_documents(payload.get("query", ""), limit=max(1, min(limit, 8)))
+    results = search_documents(payload.get("query", ""), patient_id, limit=max(1, min(limit, 8)))
     for result in results:
         text = result.get("text") or ""
         if len(text) > MAX_DOCUMENT_CHARS:
@@ -104,8 +105,14 @@ _HANDLERS = {
 }
 
 
-def run_tool(name: str, payload: Dict[str, Any]) -> str:
+def run_tool(name: str, payload: Dict[str, Any], patient_id: int) -> str:
     """Execute one tool call and return its result as JSON text.
+
+    patient_id is never taken from the model's tool input — it comes from the
+    authenticated request that started this chat turn (see app/api/chat.py),
+    the same as every other data access in the app. A tool schema that let the
+    model pass its own patient_id would turn "look up my metric history" into
+    a parameter an attacker-controlled prompt could set to someone else's.
 
     A failing tool comes back as an error string rather than an exception: the
     model can say what it could not look up, which is a better answer than a
@@ -116,7 +123,7 @@ def run_tool(name: str, payload: Dict[str, Any]) -> str:
         return json.dumps({"error": f"Neznámy nástroj: {name}"}, ensure_ascii=False)
 
     try:
-        result = handler(payload or {})
+        result = handler(payload or {}, patient_id)
     except Exception as e:
         logger.warning("chat tool %s failed: %s", name, e)
         result = {"error": f"Nástroj zlyhal: {e}"}
