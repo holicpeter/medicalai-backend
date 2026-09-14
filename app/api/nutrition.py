@@ -1,12 +1,14 @@
 import asyncio
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 
-from app.database import get_session, Patient, NutritionEntry
+from app.database import get_session, Patient, NutritionEntry, NutritionTextCache
 from app.nutrition.analyzer import MealAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,20 @@ def _day_bounds(day: date) -> tuple:
     return start, start + timedelta(days=1)
 
 
+def _normalize_description(text: str) -> str:
+    """Normalizuje popis jedla pre cache lookup.
+
+    Zámerne jednoduché a konzervatívne — case-insensitive, orezané a zjednotené
+    biele znaky. Cieľom je chytiť presne ten istý (alebo takmer identicky
+    napísaný) popis znova, nie robiť fuzzy matching naprieč rôznymi jedlami.
+    Pri zdravotnej appke je nesprávne priradený odhad horší než jedno AI
+    volanie navyše, tak radšej cache miss než falošný hit.
+    """
+    normalized = text.strip().lower()
+    normalized = re.sub(r'\s+', ' ', normalized)
+    return normalized[:2000]
+
+
 @router.post("/analyze")
 async def analyze_meal_photo(file: UploadFile = File(...)):
     """Odfotené jedlo -> Claude vision -> štruktúrovaný odhad nutričných hodnôt.
@@ -124,7 +140,15 @@ async def analyze_meal_photo(file: UploadFile = File(...)):
         'Skutočná gramáž a nutričné hodnoty sa môžu líšiť, najmä pri zmiešaných jedlách. '
         'Uprav porciu, ak si myslíš, že odhad nesedí.'
     )
+    result['from_cache'] = False  # fotky sa necachujú (pozri NutritionTextCache docstring)
     return result
+
+
+_TEXT_CACHE_DISCLAIMER = (
+    'Toto je len orientačný odhad na základe textového popisu, nie presné laboratórne meranie. '
+    'Skutočná gramáž a nutričné hodnoty sa môžu líšiť najmä pri chýbajúcich detailoch (príprava, omáčky). '
+    'Uprav hodnoty, ak si myslíš, že odhad nesedí.'
+)
 
 
 @router.post("/analyze-text")
@@ -134,7 +158,32 @@ async def analyze_meal_text(data: MealTextRequest):
     Rovnaký kontrakt ako POST /analyze (fotka): len analyzuje a vráti výsledok,
     neukladá nič do denníka — uloženie ide rovnako cez POST /entries, ktoré je
     zdroju analýzy (fotka vs. text) ľahostajné.
+
+    Pred volaním AI sa skúsi presný (normalizovaný) match v NutritionTextCache —
+    ak niekto napíše rovnaký popis znova (rutinné raňajky/obed), ušetrí to celé
+    volanie Claude API. Pozri ai-model-selection-strategy.md, krok 2.
     """
+    normalized = _normalize_description(data.description)
+
+    session = get_session()
+    try:
+        cached = (
+            session.query(NutritionTextCache)
+            .filter_by(description_normalized=normalized)
+            .first()
+        )
+        if cached:
+            cached.hit_count = (cached.hit_count or 0) + 1
+            cached.last_used_at = datetime.now()
+            session.commit()
+            result = dict(cached.analysis_json)
+            result['disclaimer'] = _TEXT_CACHE_DISCLAIMER
+            result['from_cache'] = True
+            logger.info('Nutrition text cache hit (hit_count=%s)', cached.hit_count)
+            return result
+    finally:
+        session.close()
+
     try:
         result = await asyncio.to_thread(
             analyzer.analyze_meal_text, data.description,
@@ -152,11 +201,27 @@ async def analyze_meal_text(data: MealTextRequest):
         logger.error('Meal text analysis failed: %s', e)
         raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze popisu jedla.")
 
-    result['disclaimer'] = (
-        'Toto je len orientačný odhad na základe textového popisu, nie presné laboratórne meranie. '
-        'Skutočná gramáž a nutričné hodnoty sa môžu líšiť najmä pri chýbajúcich detailoch (príprava, omáčky). '
-        'Uprav hodnoty, ak si myslíš, že odhad nesedí.'
-    )
+    # Cache zápis je best-effort — ak zlyhá (napr. súbežný rovnaký request
+    # vyhral unique constraint pretek), analýza sa aj tak vráti používateľovi.
+    cache_session = get_session()
+    try:
+        cache_session.add(NutritionTextCache(
+            description_normalized=normalized,
+            description_original=data.description,
+            analysis_json=result,
+            hit_count=1,
+        ))
+        cache_session.commit()
+    except IntegrityError:
+        cache_session.rollback()
+    except Exception as e:
+        cache_session.rollback()
+        logger.warning('Failed to write nutrition text cache: %s', e)
+    finally:
+        cache_session.close()
+
+    result['disclaimer'] = _TEXT_CACHE_DISCLAIMER
+    result['from_cache'] = False
     return result
 
 
