@@ -15,17 +15,9 @@ DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
 # (3-5x/deň/používateľ), nie o hlboké uvažovanie. Pozri projektový dokument
 # ai-model-selection-strategy.md pre zdôvodnenie tohto výberu.
 
-_ANALYSIS_INSTRUCTION = """\
-You are analyzing a photo of a meal for a health-tracking app. Identify every
-distinct food item visible, estimate its portion size in grams using visual
-cues (plate size, cutlery, common serving sizes), and estimate its calories
-and macronutrients at that estimated portion.
-
-Be honest that portion estimation from a single photo has real limits,
-especially for mixed dishes with hidden ingredients (oil, sauces, sugar) —
-reflect that in the confidence values rather than always returning a high
-number.
-
+# Spoločný "chvost" pre obidve vetvy (fotka aj text) — formát výstupu musí byť
+# identický, aby parse_meal_analysis() nemusela rozlišovať, odkiaľ odpoveď prišla.
+_ANALYSIS_OUTPUT_FORMAT = """\
 Return ONLY a JSON object — no other text, no markdown, no explanation.
 
 Format:
@@ -50,6 +42,37 @@ Rules:
 - include every distinct food item you can identify, even small ones
 """
 
+_PHOTO_ANALYSIS_INTRO = """\
+You are analyzing a photo of a meal for a health-tracking app. Identify every
+distinct food item visible, estimate its portion size in grams using visual
+cues (plate size, cutlery, common serving sizes), and estimate its calories
+and macronutrients at that estimated portion.
+
+Be honest that portion estimation from a single photo has real limits,
+especially for mixed dishes with hidden ingredients (oil, sauces, sugar) —
+reflect that in the confidence values rather than always returning a high
+number.
+
+"""
+
+_TEXT_ANALYSIS_INTRO = """\
+You are estimating the nutrition of a meal that a user of a health-tracking
+app described in their own words. Split the description into distinct food
+items, estimate the portion of each in grams — honouring any quantities or
+units the user gave, and falling back to a typical serving size where they
+gave none — and estimate its calories and macronutrients at that estimated
+portion.
+
+Be honest that a written description has limits of its own: preparation
+method, added fat, sauces and dressings often go unmentioned — reflect that
+in the confidence values rather than always returning a high number. Do not
+invent items the description does not mention.
+
+"""
+
+_ANALYSIS_INSTRUCTION = _PHOTO_ANALYSIS_INTRO + _ANALYSIS_OUTPUT_FORMAT
+_TEXT_ANALYSIS_INSTRUCTION = _TEXT_ANALYSIS_INTRO + _ANALYSIS_OUTPUT_FORMAT
+
 
 def _read_image_as_jpeg(image_bytes: bytes) -> bytes:
     """Normalise any supported input (incl. HEIC, via the app-wide heif opener
@@ -63,7 +86,7 @@ def _read_image_as_jpeg(image_bytes: bytes) -> bytes:
 
 
 class MealAnalyzer:
-    """Claude vision integrácia pre analýzu jedla z fotky."""
+    """Claude integrácia pre analýzu jedla — z fotky (vision) alebo z textového popisu."""
 
     def __init__(self):
         from app.config import settings
@@ -107,6 +130,41 @@ class MealAnalyzer:
 
         text = message.content[0].text
         logger.info('Meal analysis response: %d characters', len(text))
+        return parse_meal_analysis(text)
+
+    def analyze_meal_text(self, description: str) -> Dict:
+        """To isté ako analyze_meal_photo, ale zo slovného popisu jedla namiesto fotky.
+
+        Rovnaký model, rovnaký tvar výstupu a rovnaké výnimky — RuntimeError,
+        ak klient nie je nakonfigurovaný, ValueError, ak sa z odpovede nedá
+        vyparsovať platný výsledok.
+        """
+        if self.client is None:
+            raise RuntimeError('ANTHROPIC_API_KEY is not set')
+
+        content = [
+            {
+                'type': 'text',
+                'text': _TEXT_ANALYSIS_INSTRUCTION,
+                'cache_control': {'type': 'ephemeral'},
+            },
+            # Popis ide do samostatného bloku až za cache breakpoint. Keby bol
+            # vložený priamo do inštrukcie, menil by sa cachovaný prefix pri
+            # každom requeste a cache by nikdy nesadla.
+            {
+                'type': 'text',
+                'text': f'Meal description from the user:\n{description}',
+            },
+        ]
+
+        message = self.client.messages.create(
+            model=DEFAULT_MODEL,
+            max_tokens=1024,
+            messages=[{'role': 'user', 'content': content}],
+        )
+
+        text = message.content[0].text
+        logger.info('Meal text analysis response: %d characters', len(text))
         return parse_meal_analysis(text)
 
 
