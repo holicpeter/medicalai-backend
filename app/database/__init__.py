@@ -1,6 +1,7 @@
 # Database module
 from .models import (
     Base,
+    User,
     Patient,
     FamilyMember,
     HealthRecord,
@@ -19,6 +20,7 @@ from .models import (
 
 __all__ = [
     "Base",
+    "User",
     "Patient",
     "FamilyMember",
     "HealthRecord",

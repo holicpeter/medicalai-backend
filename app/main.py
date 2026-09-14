@@ -7,9 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from app.api import health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
+from app.api import auth, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
 from app.config import settings
-from app.database import init_database, create_default_patient
+from app.database import init_database
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,7 +22,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     try:
         init_database()
-        create_default_patient()
+        # create_default_patient() used to run here, making an implicit
+        # unowned Patient row for the app's one-and-only user. Patients are
+        # now created at registration (app/api/auth.py), one per User, so an
+        # unowned row here would just be orphaned data with nobody scoped to
+        # read it. Pre-existing production data is handled once by
+        # scripts/migrate_multi_user.py, which links it to an admin account
+        # (or creates one) — see that script before running this branch
+        # against the production database for the first time.
         logger.info('Database initialized successfully')
     except Exception as e:
         logger.error('Failed to initialize database: %s', e)
@@ -40,7 +47,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
     allow_origin_regex=settings.ALLOWED_ORIGIN_REGEX,
-    allow_credentials=False,
+    # Auth now rides an httpOnly cookie (see app/auth/dependencies.py) instead
+    # of a client-readable token, and a cookie is only attached to a
+    # cross-origin fetch() when the browser is told the response allows
+    # credentialed requests — allow_credentials=False silently drops the
+    # cookie on every request from the frontend's own domain.
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -79,6 +91,7 @@ async def require_proxy_secret(request: Request, call_next):
 
     return await call_next(request)
 
+app.include_router(auth.router)
 app.include_router(health.router, prefix="/api/health", tags=["health"])
 app.include_router(upload.router, prefix="/api/upload", tags=["upload"])
 app.include_router(analysis.router, prefix="/api/analysis", tags=["analysis"])
