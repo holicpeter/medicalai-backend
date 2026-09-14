@@ -1,13 +1,14 @@
 import asyncio
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import anthropic
 from app.analysis.chat_context import build_health_context, format_health_context
+from app.auth.dependencies import get_current_patient_id
 from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
 from app.config import settings
-from app.database import ChatMessage, Patient, get_session
+from app.database import ChatMessage, get_session
 
 _MODEL = "claude-haiku-4-5-20251001"
 
@@ -41,7 +42,7 @@ class ChatResponse(BaseModel):
 
 
 @router.post("/ask", response_model=ChatResponse)
-async def ask_question(request: ChatRequest):
+async def ask_question(request: ChatRequest, patient_id: int = Depends(get_current_patient_id)):
     """
     Spracuje otázku používateľa a vráti odpoveď založenú na zdravotných dátach
     """
@@ -52,7 +53,7 @@ async def ask_question(request: ChatRequest):
         # always did, because the endpoint it calls did not exist — every
         # question reached the model with no data attached and got "nemám
         # žiadne údaje" as the honest answer to an empty context.
-        context = format_health_context(build_health_context(question=request.question))
+        context = format_health_context(build_health_context(patient_id, question=request.question))
 
         if not context:
             # Nothing stored yet. A client-supplied snapshot is still accepted
@@ -113,11 +114,11 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
             answer = response.choices[0].message.content
         elif settings.ANTHROPIC_API_KEY:
             client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-            history = await asyncio.to_thread(load_history)
+            history = await asyncio.to_thread(load_history, patient_id)
             # Off the event loop: the SDK call is blocking and there can now be
             # several of them in one question.
             answer = await asyncio.to_thread(
-                _ask_claude, client, system_prompt, user_prompt, history
+                _ask_claude, client, system_prompt, user_prompt, history, patient_id
             )
         else:
             raise HTTPException(
@@ -125,7 +126,7 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
                 detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
             )
 
-        await asyncio.to_thread(_save_turn, request.question, answer)
+        await asyncio.to_thread(_save_turn, patient_id, request.question, answer)
         return ChatResponse(answer=answer)
 
     except HTTPException:
@@ -135,8 +136,8 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
         raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
 
 
-def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
-    """The last turns, oldest first, in the shape the Messages API expects.
+def load_history(patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
+    """The last turns for one patient, oldest first, in the shape the Messages API expects.
 
     A failure here must not cost the patient an answer: a chat without memory
     is worse than one with it, and far better than a 500.
@@ -148,6 +149,7 @@ def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
         session = get_session()
         rows = (
             session.query(ChatMessage)
+            .filter(ChatMessage.patient_id == patient_id)
             .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
             .limit(limit)
             .all()
@@ -171,12 +173,10 @@ def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
             session.close()
 
 
-def _save_turn(question: str, answer: str) -> None:
+def _save_turn(patient_id: int, question: str, answer: str) -> None:
     session = None
     try:
         session = get_session()
-        patient = session.query(Patient).first()
-        patient_id = patient.id if patient else None
         session.add(ChatMessage(patient_id=patient_id, role='user', content=question))
         session.add(ChatMessage(patient_id=patient_id, role='assistant', content=answer))
         session.commit()
@@ -190,12 +190,15 @@ def _save_turn(question: str, answer: str) -> None:
 
 
 @router.get("/history")
-async def get_chat_history(limit: int = 50):
-    """Every question and answer, with its timestamp, oldest first."""
-    return {"messages": load_history(limit=max(1, min(limit, 500)), full=True)}
+async def get_chat_history(limit: int = 50, patient_id: int = Depends(get_current_patient_id)):
+    """Every question and answer for the current patient, with its timestamp, oldest first."""
+    return {"messages": load_history(patient_id, limit=max(1, min(limit, 500)), full=True)}
 
 
-def _ask_claude(client, system_prompt: str, user_prompt: str, history: Optional[list] = None) -> str:
+def _ask_claude(
+    client, system_prompt: str, user_prompt: str,
+    history: Optional[list] = None, patient_id: Optional[int] = None,
+) -> str:
     """Ask, letting the model fetch what the prompt does not already carry.
 
     The context is a snapshot of the recent window; a question about a longer
@@ -230,7 +233,7 @@ def _ask_claude(client, system_prompt: str, user_prompt: str, history: Optional[
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": run_tool(block.name, block.input),
+                "content": run_tool(block.name, block.input, patient_id),
             })
         messages.append({"role": "user", "content": results})
     else:

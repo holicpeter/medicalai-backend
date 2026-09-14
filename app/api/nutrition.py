@@ -3,10 +3,11 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 
-from app.database import get_session, Patient, NutritionEntry
+from app.auth.dependencies import get_current_patient_id
+from app.database import get_session, NutritionEntry
 from app.nutrition.analyzer import MealAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -50,13 +51,6 @@ class NutritionEntryCreate(BaseModel):
     overall_confidence: Optional[float] = None
     recommendation: Optional[str] = None
     notes: Optional[str] = None
-
-
-def _get_default_patient(session) -> Patient:
-    patient = session.query(Patient).first()
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
-    return patient
 
 
 def _serialize_entry(entry: NutritionEntry) -> dict:
@@ -161,14 +155,15 @@ async def analyze_meal_text(data: MealTextRequest):
 
 
 @router.post("/entries")
-async def save_nutrition_entry(data: NutritionEntryCreate):
+async def save_nutrition_entry(
+    data: NutritionEntryCreate,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Uloží (prípadne používateľom upravenú) analýzu jedla do denníka."""
     session = get_session()
     try:
-        patient = _get_default_patient(session)
-
         entry = NutritionEntry(
-            patient_id=patient.id,
+            patient_id=patient_id,
             logged_at=datetime.now(),
             items=[item.model_dump() for item in data.items],
             total_calories=data.total_calories,
@@ -189,18 +184,20 @@ async def save_nutrition_entry(data: NutritionEntryCreate):
 
 
 @router.get("/entries")
-async def list_nutrition_entries(target_date: Optional[date] = None):
+async def list_nutrition_entries(
+    target_date: Optional[date] = None,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Zoznam zaznamenaných jedál pre daný deň (default: dnes), najnovšie prvé."""
     day = target_date or date.today()
     start, end = _day_bounds(day)
 
     session = get_session()
     try:
-        patient = _get_default_patient(session)
         entries = (
             session.query(NutritionEntry)
             .filter(
-                NutritionEntry.patient_id == patient.id,
+                NutritionEntry.patient_id == patient_id,
                 NutritionEntry.logged_at >= start,
                 NutritionEntry.logged_at < end,
             )
@@ -213,10 +210,20 @@ async def list_nutrition_entries(target_date: Optional[date] = None):
 
 
 @router.delete("/entries/{entry_id}")
-async def delete_nutrition_entry(entry_id: int):
+async def delete_nutrition_entry(
+    entry_id: int,
+    patient_id: int = Depends(get_current_patient_id),
+):
     session = get_session()
     try:
-        entry = session.query(NutritionEntry).filter_by(id=entry_id).first()
+        # Scoped by patient_id, not just id: an id-only lookup would let any
+        # authenticated user delete another patient's entry by guessing/
+        # incrementing the id (IDOR).
+        entry = (
+            session.query(NutritionEntry)
+            .filter_by(id=entry_id, patient_id=patient_id)
+            .first()
+        )
         if not entry:
             raise HTTPException(status_code=404, detail="Záznam sa nenašiel.")
         session.delete(entry)
@@ -227,7 +234,10 @@ async def delete_nutrition_entry(entry_id: int):
 
 
 @router.get("/summary")
-async def get_daily_summary(target_date: Optional[date] = None):
+async def get_daily_summary(
+    target_date: Optional[date] = None,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Súčet kalórií/makier za daný deň + jednoduché pravidlové odporúčanie.
 
     Toto je zámerne "hlúpe" pravidlové odporúčanie, nie AI — plná personalizácia
@@ -238,11 +248,10 @@ async def get_daily_summary(target_date: Optional[date] = None):
 
     session = get_session()
     try:
-        patient = _get_default_patient(session)
         entries = (
             session.query(NutritionEntry)
             .filter(
-                NutritionEntry.patient_id == patient.id,
+                NutritionEntry.patient_id == patient_id,
                 NutritionEntry.logged_at >= start,
                 NutritionEntry.logged_at < end,
             )

@@ -16,6 +16,7 @@ import pytest
 from app.analysis import chat_context
 
 TODAY = date.today()
+PATIENT_ID = 1
 
 DOCUMENTS = [
     {"filename": "kardio-marec.pdf", "type": "lab_report", "date": "2026-03-14",
@@ -113,7 +114,8 @@ def stub_sources(monkeypatch, rows):
     test stay real, including the thresholds shared with HealthMetricsAnalyzer.
     """
     class _TrendAnalyzer:
-        def __init__(self):
+        def __init__(self, patient_id):
+            self.patient_id = patient_id
             self.data = _frame(rows)
 
         def analyze_trends(self):
@@ -129,11 +131,11 @@ def stub_sources(monkeypatch, rows):
 
     monkeypatch.setattr(chat_context, "TrendAnalyzer", _TrendAnalyzer)
     monkeypatch.setattr(chat_context, "get_session", lambda: _Session())
-    monkeypatch.setattr(chat_context, "document_inventory", lambda: list(DOCUMENTS))
+    monkeypatch.setattr(chat_context, "document_inventory", lambda patient_id: list(DOCUMENTS))
     monkeypatch.setattr(chat_context, "search_documents",
-                        lambda q, limit=5: list(PASSAGES) if q else [])
+                        lambda q, patient_id, limit=5: list(PASSAGES) if q else [])
     # the ML predictor loads its own view of the data; not what these cover
-    monkeypatch.setattr(chat_context, "_risks", lambda: {})
+    monkeypatch.setattr(chat_context, "_risks", lambda patient_id: {})
 
 
 @pytest.mark.parametrize("metric,value,expected", [
@@ -150,7 +152,7 @@ def test_split_value(metric, value, expected):
 
 
 def test_inventory_counts_every_source_and_splits_blood_pressure():
-    inventory = chat_context.build_health_context()["inventory"]
+    inventory = chat_context.build_health_context(PATIENT_ID)["inventory"]
 
     # 12 heart rate + 1 glucose + blood pressure as two series; the undated row drops
     assert inventory["total_rows"] == 15
@@ -161,7 +163,7 @@ def test_inventory_counts_every_source_and_splits_blood_pressure():
 
 
 def test_latest_value_carries_date_and_status():
-    by_metric = chat_context.build_health_context()["inventory"]["by_metric"]
+    by_metric = chat_context.build_health_context(PATIENT_ID)["inventory"]["by_metric"]
 
     glucose = by_metric["glucose"]
     assert glucose["latest_value"] == 7.4
@@ -171,7 +173,7 @@ def test_latest_value_carries_date_and_status():
 
 
 def test_recent_window_aggregates_per_day_and_excludes_older_values():
-    recent = chat_context.build_health_context(recent_days=30)["recent"]
+    recent = chat_context.build_health_context(PATIENT_ID, recent_days=30)["recent"]
 
     assert len(recent["heart_rate"]) == 3
     day = recent["heart_rate"][0]
@@ -182,20 +184,20 @@ def test_recent_window_aggregates_per_day_and_excludes_older_values():
 
 
 def test_trends_drop_errors_and_the_full_series():
-    trends = chat_context.build_health_context()["trends"]
+    trends = chat_context.build_health_context(PATIENT_ID)["trends"]
 
     assert "values_over_time" not in trends["heart_rate"]
     assert "glucose" not in trends, "entries carrying an error are not trends"
 
 
 def test_patient_age_is_derived_from_date_of_birth():
-    assert chat_context.build_health_context()["patient"]["age"] == (
+    assert chat_context.build_health_context(PATIENT_ID)["patient"]["age"] == (
         TODAY.year - 1985 - ((TODAY.month, TODAY.day) < (4, 12))
     )
 
 
 def test_rendered_context_holds_what_the_model_needs():
-    text = chat_context.format_health_context(chat_context.build_health_context())
+    text = chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID))
 
     assert "DNEŠNÝ DÁTUM" in text
     assert "RODINNÁ ANAMNÉZA" in text and "hypertenzia" in text
@@ -206,7 +208,7 @@ def test_rendered_context_holds_what_the_model_needs():
 def test_empty_window_reports_the_latest_values_instead_of_no_data():
     """The exact case that produced "v systéme nie sú zaznamenané žiadne merania"."""
     text = chat_context.format_health_context(
-        chat_context.build_health_context(recent_days=0))
+        chat_context.build_health_context(PATIENT_ID, recent_days=0))
 
     assert "Za toto obdobie nie sú žiadne merania" in text
     assert "NAJNOVŠIA HODNOTA KAŽDEJ METRIKY" in text
@@ -214,7 +216,7 @@ def test_empty_window_reports_the_latest_values_instead_of_no_data():
 
 
 def test_documents_are_listed_and_passages_retrieved_for_a_question():
-    context = chat_context.build_health_context(question="čo písal kardiológ?")
+    context = chat_context.build_health_context(PATIENT_ID, question="čo písal kardiológ?")
     text = chat_context.format_health_context(context)
 
     assert context["documents"]["passages"], "a question must trigger retrieval"
@@ -248,7 +250,7 @@ def test_a_crowded_profile_does_not_push_the_passages_out(monkeypatch, rows):
     monkeypatch.setattr(chat_context, "TrendAnalyzer", _Crowded)
 
     text = chat_context.format_health_context(
-        chat_context.build_health_context(question="aké som mal operácie?"))
+        chat_context.build_health_context(PATIENT_ID, question="aké som mal operácie?"))
 
     assert "kontext skrátený" in text, "this profile has to overflow the cap"
     assert len(text) <= chat_context.MAX_CONTEXT_CHARS + 40
@@ -259,7 +261,7 @@ def test_a_crowded_profile_does_not_push_the_passages_out(monkeypatch, rows):
 
 def test_passages_sit_above_the_section_the_size_cap_trims():
     text = chat_context.format_health_context(
-        chat_context.build_health_context(question="kardiológ"))
+        chat_context.build_health_context(PATIENT_ID, question="kardiológ"))
 
     assert text.index("RELEVANTNÉ ÚRYVKY") < text.index("MERANIA ZA POSLEDNÝCH")
 
@@ -272,9 +274,9 @@ def test_no_stored_documents_says_so_instead_of_implying_the_card_is_readable(mo
     about operations as if the card simply did not mention any. The extractor
     only ever kept the numbers; the text around them was discarded.
     """
-    monkeypatch.setattr(chat_context, "document_inventory", list)
+    monkeypatch.setattr(chat_context, "document_inventory", lambda patient_id: [])
 
-    text = chat_context.format_health_context(chat_context.build_health_context())
+    text = chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID))
 
     assert "NAHRANÉ LEKÁRSKE DOKUMENTY (0)" in text
     assert "operácie" in text
@@ -283,7 +285,7 @@ def test_no_stored_documents_says_so_instead_of_implying_the_card_is_readable(mo
 
 
 def test_without_a_question_there_is_an_inventory_but_no_retrieval():
-    text = chat_context.format_health_context(chat_context.build_health_context())
+    text = chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID))
 
     assert "NAHRANÉ LEKÁRSKE DOKUMENTY" in text
     assert "RELEVANTNÉ ÚRYVKY" not in text
@@ -292,8 +294,8 @@ def test_without_a_question_there_is_an_inventory_but_no_retrieval():
 def test_nothing_stored_renders_empty_so_the_caller_can_fall_back(monkeypatch, rows):
     """chat.py falls back to a client snapshot only when this is empty."""
     rows.clear()
-    monkeypatch.setattr(chat_context, "document_inventory", list)
-    monkeypatch.setattr(chat_context, "search_documents", lambda q, limit=5: [])
-    monkeypatch.setattr(chat_context, "_family", list)
+    monkeypatch.setattr(chat_context, "document_inventory", lambda patient_id: [])
+    monkeypatch.setattr(chat_context, "search_documents", lambda q, patient_id, limit=5: [])
+    monkeypatch.setattr(chat_context, "_family", lambda patient_id: [])
 
-    assert chat_context.format_health_context(chat_context.build_health_context()) == ""
+    assert chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID)) == ""

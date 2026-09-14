@@ -41,6 +41,7 @@ def test_summary_keeps_full_shape(empty_metrics):
 
 def test_trends_is_empty_mapping():
     a = TrendAnalyzer.__new__(TrendAnalyzer)
+    a.patient_id = 1
     a.data = pd.DataFrame()
     result = a.analyze_trends()
     assert result == {}
@@ -49,6 +50,7 @@ def test_trends_is_empty_mapping():
 
 def test_risks_keep_full_shape(monkeypatch):
     p = RiskPredictor.__new__(RiskPredictor)
+    p.patient_id = 1
     p.data = pd.DataFrame()
     monkeypatch.setattr(p, "refresh", lambda: None)
     risks = p.predict_risks()

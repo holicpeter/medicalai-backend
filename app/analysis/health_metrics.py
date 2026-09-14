@@ -2,9 +2,7 @@ import logging
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, Optional
-import json
 
-from app.config import settings
 from app.analysis.sources import load_all_measurements
 
 logger = logging.getLogger(__name__)
@@ -22,23 +20,26 @@ def _to_float(value):
 
 
 class HealthMetricsAnalyzer:
-    def __init__(self):
+    def __init__(self, patient_id: int):
+        self.patient_id = patient_id
         self.data = self._load_all_data()
 
     def _load_all_data(self) -> pd.DataFrame:
         all_metrics = []
 
-        # Legacy JSON files
-        for json_file in settings.PROCESSED_DATA_DIR.glob("extracted_data_*.json"):
-            try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    all_metrics.extend(json.load(f))
-            except Exception as e:
-                logger.warning('Error loading %s: %s', json_file, e)
-
-        # Every stored source, including Apple Health — which this analyzer
-        # used to skip, so an import left the dashboard reading zero.
-        all_metrics.extend(load_all_measurements())
+        # Legacy JSON files (extracted_data_*.json) predate the database and
+        # per-patient scoping entirely — a flat file on disk with no
+        # patient_id of its own. Now that patient_id is the isolation
+        # boundary between tenants, a file with no owner cannot be safely
+        # attributed to any one of them; showing it to every patient would be
+        # a cross-tenant leak of whatever it contains. Deliberately dropped
+        # here rather than guessed at — all of this app's actual data has
+        # lived in the database for a long time (see the DB-backed loaders
+        # below), so nothing observable should depend on this path still
+        # existing. If it turns out something does, that data needs a real
+        # patient_id and an import into the database, not a reason to bring
+        # this branch back.
+        all_metrics.extend(load_all_measurements(self.patient_id))
 
         if not all_metrics:
             return pd.DataFrame()

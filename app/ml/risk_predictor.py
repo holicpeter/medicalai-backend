@@ -10,17 +10,18 @@ logger = logging.getLogger(__name__)
 
 
 class RiskPredictor:
-    """ML model pre predikciu zdravotných rizík"""
+    """ML model pre predikciu zdravotných rizík, scoped to one patient."""
 
-    def __init__(self):
+    def __init__(self, patient_id: int):
+        self.patient_id = patient_id
         # The trend analyzer is the single place that knows how to load every
-        # stored source — legacy JSON exports, manual and OCR records, Apple
-        # Health — and it keeps a shared cache that every write path already
-        # invalidates. Reading through it is why the risks screen can no
-        # longer disagree with /analysis/trends about what data exists: this
-        # class used to read only extracted_data_*.json off local disk, which
-        # is empty on the deployed instance, so every risk came back zero.
-        self._analyzer = TrendAnalyzer()
+        # stored source — manual and OCR records, Apple Health — and it keeps
+        # a per-patient cache that every write path already invalidates.
+        # Reading through it is why the risks screen can no longer disagree
+        # with /analysis/trends about what data exists: this class used to
+        # read only extracted_data_*.json off local disk, which is empty on
+        # the deployed instance, so every risk came back zero.
+        self._analyzer = TrendAnalyzer(patient_id)
         self.refresh()
 
     def refresh(self):
