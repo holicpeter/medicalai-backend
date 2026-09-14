@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.database import get_session, Patient, NutritionEntry
 from app.nutrition.analyzer import MealAnalyzer
@@ -35,6 +35,10 @@ class FoodItemModel(BaseModel):
     carbs_g: float
     fat_g: float
     confidence: float = 0.5
+
+
+class MealTextRequest(BaseModel):
+    description: str = Field(..., min_length=3, max_length=2000)
 
 
 class NutritionEntryCreate(BaseModel):
@@ -119,6 +123,39 @@ async def analyze_meal_photo(file: UploadFile = File(...)):
         'Toto je len orientačný odhad na základe fotky, nie presné laboratórne meranie. '
         'Skutočná gramáž a nutričné hodnoty sa môžu líšiť, najmä pri zmiešaných jedlách. '
         'Uprav porciu, ak si myslíš, že odhad nesedí.'
+    )
+    return result
+
+
+@router.post("/analyze-text")
+async def analyze_meal_text(data: MealTextRequest):
+    """Textový popis jedla -> Claude -> štruktúrovaný odhad nutričných hodnôt.
+
+    Rovnaký kontrakt ako POST /analyze (fotka): len analyzuje a vráti výsledok,
+    neukladá nič do denníka — uloženie ide rovnako cez POST /entries, ktoré je
+    zdroju analýzy (fotka vs. text) ľahostajné.
+    """
+    try:
+        result = await asyncio.to_thread(
+            analyzer.analyze_meal_text, data.description,
+        )
+    except RuntimeError as e:
+        logger.error('Meal text analysis not configured: %s', e)
+        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as e:
+        logger.warning('Meal text analysis returned unparseable output: %s', e)
+        raise HTTPException(
+            status_code=502,
+            detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s podrobnejším popisom.",
+        )
+    except Exception as e:
+        logger.error('Meal text analysis failed: %s', e)
+        raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze popisu jedla.")
+
+    result['disclaimer'] = (
+        'Toto je len orientačný odhad na základe textového popisu, nie presné laboratórne meranie. '
+        'Skutočná gramáž a nutričné hodnoty sa môžu líšiť najmä pri chýbajúcich detailoch (príprava, omáčky). '
+        'Uprav hodnoty, ak si myslíš, že odhad nesedí.'
     )
     return result
 
