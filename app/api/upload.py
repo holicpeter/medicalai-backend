@@ -1,11 +1,12 @@
 import asyncio
 import logging
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from typing import List
 import shutil
 from pathlib import Path
 from datetime import datetime
 
+from app.auth.dependencies import get_current_patient_id, require_admin
 from app.config import settings
 from app.ocr.document_processor import DocumentProcessor, split_document_output
 from app.ocr.data_extractor import HealthDataExtractor
@@ -41,10 +42,10 @@ def _resolve_extension(file: UploadFile) -> str:
     return _CONTENT_TYPE_MAP.get(ct, ext)
 
 
-def _invalidate_analyzers():
+def _invalidate_analyzers(patient_id: int):
     """Clear cached data so next request reloads from DB."""
     from app.analysis.trend_analyzer import TrendAnalyzer
-    TrendAnalyzer.invalidate_cache()
+    TrendAnalyzer.invalidate_cache(patient_id)
 
 
 def _document_date(health_data: List[dict]):
@@ -61,7 +62,7 @@ def _document_date(health_data: List[dict]):
     return max(dates) if dates else None
 
 
-async def _process_single_file(file: UploadFile) -> dict:
+async def _process_single_file(file: UploadFile, patient_id: int) -> dict:
     """Save and process one uploaded file. Runs Claude call in a thread."""
     file_ext = _resolve_extension(file)
 
@@ -94,7 +95,7 @@ async def _process_single_file(file: UploadFile) -> dict:
         # in the record would otherwise swallow the real array.
         record_text, metrics_text = split_document_output(text_content)
         health_data = await asyncio.to_thread(
-            data_extractor.extract_health_metrics, metrics_text, file.filename
+            data_extractor.extract_health_metrics, metrics_text, file.filename, patient_id
         )
 
     # The transcription used to end here: the metrics were parsed out and the
@@ -108,6 +109,7 @@ async def _process_single_file(file: UploadFile) -> dict:
             index_document,
             file.filename or safe_filename,
             record_text,
+            patient_id,
             str(file_path),
             file_ext.lstrip('.'),
             file_path.stat().st_size if file_path.exists() else None,
@@ -126,7 +128,10 @@ async def _process_single_file(file: UploadFile) -> dict:
 
 
 @router.post("/documents")
-async def upload_documents(files: List[UploadFile] = File(...)):
+async def upload_documents(
+    files: List[UploadFile] = File(...),
+    patient_id: int = Depends(get_current_patient_id),
+):
     """
     Upload health documents (PDF, images, CSV) for processing.
     Supported formats: PDF, JPG, JPEG, PNG, HEIC, HEIF, CSV
@@ -134,7 +139,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
     """
     try:
         # Process all files concurrently
-        tasks = [_process_single_file(f) for f in files]
+        tasks = [_process_single_file(f, patient_id) for f in files]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         uploaded_files = []
@@ -149,7 +154,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
         # Invalidate analyzer cache so dashboard reflects new data immediately
         if uploaded_files:
-            _invalidate_analyzers()
+            _invalidate_analyzers(patient_id)
 
         if errors and not uploaded_files:
             raise HTTPException(status_code=500, detail=f"All files failed: {errors}")
@@ -182,7 +187,7 @@ async def download_csv_template():
 
 
 @router.get("/history")
-async def upload_history():
+async def upload_history(patient_id: int = Depends(get_current_patient_id)):
     """History of processed documents, newest first.
 
     Built from the extracted records rather than the upload directory, which
@@ -203,6 +208,7 @@ async def upload_history():
             )
             .filter(HealthRecord.source == 'ocr')
             .filter(HealthRecord.source_file.isnot(None))
+            .filter(HealthRecord.patient_id == patient_id)
             .group_by(HealthRecord.source_file)
             .order_by(func.min(HealthRecord.created_at).desc())
             .all()
@@ -227,6 +233,7 @@ async def upload_history():
             session.query(func.count(HealthRecord.id))
             .filter(HealthRecord.source == 'ocr')
             .filter(HealthRecord.source_file.is_(None))
+            .filter(HealthRecord.patient_id == patient_id)
             .scalar()
         ) or 0
 
@@ -240,24 +247,31 @@ async def upload_history():
 
 
 @router.get("/search")
-async def search_documents_endpoint(q: str, limit: int = 5):
+async def search_documents_endpoint(
+    q: str, limit: int = 5, patient_id: int = Depends(get_current_patient_id),
+):
     """Passages retrieval returns for a query — the chat calls the same function.
 
     Exposed so a bad answer can be traced: if the chat missed something that is
     in a report, this shows whether retrieval failed or the model ignored what
     it was given.
     """
-    documents = document_inventory()
+    documents = document_inventory(patient_id)
     return {
         "query": q,
         "documents_indexed": sum(1 for d in documents if d.get("has_text")),
-        "results": search_documents(q, limit=limit),
+        "results": search_documents(q, patient_id, limit=limit),
     }
 
 
 @router.get("/documents")
-async def list_documents():
-    """Files currently on disk. Ephemeral — kept for debugging only."""
+async def list_documents(_admin=Depends(require_admin)):
+    """Files currently on disk. Ephemeral — kept for debugging only.
+
+    Admin-only: the container's upload directory is shared by every tenant,
+    so listing it without scoping would otherwise show every patient's
+    filenames to any authenticated user.
+    """
     try:
         files = list(settings.RAW_DATA_DIR.glob("*"))
         return {

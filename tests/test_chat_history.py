@@ -12,6 +12,8 @@ import pytest
 
 from app.api import chat as chat_api
 
+PATIENT_ID = 1
+
 
 class _Row:
     def __init__(self, role, content, created_at):
@@ -27,6 +29,13 @@ class _Query:
         self.rows = rows
         self.saved = saved
         self._limit = None
+
+    def filter(self, *args):
+        # The mock's rows are already scoped to one patient — the real
+        # `.filter(ChatMessage.patient_id == patient_id)` clause has nothing
+        # further to narrow here, so this is a no-op that keeps the chain
+        # shaped like the real query.
+        return self
 
     def order_by(self, *args):
         return self
@@ -51,8 +60,6 @@ class _Session:
         self.committed = False
 
     def query(self, model):
-        if model is chat_api.Patient:
-            return _Query([], self.saved)
         return _Query(self.rows, self.saved)
 
     def add(self, row):
@@ -88,7 +95,7 @@ def session(monkeypatch, stored, saved):
 
 
 def test_history_comes_back_oldest_first_in_message_shape():
-    history = chat_api.load_history()
+    history = chat_api.load_history(PATIENT_ID)
 
     assert [m["role"] for m in history] == ["user", "assistant"]
     assert history[0]["content"].startswith("aké mám hodnoty")
@@ -98,7 +105,7 @@ def test_history_comes_back_oldest_first_in_message_shape():
 def test_the_history_endpoint_keeps_timestamps_and_the_whole_answer(stored):
     stored[1].content = "x" * 5000
 
-    history = chat_api.load_history(limit=50, full=True)
+    history = chat_api.load_history(PATIENT_ID, limit=50, full=True)
 
     assert history[1]["content"] == "x" * 5000
     assert history[1]["created_at"] == "2026-09-11T14:00:08"
@@ -107,7 +114,7 @@ def test_the_history_endpoint_keeps_timestamps_and_the_whole_answer(stored):
 def test_a_long_answer_is_trimmed_before_it_is_replayed(stored):
     stored[1].content = "x" * 5000
 
-    replayed = chat_api.load_history()[1]["content"]
+    replayed = chat_api.load_history(PATIENT_ID)[1]["content"]
 
     assert len(replayed) <= chat_api.MAX_REPLAYED_CHARS + 10
     assert replayed.endswith("[…]")
@@ -118,7 +125,7 @@ def test_only_the_last_turns_are_replayed(stored):
     for index in range(20):
         stored.append(_Row("user", f"otázka {index}", base + timedelta(minutes=index)))
 
-    assert len(chat_api.load_history()) == chat_api.MAX_HISTORY_TURNS
+    assert len(chat_api.load_history(PATIENT_ID)) == chat_api.MAX_HISTORY_TURNS
 
 
 def test_a_broken_database_costs_the_memory_not_the_answer(monkeypatch):
@@ -127,11 +134,11 @@ def test_a_broken_database_costs_the_memory_not_the_answer(monkeypatch):
 
     monkeypatch.setattr(chat_api, "get_session", _boom)
 
-    assert chat_api.load_history() == []
+    assert chat_api.load_history(PATIENT_ID) == []
 
 
 def test_both_sides_of_the_turn_are_saved(saved):
-    chat_api._save_turn("aké som mal operácie?", "Orchiopexia, 27. 1. 1993.")
+    chat_api._save_turn(PATIENT_ID, "aké som mal operácie?", "Orchiopexia, 27. 1. 1993.")
 
     assert [row.role for row in saved] == ["user", "assistant"]
     assert saved[0].content == "aké som mal operácie?"
@@ -154,7 +161,9 @@ def test_earlier_turns_are_sent_ahead_of_the_question():
 
     client = _Client()
 
-    chat_api._ask_claude(client, "system", "a čo tie lieky?", chat_api.load_history())
+    chat_api._ask_claude(
+        client, "system", "a čo tie lieky?", chat_api.load_history(PATIENT_ID), patient_id=PATIENT_ID
+    )
 
     sent = client.calls[0]["messages"]
     assert len(sent) == 3
