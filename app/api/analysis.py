@@ -1,33 +1,44 @@
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 
 from app.analysis.trend_analyzer import TrendAnalyzer
 from app.analysis.health_metrics import HealthMetricsAnalyzer
+from app.auth.dependencies import get_current_patient_id
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-trend_analyzer = TrendAnalyzer()
-metrics_analyzer = HealthMetricsAnalyzer()
+
+# Analyzers used to be built once at import time and shared by every request
+# (`trend_analyzer = TrendAnalyzer()` at module scope) — that was already a
+# bug before multi-user (data imported after startup never showed up without
+# a restart, see the comments inside TrendAnalyzer.refresh), and with more
+# than one patient it would have been a straight cross-tenant leak: every
+# request would have shared one process-wide instance regardless of who was
+# asking. Each endpoint below builds its own analyzer, scoped to the
+# authenticated caller's patient_id.
+
 
 @router.get("/trends")
 async def get_health_trends(
     metric: Optional[str] = None,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    patient_id: int = Depends(get_current_patient_id),
 ):
     """
     Analyzuje trendy v zdravotných ukazovateľoch
-    
+
     Parameters:
     - metric: blood_pressure, glucose, cholesterol, bmi (None = všetky)
     - start_date: YYYY-MM-DD
     - end_date: YYYY-MM-DD
     """
     try:
-        logger.info('/trends called: metric=%s start=%s end=%s', metric, start_date, end_date)
+        logger.info('/trends called: metric=%s start=%s end=%s patient=%s', metric, start_date, end_date, patient_id)
 
+        trend_analyzer = TrendAnalyzer(patient_id)
         trends = trend_analyzer.analyze_trends(
             metric=metric,
             start_date=start_date,
@@ -55,40 +66,40 @@ async def get_health_trends(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/metrics/latest")
-async def get_latest_metrics():
+async def get_latest_metrics(patient_id: int = Depends(get_current_patient_id)):
     """Získa najnovšie zdravotné ukazovatele"""
     try:
-        latest = metrics_analyzer.get_latest_metrics()
+        latest = HealthMetricsAnalyzer(patient_id).get_latest_metrics()
         return latest
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/metrics/history")
-async def get_metrics_history(days: int = 365):
+async def get_metrics_history(days: int = 365, patient_id: int = Depends(get_current_patient_id)):
     """Získa históriu meraní za posledných N dní"""
     try:
-        history = metrics_analyzer.get_metrics_history(days=days)
+        history = HealthMetricsAnalyzer(patient_id).get_metrics_history(days=days)
         return {
             "period_days": days,
             "metrics": history
         }
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/summary")
-async def get_health_summary():
+async def get_health_summary(patient_id: int = Depends(get_current_patient_id)):
     """Komplexný zdravotný prehľad"""
     try:
-        summary = metrics_analyzer.get_comprehensive_summary()
+        summary = HealthMetricsAnalyzer(patient_id).get_comprehensive_summary()
         return summary
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/latest")
-async def get_latest_analysis():
+async def get_latest_analysis(patient_id: int = Depends(get_current_patient_id)):
     """Snapshot of the current state, in the shape the chat page loads on open.
 
     The frontend has always called this endpoint; it never existed, so the page
@@ -102,6 +113,7 @@ async def get_latest_analysis():
     object with trends, warnings and the health score.
     """
     try:
+        metrics_analyzer = HealthMetricsAnalyzer(patient_id)
         summary = metrics_analyzer.get_comprehensive_summary()
         latest = summary.get("latest_metrics", {}) or {}
 
@@ -117,6 +129,7 @@ async def get_latest_analysis():
 
         trends = []
         try:
+            trend_analyzer = TrendAnalyzer(patient_id)
             for metric_name, trend_data in (trend_analyzer.analyze_trends() or {}).items():
                 if isinstance(trend_data, dict) and "error" not in trend_data:
                     trends.append({
@@ -144,14 +157,11 @@ async def get_latest_analysis():
 
 
 @router.post("/refresh-cache")
-async def refresh_trend_cache():
+async def refresh_trend_cache(patient_id: int = Depends(get_current_patient_id)):
     """Vymaže cache a znova načíta všetky dáta"""
     try:
-        TrendAnalyzer.invalidate_cache()
-
-        # Refresh the analyzer the router actually serves from, rather than
-        # building a throwaway one and leaving the old data in place.
-        trend_analyzer.refresh()
+        TrendAnalyzer.invalidate_cache(patient_id)
+        trend_analyzer = TrendAnalyzer(patient_id)
 
         return {
             "success": True,

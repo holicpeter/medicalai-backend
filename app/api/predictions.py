@@ -1,8 +1,9 @@
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 
+from app.auth.dependencies import get_current_patient_id
 from app.ml.risk_predictor import RiskPredictor
 from app.ml.recommendation_engine import RecommendationEngine
 from app.claude.medical_advisor import MedicalAdvisor
@@ -10,7 +11,12 @@ from app.claude.medical_advisor import MedicalAdvisor
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-risk_predictor = RiskPredictor()
+
+# RiskPredictor wraps a TrendAnalyzer and must be built per request, scoped to
+# the caller's patient_id (see app/api/analysis.py for the same rationale).
+# RecommendationEngine and MedicalAdvisor touch no patient data of their own —
+# the former is pure age-based static logic, the latter only reasons over the
+# ml_risks dict it is handed — so they stay as shared, stateless instances.
 recommendation_engine = RecommendationEngine()
 medical_advisor = MedicalAdvisor()
 
@@ -18,7 +24,7 @@ SUPPORTED_DISEASES = ["diabetes", "cardiovascular", "hypertension", "metabolic_s
 
 
 @router.get("/risks")
-async def predict_health_risks(use_claude: bool = False):
+async def predict_health_risks(use_claude: bool = False, patient_id: int = Depends(get_current_patient_id)):
     """
     Predikcia budúcich zdravotných rizík
 
@@ -27,6 +33,7 @@ async def predict_health_risks(use_claude: bool = False):
     """
     try:
         # ML-based risk prediction
+        risk_predictor = RiskPredictor(patient_id)
         ml_risks = risk_predictor.predict_risks()
 
         result = {
@@ -75,7 +82,7 @@ async def get_preventive_recommendations(age: Optional[int] = None):
 
 
 @router.get("/disease-risk/{disease}")
-async def get_specific_disease_risk(disease: str):
+async def get_specific_disease_risk(disease: str, patient_id: int = Depends(get_current_patient_id)):
     """
     Špecifická predikcia rizika pre konkrétne ochorenie
 
@@ -91,7 +98,7 @@ async def get_specific_disease_risk(disease: str):
         )
 
     try:
-        risk_assessment = risk_predictor.predict_disease_risk(disease)
+        risk_assessment = RiskPredictor(patient_id).predict_disease_risk(disease)
 
         return {
             "disease": disease,

@@ -9,6 +9,8 @@ import pytest
 
 from app.rag import retriever
 
+PATIENT_ID = 1
+
 FIXTURES = [
     ("kardio-marec.pdf", "2026-03-14",
      "Záver kardiológa: ľahká hypertenzia. Odporúčam Prestarium 5 mg denne "
@@ -35,7 +37,7 @@ def _indexed(filename, document_date, text, position=0):
 @pytest.fixture
 def corpus(monkeypatch):
     """Index the fixtures instead of reading the database."""
-    def _load(chunks=None):
+    def _load(patient_id=None):
         return [_indexed(name, date, text, i)
                 for i, (name, date, text) in enumerate(FIXTURES)]
 
@@ -88,7 +90,7 @@ def test_paragraphs_are_packed_without_losing_any():
 
 
 def test_an_inflected_question_matches_the_report(corpus):
-    hits = retriever.search("aký mám cholesterol?")
+    hits = retriever.search("aký mám cholesterol?", PATIENT_ID)
 
     assert hits[0]["document"] == "labak-jun.pdf"
     assert hits[0]["date"] == "2026-06-02"
@@ -96,45 +98,62 @@ def test_an_inflected_question_matches_the_report(corpus):
 
 
 def test_free_text_question_structured_metrics_cannot_answer(corpus):
-    hits = retriever.search("čo písal kardiológ a aké lieky mi predpísal?")
+    hits = retriever.search("čo písal kardiológ a aké lieky mi predpísal?", PATIENT_ID)
 
     assert hits[0]["document"] == "kardio-marec.pdf"
     assert "Prestarium" in hits[0]["text"]
 
 
 def test_query_without_diacritics_still_lands(corpus):
-    assert retriever.search("ejekcna frakcia lavej komory")[0]["chunk_index"] == 1
+    assert retriever.search("ejekcna frakcia lavej komory", PATIENT_ID)[0]["chunk_index"] == 1
 
 
 @pytest.mark.parametrize("query", ["ahoj", "", "a to je"])
 def test_a_query_with_nothing_to_match_returns_nothing(corpus, query):
-    assert retriever.search(query) == []
+    assert retriever.search(query, PATIENT_ID) == []
 
 
 def test_results_are_ranked_and_scored(corpus):
-    hits = retriever.search("cholesterol LDL diéta", limit=4)
+    hits = retriever.search("cholesterol LDL diéta", PATIENT_ID, limit=4)
 
     assert hits == sorted(hits, key=lambda h: h["score"], reverse=True)
     assert all(hit["score"] > 0 for hit in hits)
 
 
 def test_limit_is_honoured(corpus):
-    assert len(retriever.search("kontrola", limit=1)) == 1
+    assert len(retriever.search("kontrola", PATIENT_ID, limit=1)) == 1
 
 
 def test_a_long_passage_is_capped(monkeypatch):
     monkeypatch.setattr(retriever, "_load_chunks",
-                        lambda: [_indexed("velky.pdf", None, "kontrola " * 300)])
+                        lambda patient_id: [_indexed("velky.pdf", None, "kontrola " * 300)])
     retriever.invalidate_cache()
 
-    hit = retriever.search("kontrola")[0]
+    hit = retriever.search("kontrola", PATIENT_ID)[0]
 
     assert len(hit["text"]) <= retriever.MAX_PASSAGE_CHARS + 10
     assert hit["text"].endswith("[…]")
 
 
 def test_an_empty_corpus_is_a_normal_state(monkeypatch):
-    monkeypatch.setattr(retriever, "_load_chunks", list)
+    monkeypatch.setattr(retriever, "_load_chunks", lambda patient_id: [])
     retriever.invalidate_cache()
 
-    assert retriever.search("cholesterol") == []
+    assert retriever.search("cholesterol", PATIENT_ID) == []
+
+
+def test_two_patients_never_share_the_cached_index(monkeypatch):
+    """The BM25 index is cached per patient_id — see _get_index — so one
+    patient's documents must never answer another patient's search."""
+    corpora = {
+        1: [_indexed("a-only.pdf", "2026-01-01", "jedinečné slovo alfa")],
+        2: [_indexed("b-only.pdf", "2026-01-01", "jedinečné slovo beta")],
+    }
+    monkeypatch.setattr(retriever, "_load_chunks", lambda patient_id: corpora[patient_id])
+    retriever.invalidate_cache()
+
+    hits_a = retriever.search("alfa", 1)
+    hits_b = retriever.search("alfa", 2)
+
+    assert hits_a and hits_a[0]["document"] == "a-only.pdf"
+    assert hits_b == [], "patient 2 has no document containing 'alfa'"

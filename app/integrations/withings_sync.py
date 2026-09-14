@@ -16,9 +16,9 @@ import logging
 import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from app.database import get_session, HealthRecord, Patient
+from app.database import get_session, HealthRecord
 from app.integrations.withings_connector import get_withings_connector
 
 logger = logging.getLogger(__name__)
@@ -57,11 +57,6 @@ METRIC_UNITS = {
     "hrv_rmssd": "ms",
     "hrv_sdnn": "ms",
 }
-
-
-def _default_patient_id(session) -> Optional[int]:
-    patient = session.query(Patient).first()
-    return patient.id if patient else None
 
 
 def _day(iso: str):
@@ -116,8 +111,15 @@ async def collect_daily_metrics(days: int = 30, hrv_nights: int = 14) -> Dict:
     return {key: statistics.median(vals) for key, vals in daily.items() if vals}
 
 
-async def sync_withings_to_db(days: int = 30, hrv_nights: int = 14) -> Dict:
-    """Stiahne dáta a zapíše ich do health_records. Idempotentné."""
+async def sync_withings_to_db(patient_id: int, days: int = 30, hrv_nights: int = 14) -> Dict:
+    """Stiahne dáta a zapíše ich do health_records. Idempotentné.
+
+    patient_id is the calling admin's own patient id (see app/api/integrations.py)
+    rather than "whichever Patient row sorts first" — this endpoint is
+    admin-only, but ADMIN_EMAILS can list more than one address, and the old
+    session.query(Patient).first() would have let a second admin's sync
+    silently write into (or overwrite) the first admin's records.
+    """
     values = await collect_daily_metrics(days, hrv_nights)
     if not values:
         return {"written": 0, "updated": 0, "metrics": []}
@@ -125,12 +127,11 @@ async def sync_withings_to_db(days: int = 30, hrv_nights: int = 14) -> Dict:
     session = get_session()
     written = updated = 0
     try:
-        patient_id = _default_patient_id(session)
-
         existing = {
             (r.metric_type, r.record_date): r
             for r in session.query(HealthRecord)
             .filter(HealthRecord.source == SOURCE)
+            .filter(HealthRecord.patient_id == patient_id)
             .filter(HealthRecord.record_date >= (datetime.now().date()
                                                  - timedelta(days=days + 1)))
             .all()

@@ -2,7 +2,7 @@
 Apple Health API - Import dát z iPhone Health appky
 Podporuje import z export.xml, export.xml.gz a export.zip
 """
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 import asyncio
 import tempfile
@@ -29,6 +29,7 @@ _UPLOAD_CHUNK_SIZE = 1024 * 1024
 _import_jobs: Dict[str, Dict[str, Any]] = {}
 
 from ..database.models import AppleHealthData, get_session
+from ..auth.dependencies import get_current_patient_id
 
 router = APIRouter(prefix="/api/apple-health", tags=["apple_health"])
 
@@ -244,13 +245,17 @@ def parse_apple_health_xml(xml_source, on_record=None) -> Dict[str, Any]:
         raise Exception(f"Chyba pri parsovaní Apple Health XML: {str(e)}")
 
 
-def _stream_import(xml_path, batch_id: str, progress=None):
+def _stream_import(xml_path, batch_id: str, patient_id: int, progress=None):
     """Parse and insert in one streaming pass.
 
     Records are handed over one at a time and flushed in batches, so a
     multi-hundred-MB export never materialises as a list. Duplicates are
     checked against a set built from one query instead of one SELECT per
     record — the latter turned a large import into millions of table scans.
+    The dedup set and every inserted row are scoped to patient_id: without
+    that, one patient's export would both write into another patient's data
+    and be silently short-circuited by rows that happen to match someone
+    else's identical readings.
     """
     session = get_session()
     counts = {"saved": 0, "skipped": 0, "duplicates": 0}
@@ -264,7 +269,7 @@ def _stream_import(xml_path, batch_id: str, progress=None):
             AppleHealthData.start_date,
             AppleHealthData.value,
             AppleHealthData.unit,
-        ).all()
+        ).filter(AppleHealthData.patient_id == patient_id).all()
     }
     print(f"[APPLE HEALTH] Loaded {len(seen):,} existing keys for duplicate check")
 
@@ -287,7 +292,7 @@ def _stream_import(xml_path, batch_id: str, progress=None):
 
         device = record["device"] or {}
         batch.append(AppleHealthData(
-            patient_id=1,
+            patient_id=patient_id,
             record_type=record["type"],
             value=record["value"],
             unit=record["unit"],
@@ -503,7 +508,10 @@ async def _spool_upload(file: UploadFile) -> tuple[Path, int]:
 
 
 @router.post("/import")
-async def import_apple_health_data(file: UploadFile = File(...)):
+async def import_apple_health_data(
+    file: UploadFile = File(...),
+    patient_id: int = Depends(get_current_patient_id),
+):
     """
     Import Apple Health XML súboru (akýkoľvek .xml súbor)
 
@@ -520,7 +528,7 @@ async def import_apple_health_data(file: UploadFile = File(...)):
         batch_id = str(uuid.uuid4())[:8]
 
         # Parsing and importing are CPU/DB bound — keep them off the event loop.
-        stats, counts = await asyncio.to_thread(_stream_import, tmp_path, batch_id)
+        stats, counts = await asyncio.to_thread(_stream_import, tmp_path, batch_id, patient_id)
 
         saved_count = counts["saved"]
         skipped_count = counts["skipped"]
@@ -543,7 +551,7 @@ async def import_apple_health_data(file: UploadFile = File(...)):
 
         # Newly imported records must be visible in /trends straight away.
         from app.analysis.trend_analyzer import TrendAnalyzer
-        TrendAnalyzer.invalidate_cache()
+        TrendAnalyzer.invalidate_cache(patient_id)
 
         return JSONResponse(content={
             "success": True,
@@ -574,7 +582,7 @@ async def import_apple_health_data(file: UploadFile = File(...)):
             tmp_path.unlink(missing_ok=True)
 
 
-def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename: str):
+def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename: str, patient_id: int):
     """Run an import outside the request cycle, recording progress as it goes."""
     job = _import_jobs[job_id]
     job.update(status="running", started_at=datetime.now().isoformat())
@@ -583,7 +591,7 @@ def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename:
         job["counts"] = counts
 
     try:
-        stats, counts = _stream_import(tmp_path, batch_id, progress=progress)
+        stats, counts = _stream_import(tmp_path, batch_id, patient_id, progress=progress)
         job["counts"] = counts
 
         if stats["total_records"] == 0:
@@ -597,7 +605,7 @@ def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename:
             return
 
         from app.analysis.trend_analyzer import TrendAnalyzer
-        TrendAnalyzer.invalidate_cache()
+        TrendAnalyzer.invalidate_cache(patient_id)
 
         job.update(
             status="completed",
@@ -625,7 +633,10 @@ def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename:
 
 
 @router.post("/import-async")
-async def import_apple_health_async(file: UploadFile = File(...)):
+async def import_apple_health_async(
+    file: UploadFile = File(...),
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Import a large export without holding the HTTP connection open.
 
     Railway closes a request after 5 minutes with no data transferred, so a
@@ -643,10 +654,13 @@ async def import_apple_health_async(file: UploadFile = File(...)):
         "size_mb": round(bytes_written / (1024 * 1024), 1),
         "counts": {"saved": 0, "skipped": 0, "duplicates": 0},
         "created_at": datetime.now().isoformat(),
+        # Who this job belongs to — checked by /import-status so one patient
+        # cannot poll (or infer the existence of) another patient's import.
+        "patient_id": patient_id,
     }
 
     asyncio.create_task(
-        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, file.filename)
+        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, file.filename, patient_id)
     )
 
     print(f"[APPLE HEALTH] Queued job {job_id} for {file.filename} "
@@ -662,7 +676,11 @@ async def import_apple_health_async(file: UploadFile = File(...)):
 
 
 @router.post("/import-raw")
-async def import_apple_health_raw(request: Request, filename: str = "export.xml"):
+async def import_apple_health_raw(
+    request: Request,
+    filename: str = "export.xml",
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Import an export sent as the raw request body, with no multipart wrapper.
 
     Multipart uploads need a form field named exactly `file`; clients that build
@@ -691,10 +709,11 @@ async def import_apple_health_raw(request: Request, filename: str = "export.xml"
         "size_mb": round(bytes_written / (1024 * 1024), 1),
         "counts": {"saved": 0, "skipped": 0, "duplicates": 0},
         "created_at": datetime.now().isoformat(),
+        "patient_id": patient_id,
     }
 
     asyncio.create_task(
-        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, filename)
+        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, filename, patient_id)
     )
 
     print(f"[APPLE HEALTH] Queued raw job {job_id} "
@@ -710,16 +729,19 @@ async def import_apple_health_raw(request: Request, filename: str = "export.xml"
 
 
 @router.get("/import-status/{job_id}")
-async def import_status(job_id: str):
+async def import_status(job_id: str, patient_id: int = Depends(get_current_patient_id)):
     """Progress of a background import."""
     job = _import_jobs.get(job_id)
-    if job is None:
+    # Owner check folded into the same 404 as "job does not exist" — a job
+    # that belongs to someone else must not be distinguishable from a job
+    # that was never created.
+    if job is None or job.get("patient_id") != patient_id:
         raise HTTPException(status_code=404, detail="Neznáme job_id")
     return job
 
 
 @router.get("/imports")
-async def list_imports():
+async def list_imports(patient_id: int = Depends(get_current_patient_id)):
     """History of Apple Health imports, newest first.
 
     Reconstructed from the stored rows rather than the in-memory job list, so
@@ -737,6 +759,7 @@ async def list_imports():
                 func.min(AppleHealthData.start_date).label('period_start'),
                 func.max(AppleHealthData.start_date).label('period_end'),
             )
+            .filter(AppleHealthData.patient_id == patient_id)
             .group_by(AppleHealthData.import_batch_id)
             .order_by(func.min(AppleHealthData.imported_at).desc())
             .all()
@@ -765,41 +788,45 @@ async def list_imports():
 
 
 @router.get("/stats")
-async def get_apple_health_stats():
+async def get_apple_health_stats(patient_id: int = Depends(get_current_patient_id)):
     """Získať štatistiky importovaných Apple Health dát"""
     try:
         session = get_session()
-        
+
         # Total records
-        total_records = session.query(AppleHealthData).count()
-        
+        total_records = session.query(AppleHealthData).filter(
+            AppleHealthData.patient_id == patient_id
+        ).count()
+
         # By type
         from sqlalchemy import func
         by_type = session.query(
             AppleHealthData.record_type,
             func.count(AppleHealthData.id).label('count')
-        ).group_by(AppleHealthData.record_type).all()
-        
+        ).filter(AppleHealthData.patient_id == patient_id).group_by(AppleHealthData.record_type).all()
+
         by_type_dict = {}
         for record_type, count in by_type:
             friendly_name = APPLE_HEALTH_TYPE_MAPPING.get(record_type, record_type)
             by_type_dict[friendly_name] = count
-        
+
         # Date range
         date_range = session.query(
             func.min(AppleHealthData.start_date).label('start'),
             func.max(AppleHealthData.start_date).label('end')
-        ).first()
-        
+        ).filter(AppleHealthData.patient_id == patient_id).first()
+
         # Unique devices
-        unique_devices = session.query(AppleHealthData.device_name).distinct().all()
+        unique_devices = session.query(AppleHealthData.device_name).filter(
+            AppleHealthData.patient_id == patient_id
+        ).distinct().all()
         devices = [d[0] for d in unique_devices if d[0]]
-        
+
         # Latest import
         latest_import = session.query(
             func.max(AppleHealthData.imported_at)
-        ).scalar()
-        
+        ).filter(AppleHealthData.patient_id == patient_id).scalar()
+
         session.close()
         
         return JSONResponse(content={
@@ -822,11 +849,12 @@ async def get_apple_health_data_by_type(
     record_type: str,
     start_date: str = None,
     end_date: str = None,
-    limit: int = 100
+    limit: int = 100,
+    patient_id: int = Depends(get_current_patient_id),
 ):
     """
     Získať Apple Health dáta podľa typu
-    
+
     Príklady record_type:
     - HKQuantityTypeIdentifierStepCount (kroky)
     - HKQuantityTypeIdentifierHeartRate (srdcový tep)
@@ -834,9 +862,10 @@ async def get_apple_health_data_by_type(
     """
     try:
         session = get_session()
-        
+
         query = session.query(AppleHealthData).filter(
-            AppleHealthData.record_type == record_type
+            AppleHealthData.record_type == record_type,
+            AppleHealthData.patient_id == patient_id,
         )
         
         # Date filter
@@ -881,13 +910,19 @@ async def get_apple_health_data_by_type(
 
 
 @router.delete("/data")
-async def delete_all_apple_health_data():
-    """Vymazať všetky Apple Health dáta z databázy"""
+async def delete_all_apple_health_data(patient_id: int = Depends(get_current_patient_id)):
+    """Vymazať všetky Apple Health dáta prihláseného pacienta z databázy.
+
+    Scoped by patient_id — this used to be an unconditional `DELETE FROM
+    apple_health_data` with no WHERE clause at all, which under multi-tenancy
+    would let any authenticated user wipe every other patient's imported data.
+    """
     try:
         session = get_session()
-        
-        count = session.query(AppleHealthData).count()
-        session.query(AppleHealthData).delete()
+
+        query = session.query(AppleHealthData).filter(AppleHealthData.patient_id == patient_id)
+        count = query.count()
+        query.delete()
         session.commit()
         session.close()
         
@@ -901,13 +936,15 @@ async def delete_all_apple_health_data():
 
 
 @router.get("/types")
-async def get_available_types():
+async def get_available_types(patient_id: int = Depends(get_current_patient_id)):
     """Získať zoznam všetkých dostupných typov záznamov v databáze"""
     try:
         session = get_session()
-        
-        types = session.query(AppleHealthData.record_type).distinct().all()
-        
+
+        types = session.query(AppleHealthData.record_type).filter(
+            AppleHealthData.patient_id == patient_id
+        ).distinct().all()
+
         session.close()
         
         result = []
@@ -927,23 +964,24 @@ async def get_available_types():
 
 
 @router.get("/sport-stats")
-async def get_sport_statistics():
+async def get_sport_statistics(patient_id: int = Depends(get_current_patient_id)):
     """Získať agregované športové štatistiky pre dashboard"""
     try:
         from sqlalchemy import func
         from datetime import timedelta
         import pandas as pd
-        
+
         session = get_session()
         now = datetime.now()
-        
+
         # Helper funkcia pre agregáciu
         def aggregate_daily(record_type: str, days: int = 7):
             """Agreguje denné hodnoty pre daný typ metriky"""
             start_date = now - timedelta(days=days)
             records = session.query(AppleHealthData).filter(
                 AppleHealthData.record_type == record_type,
-                AppleHealthData.start_date >= start_date
+                AppleHealthData.start_date >= start_date,
+                AppleHealthData.patient_id == patient_id,
             ).all()
             
             if not records:
@@ -978,7 +1016,8 @@ async def get_sport_statistics():
         # SPÁNOK (v hodinách)
         sleep_records = session.query(AppleHealthData).filter(
             AppleHealthData.record_type == 'HKCategoryTypeIdentifierSleepAnalysis',
-            AppleHealthData.start_date >= now - timedelta(days=7)
+            AppleHealthData.start_date >= now - timedelta(days=7),
+            AppleHealthData.patient_id == patient_id,
         ).all()
         
         sleep_by_day = {}

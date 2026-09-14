@@ -1,7 +1,21 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
+
+from app.auth.dependencies import get_current_patient_id, require_admin
+
+# Garmin, Withings and Google Calendar connectors are process-global
+# singletons holding one OAuth session each (see get_garmin_connector() etc.
+# below) — they authenticate once per container, not once per patient. That
+# was fine with a single implicit patient; under multi-tenancy it would let
+# any authenticated tester read (or overwrite, via /sync) whichever account
+# happens to be connected. Making these properly per-user would mean storing
+# a separate OAuth token per patient and is a larger, separate piece of work
+# (see the multi-user-auth PR description). For this pass, every endpoint
+# below that reads or triggers a sync is restricted to ADMIN_EMAILS via
+# require_admin, instead of either deleting the integrations or silently
+# leaving them open to cross-tenant access.
 
 try:
     from app.integrations.garmin_connector import get_garmin_connector
@@ -44,7 +58,7 @@ class CorrelationAnalysisRequest(BaseModel):
 
 
 @router.post("/garmin/auth")
-async def authenticate_garmin(request: GarminAuthRequest):
+async def authenticate_garmin(request: GarminAuthRequest, _admin=Depends(require_admin)):
     """
     Autentifikácia do Garmin Connect
     """
@@ -67,7 +81,7 @@ async def authenticate_garmin(request: GarminAuthRequest):
 
 
 @router.get("/garmin/daily")
-async def get_garmin_daily_data(date: Optional[str] = None):
+async def get_garmin_daily_data(date: Optional[str] = None, _admin=Depends(require_admin)):
     """
     Získať denné dáta z Garmin hodinek
     """
@@ -90,7 +104,7 @@ async def get_garmin_daily_data(date: Optional[str] = None):
 
 
 @router.post("/garmin/sync")
-async def sync_garmin_data(request: SyncRequest, background_tasks: BackgroundTasks):
+async def sync_garmin_data(request: SyncRequest, background_tasks: BackgroundTasks, _admin=Depends(require_admin)):
     """
     Synchronizovať historické dáta z Garmin (na pozadí)
     """
@@ -138,7 +152,7 @@ def _require_withings():
 
 
 @router.get("/withings/auth")
-async def authenticate_withings():
+async def authenticate_withings(_admin=Depends(require_admin)):
     """
     Vráti URL, na ktorú treba používateľa presmerovať (OAuth2 consent screen)
     """
@@ -175,7 +189,7 @@ async def withings_callback(code: Optional[str] = None, state: str = ""):
 
 
 @router.get("/withings/sleep")
-async def get_withings_sleep(days: int = 30):
+async def get_withings_sleep(days: int = 30, _admin=Depends(require_admin)):
     """
     Spánok z hodiniek — fázy, prebúdzania, tep, dychové poruchy
     """
@@ -188,7 +202,7 @@ async def get_withings_sleep(days: int = 30):
 
 
 @router.get("/withings/activity")
-async def get_withings_activity(days: int = 30):
+async def get_withings_activity(days: int = 30, _admin=Depends(require_admin)):
     """
     Denná aktivita — kroky, vzdialenosť, poschodia, pásma tepu
     """
@@ -201,7 +215,7 @@ async def get_withings_activity(days: int = 30):
 
 
 @router.get("/withings/measures")
-async def get_withings_measures(days: int = 30):
+async def get_withings_measures(days: int = 30, _admin=Depends(require_admin)):
     """
     Merania — tep, SpO2, teplota, VO2max, EKG intervaly
     """
@@ -214,7 +228,7 @@ async def get_withings_measures(days: int = 30):
 
 
 @router.get("/withings/hrv")
-async def get_withings_hrv(nights: int = 14):
+async def get_withings_hrv(nights: int = 14, _admin=Depends(require_admin)):
     """
     Variabilita srdcovej frekvencie zo spánku (rmssd, sdnn_1).
 
@@ -230,7 +244,7 @@ async def get_withings_hrv(nights: int = 14):
 
 
 @router.get("/withings/ecg")
-async def get_withings_ecg(with_signal: bool = False):
+async def get_withings_ecg(with_signal: bool = False, _admin=Depends(require_admin)):
     """
     EKG záznamy. with_signal=true stiahne aj surové krivky
     (9000 vzoriek na záznam, ~29 KB) — nepoužívaj pri každom načítaní stránky.
@@ -244,7 +258,12 @@ async def get_withings_ecg(with_signal: bool = False):
 
 
 @router.post("/withings/sync-db")
-async def sync_withings_to_database(days: int = 30, hrv_nights: int = 14):
+async def sync_withings_to_database(
+    days: int = 30,
+    hrv_nights: int = 14,
+    _admin=Depends(require_admin),
+    patient_id: int = Depends(get_current_patient_id),
+):
     """
     Zapíše Withings dáta do kanonickej tabuľky health_records.
 
@@ -258,7 +277,7 @@ async def sync_withings_to_database(days: int = 30, hrv_nights: int = 14):
     _require_withings()
     try:
         from app.integrations.withings_sync import sync_withings_to_db
-        return await sync_withings_to_db(days=days, hrv_nights=hrv_nights)
+        return await sync_withings_to_db(patient_id, days=days, hrv_nights=hrv_nights)
     except HTTPException:
         raise
     except Exception as e:
@@ -266,7 +285,7 @@ async def sync_withings_to_database(days: int = 30, hrv_nights: int = 14):
 
 
 @router.post("/withings/sync")
-async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundTasks):
+async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundTasks, _admin=Depends(require_admin)):
     """
     Synchronizovať historické dáta z Withings (na pozadí)
     """
@@ -280,7 +299,7 @@ async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundT
 
 
 @router.get("/calendar/auth")
-async def authenticate_calendar():
+async def authenticate_calendar(_admin=Depends(require_admin)):
     """
     Autentifikácia do Google Calendar
     """
@@ -303,7 +322,7 @@ async def authenticate_calendar():
 
 
 @router.get("/calendar/events")
-async def get_calendar_events(days_back: int = 30, days_forward: int = 7):
+async def get_calendar_events(days_back: int = 30, days_forward: int = 7, _admin=Depends(require_admin)):
     """
     Získať udalosti z kalendára
     """
@@ -331,7 +350,7 @@ async def get_calendar_events(days_back: int = 30, days_forward: int = 7):
 
 
 @router.post("/analyze/correlations")
-async def analyze_correlations(request: CorrelationAnalysisRequest):
+async def analyze_correlations(request: CorrelationAnalysisRequest, _admin=Depends(require_admin)):
     """
     Analyzovať korelácie medzi kalendárom a zdravotnými metrikami
     """
