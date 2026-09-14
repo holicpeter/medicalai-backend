@@ -105,6 +105,29 @@ class NutritionEntry(Base):
     patient = relationship("Patient", back_populates="nutrition_entries")
 
 
+class NutritionTextCache(Base):
+    """Cache pre textovo zadané jedlá (Nutrition -> "Napísať").
+
+    Ak niekto napíše presne ten istý popis jedla znova (typicky rutinné
+    raňajky/obed), vrátime uložený výsledok bez ďalšieho volania Claude API.
+    Zámerne len exact-normalized match naprieč celým popisom, nie fuzzy
+    matching na úrovni jednotlivých položiek — pri zdravotnej appke je
+    nesprávne priradený odhad horší než jedno AI volanie navyše. Pozri
+    ai-model-selection-strategy.md (krok 2) pre zdôvodnenie a alternatívy.
+
+    Fotky sa takto necachujú — presne tá istá fotka sa v praxi znova
+    nenahráva, takže by cache podľa hashu obrázka neprinieslo úsporu.
+    """
+    __tablename__ = 'nutrition_text_cache'
+    id = Column(Integer, primary_key=True)
+    description_normalized = Column(String(2000), unique=True, index=True, nullable=False)
+    description_original = Column(Text, nullable=False)
+    analysis_json = Column(JSON, nullable=False)  # items, totals, confidence, recommendation (bez disclaimer)
+    hit_count = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.now)
+    last_used_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class Document(Base):
     __tablename__ = 'documents'
     id = Column(Integer, primary_key=True)
