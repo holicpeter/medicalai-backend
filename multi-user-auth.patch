@@ -1,0 +1,4435 @@
+From 3020c9713f7290db1e52ae4c1676d95109b04850 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 14 Sep 2026 11:27:47 +0000
+Subject: [PATCH 1/3] Add multi-user auth: User/Patient split, JWT cookie
+ sessions, open registration
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every tester now gets their own account instead of the app assuming one
+implicit patient. A new User table holds login credentials, 1:1-linked to the
+existing Patient (clinical profile) table via patients.user_id — every
+already-existing patient_id-scoped table needed no new column, only a
+trustworthy per-request source for "whose data is this" to replace
+`session.query(Patient).first()`.
+
+- app/database/models.py: User model, patients.user_id column, idempotent
+  _ensure_columns() migration run on every startup.
+- app/auth/security.py: PBKDF2-SHA256 password hashing (600k iterations),
+  HS256 JWT (stdlib PyJWT, no new crypto dependency).
+- app/auth/dependencies.py: get_current_user / get_current_patient_id read
+  the session from an httpOnly cookie only; require_admin gates the
+  Garmin/Withings/Calendar integrations (see next commit); a simple in-memory
+  rate limiter guards /register and /login.
+- app/api/auth.py: register (open, email+password, explicit GDPR consent,
+  creates the user's own empty Patient row) / login / logout / me.
+- app/main.py: registers the auth router, flips CORS allow_credentials to
+  True (needed for the cookie to ride cross-origin fetch calls), and drops
+  the old create_default_patient() bootstrap — patients are created at
+  registration now, one per user.
+- scripts/migrate_multi_user.py: one-time script to link the existing
+  production Patient row (and its previously-unowned Document rows) to a new
+  admin account. Must be run once before testers register, per its docstring.
+
+Household/family grouping is deliberately out of scope for this pass (see
+claude/prompt-multi-profil-rodina.md in the MedicalAI project) — every
+account is fully independent.
+---
+ .env.example                  |  13 +++
+ app/api/auth.py               | 198 ++++++++++++++++++++++++++++++++++
+ app/auth/__init__.py          |   0
+ app/auth/dependencies.py      | 182 +++++++++++++++++++++++++++++++
+ app/auth/security.py          |  83 ++++++++++++++
+ app/config.py                 |  32 ++++++
+ app/database/__init__.py      |   2 +
+ app/database/models.py        |  61 +++++++++++
+ app/main.py                   |  21 +++-
+ requirements.txt              |   5 +
+ scripts/migrate_multi_user.py | 138 ++++++++++++++++++++++++
+ 11 files changed, 731 insertions(+), 4 deletions(-)
+ create mode 100644 app/api/auth.py
+ create mode 100644 app/auth/__init__.py
+ create mode 100644 app/auth/dependencies.py
+ create mode 100644 app/auth/security.py
+ create mode 100644 scripts/migrate_multi_user.py
+
+diff --git a/.env.example b/.env.example
+index 0f70cef..ac845b1 100644
+--- a/.env.example
++++ b/.env.example
+@@ -18,8 +18,21 @@ MISTRAL_API_KEY=
+ # --- API --------------------------------------------------------------------
+ BACKEND_HOST=localhost
+ BACKEND_PORT=8000
++# Also signs auth session cookies (JWT, HS256) — must be a long random value
++# in production, not the default. Rotating it logs out every session.
+ SECRET_KEY=
+ 
++# --- Auth ---------------------------------------------------------------
++# Comma-separated (or JSON array) list of emails allowed to use the
++# Garmin/Withings/Calendar integration endpoints — those connectors hold one
++# OAuth session per process, not per user, so they are restricted to the
++# account(s) that actually own that hardware. See app/config.py.
++ADMIN_EMAILS=
++# Set to false only for local http://localhost development. Must stay true
++# anywhere served over https (Railway/production), or the session cookie is
++# dropped by the browser.
++AUTH_COOKIE_SECURE=true
++
+ # Shared secret with the Cloudflare Worker in front of this API. When set, only
+ # requests carrying it in X-Proxy-Secret are served. Empty disables the check.
+ PROXY_SHARED_SECRET=
+diff --git a/app/api/auth.py b/app/api/auth.py
+new file mode 100644
+index 0000000..d0cb434
+--- /dev/null
++++ b/app/api/auth.py
+@@ -0,0 +1,198 @@
++"""Registration and login.
++
++Open registration on purpose (no invite code) — the point of this change is
++to let more testers into the app quickly. See
++claude/prompt-multi-profil-rodina.md in the project for that tradeoff and
++when to revisit it (an invite code becomes worth adding once the tester count
++outgrows what open signup can absorb, or abuse shows up in practice).
++
++Every user gets exactly one Patient row, created here at registration time —
++that is what every other scoped endpoint in the app resolves through
++app.auth.dependencies.get_current_patient_id.
++"""
++import logging
++import re
++from datetime import datetime
++
++from fastapi import APIRouter, Depends, HTTPException, Request, Response
++from pydantic import BaseModel, Field, field_validator
++
++from app.auth.dependencies import (
++    check_rate_limit,
++    clear_auth_cookie,
++    get_current_user,
++    set_auth_cookie,
++)
++from app.auth.security import create_access_token, hash_password, verify_password
++from app.database import Patient, User, get_session
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/api/auth", tags=["auth"])
++
++_MIN_PASSWORD_LENGTH = 10
++
++# Deliberately simple (not the full RFC 5322 grammar): pydantic's EmailStr
++# would need the email-validator package, one more dependency for a check
++# that only has to reject obvious typos — the real proof an address works is
++# the account being usable, not a stricter regex. Same tradeoff already made
++# for password hashing (stdlib PBKDF2 instead of bcrypt/passlib) and JWT
++# (PyJWT's dependency-free HS256 path).
++_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
++
++
++def _validate_email(value: str) -> str:
++    value = value.strip().lower()
++    if not _EMAIL_RE.match(value) or len(value) > 255:
++        raise ValueError("Neplatná emailová adresa.")
++    return value
++
++
++class RegisterRequest(BaseModel):
++    email: str
++    password: str = Field(..., min_length=_MIN_PASSWORD_LENGTH, max_length=200)
++    # Explicit, separate from "I agree to the ToS" — this app stores health
++    # data, so consent has to be about that specifically and per-user, not
++    # bundled into a generic checkbox. Required: True, not just present.
++    gdpr_consent: bool
++
++    _normalize_email = field_validator("email")(_validate_email)
++
++    @field_validator("gdpr_consent")
++    @classmethod
++    def _consent_must_be_given(cls, value: bool) -> bool:
++        if not value:
++            raise ValueError(
++                "Súhlas so spracovaním zdravotných údajov je potrebný na vytvorenie účtu."
++            )
++        return value
++
++
++class LoginRequest(BaseModel):
++    email: str
++    password: str
++
++    _normalize_email = field_validator("email")(_validate_email)
++
++
++class UserOut(BaseModel):
++    id: int
++    email: str
++    patient_id: int
++    created_at: str
++
++
++def _serialize(user: User, patient_id: int) -> UserOut:
++    return UserOut(
++        id=user.id,
++        email=user.email,
++        patient_id=patient_id,
++        created_at=user.created_at.isoformat() if user.created_at else "",
++    )
++
++
++@router.post("/register", response_model=UserOut, status_code=201)
++async def register(data: RegisterRequest, request: Request, response: Response):
++    check_rate_limit(request, bucket="register")
++
++    session = get_session()
++    try:
++        email = data.email.lower().strip()
++        existing = session.query(User).filter_by(email=email).first()
++        if existing is not None:
++            # Same message as "wrong password" would not help here — the
++            # thing this guards is a health app, and confirming account
++            # existence by email is a low-severity leak next to it being the
++            # only way to give a useful error to someone who signed up
++            # before and forgot. Rate limiting above is what keeps this from
++            # being an enumeration oracle at scale.
++            raise HTTPException(status_code=409, detail="Účet s týmto emailom už existuje.")
++
++        user = User(
++            email=email,
++            password_hash=hash_password(data.password),
++            gdpr_consent_at=datetime.now(),
++            is_active=True,
++        )
++        session.add(user)
++        session.flush()  # assigns user.id
++
++        # Every user owns exactly one Patient — their own profile. Created
++        # empty here; the onboarding screens (health card scan, family
++        # history, Apple Health, nutrition) fill it in from a clean slate,
++        # the same shape the admin's own profile has.
++        patient = Patient(user_id=user.id, first_name="", last_name="")
++        session.add(patient)
++        session.commit()
++        session.refresh(user)
++        session.refresh(patient)
++
++        token = create_access_token(user.id)
++        set_auth_cookie(response, token)
++
++        logger.info("auth: registered user id=%s", user.id)
++        return _serialize(user, patient.id)
++    except HTTPException:
++        session.rollback()
++        raise
++    except Exception as e:
++        session.rollback()
++        logger.exception("register failed")
++        raise HTTPException(status_code=500, detail="Registrácia zlyhala.") from e
++    finally:
++        session.close()
++
++
++@router.post("/login", response_model=UserOut)
++async def login(data: LoginRequest, request: Request, response: Response):
++    check_rate_limit(request, bucket="login")
++
++    session = get_session()
++    try:
++        email = data.email.lower().strip()
++        user = session.query(User).filter_by(email=email).first()
++
++        # Verify against a real hash either way, so a request for a
++        # nonexistent email does not return faster than one for a real
++        # email with a wrong password — that timing difference is itself an
++        # account-enumeration channel.
++        password_hash = user.password_hash if user is not None else (
++            "pbkdf2_sha256$600000$" + "00" * 16 + "$" + "00" * 32
++        )
++        password_ok = verify_password(data.password, password_hash)
++
++        if user is None or not password_ok or not user.is_active:
++            raise HTTPException(status_code=401, detail="Nesprávny email alebo heslo.")
++
++        patient = session.query(Patient).filter_by(user_id=user.id).first()
++        if patient is None:
++            logger.error("login: user %s has no linked Patient row", user.id)
++            raise HTTPException(status_code=500, detail="Profil sa nenašiel. Kontaktujte podporu.")
++
++        token = create_access_token(user.id)
++        set_auth_cookie(response, token)
++
++        logger.info("auth: logged in user id=%s", user.id)
++        return _serialize(user, patient.id)
++    except HTTPException:
++        raise
++    finally:
++        session.close()
++
++
++@router.post("/logout")
++async def logout(response: Response):
++    clear_auth_cookie(response)
++    return {"success": True}
++
++
++@router.get("/me", response_model=UserOut)
++async def me(current_user: User = Depends(get_current_user)):
++    session = get_session()
++    try:
++        patient = session.query(Patient).filter_by(user_id=current_user.id).first()
++        if patient is None:
++            raise HTTPException(status_code=500, detail="Profil sa nenašiel. Kontaktujte podporu.")
++        return _serialize(current_user, patient.id)
++    finally:
++        session.close()
+diff --git a/app/auth/__init__.py b/app/auth/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/auth/dependencies.py b/app/auth/dependencies.py
+new file mode 100644
+index 0000000..8ed6984
+--- /dev/null
++++ b/app/auth/dependencies.py
+@@ -0,0 +1,182 @@
++"""FastAPI dependencies that turn a request into "which patient is this".
++
++Every data-owning endpoint in the app used to answer that question with
++`session.query(Patient).first()` — there was only ever one. These dependencies
++are the replacement: `get_current_patient_id` is what every scoped endpoint
++now depends on instead, and it is the single place that maps a session cookie
++to a patient_id. Get this one function wrong and every table filtered by
++patient_id downstream leaks across accounts, so it is deliberately small and
++has no fallback that guesses a patient when the token is missing or invalid.
++"""
++import logging
++import time
++from collections import defaultdict, deque
++from typing import Deque, Dict, Tuple
++
++from fastapi import Depends, HTTPException, Request, Response
++
++from app.auth.security import decode_access_token
++from app.config import settings
++from app.database import Patient, User, get_session
++
++logger = logging.getLogger(__name__)
++
++
++def get_current_user(request: Request) -> User:
++    """The logged-in user, or 401.
++
++    Reads the JWT from the httpOnly cookie only — never from a header or the
++    request body — so a token cannot be lifted into a script the way a
++    header-based bearer token can be, and no client code has to handle it.
++    """
++    token = request.cookies.get(settings.AUTH_COOKIE_NAME)
++    if not token:
++        raise HTTPException(status_code=401, detail="Neprihlásený.")
++
++    user_id = decode_access_token(token)
++    if user_id is None:
++        raise HTTPException(status_code=401, detail="Neplatné alebo expirované prihlásenie.")
++
++    session = get_session()
++    try:
++        user = session.query(User).filter_by(id=user_id).first()
++        if user is None or not user.is_active:
++            raise HTTPException(status_code=401, detail="Neplatné alebo expirované prihlásenie.")
++        # Detached from the session on purpose — the caller gets a plain
++        # object with the fields already loaded, not a live ORM instance tied
++        # to a session that is about to close underneath it.
++        session.expunge(user)
++        return user
++    finally:
++        session.close()
++
++
++def get_current_patient_id(user: User = Depends(get_current_user)) -> int:
++    """The id of the current user's own Patient row.
++
++    Every user gets exactly one Patient, created at registration (see
++    app/api/auth.py) — so a missing one here means the data model was
++    violated somewhere else, not a normal "no profile yet" state, and the 500
++    is deliberate: silently creating one here would hide that bug instead of
++    surfacing it.
++    """
++    session = get_session()
++    try:
++        patient = session.query(Patient).filter_by(user_id=user.id).first()
++        if patient is None:
++            logger.error("get_current_patient_id: user %s has no linked Patient row", user.id)
++            raise HTTPException(
++                status_code=500,
++                detail="Profil sa nenašiel. Kontaktujte podporu.",
++            )
++        return patient.id
++    finally:
++        session.close()
++
++
++def require_admin(user: User = Depends(get_current_user)) -> User:
++    """Gate for the Garmin/Withings/Calendar integration endpoints.
++
++    Those connectors keep one OAuth session per process (see
++    app/integrations/*_connector.py) — not per user — because they were built
++    before there was more than one user. Letting any authenticated tester
++    call them would mean either reading the admin's own wearable data through
++    a request that is authenticated as someone else, or overwriting the
++    admin's connector session entirely. Restricting them to ADMIN_EMAILS is
++    the stopgap until those integrations store a token per user.
++    """
++    if user.email.lower() not in {e.lower() for e in settings.ADMIN_EMAILS}:
++        raise HTTPException(
++            status_code=403,
++            detail=(
++                "Táto integrácia je zatiaľ dostupná len pre administrátora účtu "
++                "(Garmin/Withings/Kalendár zdieľajú jedno pripojenie pre celú appku)."
++            ),
++        )
++    return user
++
++
++# ─── Rate limiting for /api/auth/register and /api/auth/login ──────────────
++#
++# In-memory, per-process, sliding window. Not shared across Railway
++# instances or survivable across a restart — a real deployment with more than
++# one worker would want this in the database or Redis instead. For the
++# tester-onboarding phase this is scoped to a single Railway service with one
++# process, and the goal is only to blunt casual brute-forcing and signup
++# spam, not to be an airtight rate limiter.
++
++_MAX_ATTEMPTS = 10
++_WINDOW_SECONDS = 300  # 5 minutes
++
++_attempts: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
++
++
++def _client_ip(request: Request) -> str:
++    # This API sits behind a Cloudflare Worker (see require_proxy_secret in
++    # main.py) which does not currently forward the original client IP, so
++    # this falls back to the immediate peer — the Worker's own address if it
++    # never sets one. That makes this limiter key mostly by "everyone behind
++    # the Worker" rather than by individual client, which is a known
++    # limitation, not an oversight: it still catches a single script hammering
++    # /register in a loop, which is the main risk during open registration.
++    forwarded = request.headers.get("x-forwarded-for")
++    if forwarded:
++        return forwarded.split(",")[0].strip()
++    return request.client.host if request.client else "unknown"
++
++
++def check_rate_limit(request: Request, bucket: str) -> None:
++    """Raise 429 if this (ip, bucket) pair has exceeded the attempt budget.
++
++    Call this before doing any password verification work — the point is to
++    stop a loop of attempts from reaching bcrypt-equivalent-cost hashing at
++    all, not just to stop it from succeeding.
++    """
++    key = (_client_ip(request), bucket)
++    now = time.monotonic()
++    window = _attempts[key]
++
++    while window and now - window[0] > _WINDOW_SECONDS:
++        window.popleft()
++
++    if len(window) >= _MAX_ATTEMPTS:
++        raise HTTPException(
++            status_code=429,
++            detail="Príliš veľa pokusov. Skúste to znova o pár minút.",
++        )
++
++    window.append(now)
++
++
++def _cookie_samesite() -> str:
++    # The frontend (medicalai.peterholic.com / a *.vercel.app preview) and
++    # this API (fronted by the Cloudflare Worker on its own domain) are
++    # different sites, so a fetch()-attached cookie needs SameSite=None —
++    # SameSite=Lax is only sent on top-level navigation, not on the
++    # cross-origin XHR/fetch calls the SPA makes. None requires Secure, which
++    # is why this only applies when AUTH_COOKIE_SECURE is on; local
++    # http://localhost dev (frontend and backend both on "localhost", just
++    # different ports — same site by the Secure-cookie definition) falls
++    # back to Lax, since a browser refuses SameSite=None without Secure.
++    return "none" if settings.AUTH_COOKIE_SECURE else "lax"
++
++
++def set_auth_cookie(response: Response, token: str) -> None:
++    response.set_cookie(
++        key=settings.AUTH_COOKIE_NAME,
++        value=token,
++        httponly=True,
++        secure=settings.AUTH_COOKIE_SECURE,
++        samesite=_cookie_samesite(),
++        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
++        path="/",
++    )
++
++
++def clear_auth_cookie(response: Response) -> None:
++    response.delete_cookie(
++        key=settings.AUTH_COOKIE_NAME,
++        path="/",
++        secure=settings.AUTH_COOKIE_SECURE,
++        samesite=_cookie_samesite(),
++    )
+diff --git a/app/auth/security.py b/app/auth/security.py
+new file mode 100644
+index 0000000..ab85aa3
+--- /dev/null
++++ b/app/auth/security.py
+@@ -0,0 +1,83 @@
++"""Password hashing and session tokens.
++
++Password hashing is stdlib-only (hashlib.pbkdf2_hmac) rather than pulling in
++bcrypt/argon2/passlib: PBKDF2-HMAC-SHA256 at a high iteration count is still an
++OWASP-recommended choice, and it means one fewer native dependency in a
++container image that already carries tesseract, poppler and friends for OCR.
++If this ever needs to change, _HASH_ALGO in the stored string is the version
++marker — verify_password dispatches on it, so a future algorithm can be added
++without invalidating every existing password.
++
++Session tokens are JWTs (HS256, signed with settings.SECRET_KEY) carried in an
++httpOnly cookie — never in localStorage, which a single XSS bug can read in
++full. HS256 needs no asymmetric key management and no extra native dependency
++(PyJWT's HS256 path is pure Python).
++"""
++import hashlib
++import hmac
++import logging
++import secrets
++from datetime import datetime, timedelta, timezone
++from typing import Optional
++
++import jwt
++
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++_HASH_ALGO = "pbkdf2_sha256"
++_PBKDF2_ITERATIONS = 600_000  # OWASP 2023 minimum for PBKDF2-HMAC-SHA256
++_SALT_BYTES = 16
++
++_JWT_ALGORITHM = "HS256"
++_JWT_SUBJECT_CLAIM = "sub"  # user id, as a string (JWT spec requires sub be a string)
++
++
++def hash_password(password: str) -> str:
++    """Return a self-describing hash string: algo$iterations$salt_hex$hash_hex."""
++    salt = secrets.token_bytes(_SALT_BYTES)
++    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
++    return f"{_HASH_ALGO}${_PBKDF2_ITERATIONS}${salt.hex()}${derived.hex()}"
++
++
++def verify_password(password: str, stored_hash: str) -> bool:
++    """Constant-time check. Never raises on a malformed stored hash — treat it as a mismatch."""
++    try:
++        algo, iterations_s, salt_hex, hash_hex = stored_hash.split("$", 3)
++        if algo != _HASH_ALGO:
++            logger.warning("verify_password: unknown hash algo %r", algo)
++            return False
++        iterations = int(iterations_s)
++        salt = bytes.fromhex(salt_hex)
++        expected = bytes.fromhex(hash_hex)
++    except (ValueError, AttributeError) as e:
++        logger.warning("verify_password: malformed stored hash: %s", e)
++        return False
++
++    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
++    return hmac.compare_digest(derived, expected)
++
++
++def create_access_token(user_id: int) -> str:
++    now = datetime.now(timezone.utc)
++    payload = {
++        _JWT_SUBJECT_CLAIM: str(user_id),
++        "iat": now,
++        "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
++    }
++    return jwt.encode(payload, settings.SECRET_KEY, algorithm=_JWT_ALGORITHM)
++
++
++def decode_access_token(token: str) -> Optional[int]:
++    """Return the user id the token was issued for, or None if it is invalid/expired.
++
++    Never raises: an expired, tampered, or garbage cookie value is exactly as
++    unauthenticated as no cookie at all, not a 500.
++    """
++    try:
++        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[_JWT_ALGORITHM])
++        return int(payload[_JWT_SUBJECT_CLAIM])
++    except (jwt.PyJWTError, KeyError, TypeError, ValueError) as e:
++        logger.debug("decode_access_token: rejected token: %s", e)
++        return None
+diff --git a/app/config.py b/app/config.py
+index 1c15f0b..1693ae8 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -16,6 +16,30 @@ class Settings(BaseSettings):
+     # Security
+     SECRET_KEY: str = _DEFAULT_SECRET_KEY
+ 
++    # Auth — JWT session cookie (HS256, signed with SECRET_KEY).
++    #
++    # Registration is open (no invite code) by design for this phase: the
++    # goal is letting more testers in quickly, not gatekeeping them. See
++    # claude/prompt-multi-profil-rodina.md in the project for the tradeoff —
++    # revisit if the tester count grows past what a few dozen open signups
++    # can absorb.
++    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 14  # 14 days
++    AUTH_COOKIE_NAME: str = "medicalai_session"
++    # False only for local http://localhost development; Railway/Cloudflare
++    # serve https, so this must be True there or the cookie is silently
++    # dropped by the browser over http and, worse, would be sent in the
++    # clear if it somehow were not.
++    AUTH_COOKIE_SECURE: bool = True
++    # Emails allowed to call the Garmin/Withings/Calendar integration
++    # endpoints. Those connectors hold one OAuth session per process (see
++    # app/integrations/*_connector.py) — they were never built to be
++    # multi-tenant, and making them so means storing per-user OAuth tokens in
++    # the database, which is out of scope here. Restricting them to the
++    # admin's own email is what stops a second tester from either reading
++    # the admin's Withings data through an authenticated-but-wrong-tenant
++    # request, or silently overwriting the admin's connector session.
++    ADMIN_EMAILS: List[str] = []
++
+     # Shared secret with the Cloudflare Worker that fronts this API.
+     #
+     # Cloudflare Access guards medicalai.peterholic.com, but this Railway
+@@ -107,6 +131,14 @@ if settings.WITHINGS_CLIENT_ID and settings.WITHINGS_CLIENT_SECRET:
+ else:
+     logger.warning('WITHINGS_CLIENT_ID / WITHINGS_CLIENT_SECRET not set — Withings sync disabled')
+ 
++if settings.ADMIN_EMAILS:
++    logger.info('Admin emails loaded (%d) — Garmin/Withings/Calendar restricted to them', len(settings.ADMIN_EMAILS))
++else:
++    logger.warning(
++        'ADMIN_EMAILS is not set — every /api/integrations/{garmin,withings,calendar} '
++        'endpoint will 503 rather than silently share one tenant\'s connector session'
++    )
++
+ # Ensure directories exist
+ settings.RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+ settings.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+diff --git a/app/database/__init__.py b/app/database/__init__.py
+index 0402c8f..db7b210 100644
+--- a/app/database/__init__.py
++++ b/app/database/__init__.py
+@@ -1,6 +1,7 @@
+ # Database module
+ from .models import (
+     Base,
++    User,
+     Patient,
+     FamilyMember,
+     HealthRecord,
+@@ -18,6 +19,7 @@ from .models import (
+ 
+ __all__ = [
+     "Base",
++    "User",
+     "Patient",
+     "FamilyMember",
+     "HealthRecord",
+diff --git a/app/database/models.py b/app/database/models.py
+index 29cb132..cbf18b3 100644
+--- a/app/database/models.py
++++ b/app/database/models.py
+@@ -15,9 +15,36 @@ _db_logger = logging.getLogger(__name__)
+ Base = declarative_base()
+ 
+ 
++class User(Base):
++    """A login. One user owns exactly one Patient — their own profile.
++
++    Kept deliberately separate from Patient: Patient is the clinical profile
++    (name, DOB, the data it owns via patient_id everywhere else), User is the
++    credential (email + password) that logs into it. Splitting them means the
++    existing patient_id scoping on every other table did not have to change —
++    only "which patient does this request belong to" had to be answered, and
++    that answer now comes from the session instead of "the only Patient row
++    that exists".
++    """
++    __tablename__ = 'users'
++    id = Column(Integer, primary_key=True)
++    email = Column(String(255), unique=True, nullable=False, index=True)
++    password_hash = Column(String(255), nullable=False)
++    gdpr_consent_at = Column(DateTime, nullable=True)
++    is_active = Column(Boolean, default=True)
++    created_at = Column(DateTime, default=datetime.now)
++    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
++    patient = relationship("Patient", back_populates="user", uselist=False)
++
++
+ class Patient(Base):
+     __tablename__ = 'patients'
+     id = Column(Integer, primary_key=True)
++    # Nullable during the migration window: a deploy that runs init_database()
++    # before scripts/migrate_multi_user.py has linked the pre-existing row
++    # must not crash on a NOT NULL constraint it cannot yet satisfy. New rows
++    # are always created with a user_id — see app/api/auth.py register().
++    user_id = Column(Integer, ForeignKey('users.id'), nullable=True, unique=True)
+     first_name = Column(String(100))
+     last_name = Column(String(100))
+     date_of_birth = Column(Date)
+@@ -28,6 +55,7 @@ class Patient(Base):
+     phone = Column(String(50))
+     created_at = Column(DateTime, default=datetime.now)
+     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
++    user = relationship("User", back_populates="patient")
+     health_records = relationship("HealthRecord", back_populates="patient")
+     family_members = relationship("FamilyMember", back_populates="patient")
+     nutrition_entries = relationship("NutritionEntry", back_populates="patient")
+@@ -290,12 +318,43 @@ def init_database():
+     engine = _get_engine()
+     # checkfirst=True = nevyhadzuje error ak tabuľky už existujú
+     Base.metadata.create_all(engine, checkfirst=True)
++    _ensure_columns(engine)
+     _ensure_indexes(engine)
+     _db_initialized = True
+     _db_logger.info("[DATABASE] All tables created/verified")
+     return engine
+ 
+ 
++# create_all() only creates a table's columns when the table itself is new —
++# an already-deployed `patients` table never gets a column added this way, so
++# a deploy that introduces one needs an explicit ALTER. Both PostgreSQL and
++# SQLite (3.35+, what Railway/modern local installs run) accept "ADD COLUMN
++# IF NOT EXISTS", so this is safe to re-run on every startup, the same way
++# _ensure_indexes is. scripts/migrate_multi_user.py still has to run once to
++# actually create the first user and link the pre-existing Patient row — this
++# only makes sure the column exists so that script (and the app) has
++# somewhere to write.
++_COLUMNS = (
++    ("patients", "user_id", "INTEGER"),
++)
++
++
++def _ensure_columns(engine):
++    from sqlalchemy import text
++
++    with engine.connect() as conn:
++        for table, column, coltype in _COLUMNS:
++            try:
++                conn.execute(text(
++                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}"
++                ))
++                conn.commit()
++            except Exception as e:
++                _db_logger.warning(
++                    "[DATABASE] Could not ensure column %s.%s: %s", table, column, e
++                )
++
++
+ # create_all() only creates indexes alongside a new table, so existing
+ # deployments never get them. These are idempotent and cheap to re-run.
+ _INDEXES = (
+@@ -308,6 +367,8 @@ _INDEXES = (
+     ("ix_chat_messages_created", "chat_messages", "created_at"),
+     ("ix_documents_filename", "documents", "filename"),
+     ("ix_nutrition_entries_patient_logged", "nutrition_entries", "patient_id, logged_at"),
++    ("ix_patients_user", "patients", "user_id"),
++    ("ix_documents_patient", "documents", "patient_id"),
+ )
+ 
+ 
+diff --git a/app/main.py b/app/main.py
+index 6186f40..fa7e630 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -7,9 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import JSONResponse
+ import uvicorn
+ 
+-from app.api import health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
++from app.api import auth, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
+ from app.config import settings
+-from app.database import init_database, create_default_patient
++from app.database import init_database
+ 
+ logging.basicConfig(
+     level=logging.INFO,
+@@ -22,7 +22,14 @@ logger = logging.getLogger(__name__)
+ async def lifespan(app: FastAPI):
+     try:
+         init_database()
+-        create_default_patient()
++        # create_default_patient() used to run here, making an implicit
++        # unowned Patient row for the app's one-and-only user. Patients are
++        # now created at registration (app/api/auth.py), one per User, so an
++        # unowned row here would just be orphaned data with nobody scoped to
++        # read it. Pre-existing production data is handled once by
++        # scripts/migrate_multi_user.py, which links it to an admin account
++        # (or creates one) — see that script before running this branch
++        # against the production database for the first time.
+         logger.info('Database initialized successfully')
+     except Exception as e:
+         logger.error('Failed to initialize database: %s', e)
+@@ -40,7 +47,12 @@ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=settings.ALLOWED_ORIGINS,
+     allow_origin_regex=settings.ALLOWED_ORIGIN_REGEX,
+-    allow_credentials=False,
++    # Auth now rides an httpOnly cookie (see app/auth/dependencies.py) instead
++    # of a client-readable token, and a cookie is only attached to a
++    # cross-origin fetch() when the browser is told the response allows
++    # credentialed requests — allow_credentials=False silently drops the
++    # cookie on every request from the frontend's own domain.
++    allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+ )
+@@ -79,6 +91,7 @@ async def require_proxy_secret(request: Request, call_next):
+ 
+     return await call_next(request)
+ 
++app.include_router(auth.router)
+ app.include_router(health.router, prefix="/api/health", tags=["health"])
+ app.include_router(upload.router, prefix="/api/upload", tags=["upload"])
+ app.include_router(analysis.router, prefix="/api/analysis", tags=["analysis"])
+diff --git a/requirements.txt b/requirements.txt
+index 02d55a4..5f3747c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -22,6 +22,11 @@ sqlalchemy>=2.0.0
+ scikit-learn>=1.3.0
+ psycopg2-binary>=2.9.0
+ 
++# Auth: JWT session cookies (HS256 only, no cryptography backend needed).
++# Password hashing itself uses stdlib hashlib.pbkdf2_hmac — no extra
++# dependency for that, so bcrypt/argon2/passlib were deliberately left out.
++PyJWT>=2.8.0
++
+ # scripts/apple_health_watcher.py
+ requests>=2.31.0
+ watchdog>=4.0.0
+diff --git a/scripts/migrate_multi_user.py b/scripts/migrate_multi_user.py
+new file mode 100644
+index 0000000..88ecd00
+--- /dev/null
++++ b/scripts/migrate_multi_user.py
+@@ -0,0 +1,138 @@
++"""One-time migration: link the pre-existing single Patient row to a new admin User.
++
++Run this ONCE, after deploying the code in this branch but before testers start
++registering. It is safe to run again (idempotent) — it does nothing if a User
++already owns the existing Patient row.
++
++Usage (Railway): set ADMIN_EMAIL and ADMIN_PASSWORD as one-off env vars (or
++export them locally against DATABASE_URL) and run:
++
++    python -m scripts.migrate_multi_user
++
++What it does:
++  1. Ensures the `users` table and `patients.user_id` column exist (normally
++     already true — app.database.models.init_database() does this on every
++     startup — but this script does not assume the app has started yet).
++  2. If a User with ADMIN_EMAIL already exists, stops (already migrated).
++  3. Otherwise creates that User, and links the *first* Patient row with no
++     user_id (there should be at most one — this app has always had exactly
++     one implicit patient) to it.
++  4. If there is no existing Patient row at all (a brand new database), just
++     creates the User; that account's own Patient row will be created the
++     normal way the next time someone logs in — actually no: registration is
++     what creates Patient rows now, so this creates one directly, matching
++     what app/api/auth.py's register() does.
++
++Existing data (health_records, documents, apple_health_data, nutrition_entries,
++family_members, chat_messages) is NOT touched — it already carries
++patient_id pointing at the row this script links, so it becomes that admin
++user's data automatically, with nothing to copy or rewrite.
++"""
++import getpass
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from app.auth.security import hash_password  # noqa: E402
++from app.database import Document, Patient, User, get_session, init_database  # noqa: E402
++
++
++def _backfill_documents(session, patient_id: int) -> int:
++    """Attach every un-owned Document row to patient_id.
++
++    Document.patient_id is nullable and, before this branch, was never set by
++    the upload flow at all (see app/rag/retriever.py's index_document) — every
++    pre-existing uploaded report has patient_id = NULL. RAG search and the
++    document inventory are now filtered by patient_id (per-patient cache and
++    IDOR fix), so without this step those documents would silently stop
++    showing up anywhere — not deleted, just invisible.
++    """
++    orphans = session.query(Document).filter(Document.patient_id.is_(None)).all()
++    for doc in orphans:
++        doc.patient_id = patient_id
++    if orphans:
++        session.commit()
++    return len(orphans)
++
++
++def main() -> int:
++    email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
++    password = os.environ.get("ADMIN_PASSWORD", "")
++
++    if not email:
++        email = input("Admin email: ").strip().lower()
++    if not password:
++        password = getpass.getpass("Admin password (min 10 chars): ")
++
++    if not email or "@" not in email:
++        print("ERROR: a valid email is required.", file=sys.stderr)
++        return 1
++    if len(password) < 10:
++        print("ERROR: password must be at least 10 characters.", file=sys.stderr)
++        return 1
++
++    init_database()  # idempotent — creates tables/columns/indexes if missing
++
++    session = get_session()
++    try:
++        existing_user = session.query(User).filter_by(email=email).first()
++        if existing_user is not None:
++            print(f"User {email} already exists (id={existing_user.id}) — nothing to do.")
++            linked = session.query(Patient).filter_by(user_id=existing_user.id).first()
++            if linked is None:
++                print(
++                    "WARNING: that user has no linked Patient row. This should not "
++                    "happen — investigate before letting anyone log in as this user."
++                )
++            return 0
++
++        admin = User(
++            email=email,
++            password_hash=hash_password(password),
++            is_active=True,
++        )
++        session.add(admin)
++        session.flush()  # assigns admin.id
++
++        orphan_patient = session.query(Patient).filter(Patient.user_id.is_(None)).first()
++        if orphan_patient is not None:
++            orphan_patient.user_id = admin.id
++            session.commit()
++            print(
++                f"Created user {email} (id={admin.id}) and linked existing patient "
++                f"id={orphan_patient.id} ({orphan_patient.first_name} "
++                f"{orphan_patient.last_name}).".strip()
++            )
++            doc_count = _backfill_documents(session, orphan_patient.id)
++            if doc_count:
++                print(f"Linked {doc_count} previously unowned document(s) to this patient.")
++        else:
++            new_patient = Patient(user_id=admin.id, first_name="", last_name="")
++            session.add(new_patient)
++            session.commit()
++            session.refresh(new_patient)
++            print(
++                f"Created user {email} (id={admin.id}) with a new, empty patient "
++                f"profile (id={new_patient.id}) — no pre-existing patient row was found."
++            )
++            doc_count = _backfill_documents(session, new_patient.id)
++            if doc_count:
++                print(f"Linked {doc_count} previously unowned document(s) to this patient.")
++
++        print(
++            "\nSet ADMIN_EMAILS in Railway to include this email so the "
++            "Garmin/Withings/Calendar integration endpoints keep working for it "
++            "(see app/config.py — those connectors are single-tenant)."
++        )
++        return 0
++    except Exception as e:
++        session.rollback()
++        print(f"ERROR: migration failed: {e}", file=sys.stderr)
++        return 1
++    finally:
++        session.close()
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+-- 
+2.43.0
+
+
+From ec59bf89b5916b09c94746766d6584ccd6a0bd39 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 14 Sep 2026 11:27:57 +0000
+Subject: [PATCH 2/3] Thread patient_id through analysis, ML, RAG and the chat
+ tool layer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Everything the dashboard, chat and predictions read from was either an
+unscoped query (session.query(Patient).first()) or a process-wide cache —
+both fine with one implicit patient, both a cross-tenant leak with more than
+one:
+
+- app/analysis/sources.py: every loader now takes patient_id and filters by
+  it.
+- app/analysis/health_metrics.py, trend_analyzer.py: analyzers now take
+  patient_id at construction. TrendAnalyzer's data cache became
+  Dict[patient_id, DataFrame] instead of one shared slot — without this, one
+  patient's cached frame could answer another patient's request for up to
+  the 300s TTL. Legacy extracted_data_*.json loading (predates the database,
+  carries no patient_id of its own) is dropped rather than attributed to
+  every patient.
+- app/rag/retriever.py: the BM25 index cache became the same
+  Dict[patient_id, ...] shape, for the same reason; index_document,
+  document_inventory and search all take patient_id and filter Document
+  queries by it.
+- app/ml/risk_predictor.py: RiskPredictor takes patient_id and builds its own
+  TrendAnalyzer(patient_id) instead of a bare TrendAnalyzer().
+- app/analysis/chat_context.py, app/chat_tools.py: build_health_context and
+  every tool handler take patient_id from the authenticated request, never
+  from model/tool input — a tool schema that let the model pass its own
+  patient_id would turn "look up my history" into a parameter an
+  attacker-controlled prompt could redirect at someone else's data.
+
+Tests updated for the new signatures and per-patient cache shape, plus a new
+cross-patient case in test_rag.py (two patients' documents must never answer
+each other's search).
+---
+ app/analysis/chat_context.py   | 45 ++++++++--------
+ app/analysis/health_metrics.py | 29 +++++-----
+ app/analysis/sources.py        | 24 +++++----
+ app/analysis/trend_analyzer.py | 96 +++++++++++++++++++---------------
+ app/chat_tools.py              | 17 ++++--
+ app/ml/risk_predictor.py       | 19 +++----
+ app/rag/retriever.py           | 76 +++++++++++++++++----------
+ 7 files changed, 178 insertions(+), 128 deletions(-)
+
+diff --git a/app/analysis/chat_context.py b/app/analysis/chat_context.py
+index be46d52..11c27ae 100644
+--- a/app/analysis/chat_context.py
++++ b/app/analysis/chat_context.py
+@@ -117,13 +117,13 @@ def _rows_from_frame(df: pd.DataFrame) -> List[Tuple[date, str, float, Optional[
+     return rows
+ 
+ 
+-def _measurements(recent_days: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
++def _measurements(patient_id: int, recent_days: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+     """Inventory of everything stored, plus daily aggregates for the window."""
+     inventory: Dict[str, Any] = {"total_rows": 0, "by_source": {}, "by_metric": {}}
+     recent: Dict[str, List[Dict[str, Any]]] = {}
+ 
+     try:
+-        rows = _rows_from_frame(TrendAnalyzer().data)
++        rows = _rows_from_frame(TrendAnalyzer(patient_id).data)
+     except Exception as e:  # a broken loader must not take the chat down
+         logger.warning("chat context: cannot load measurements: %s", e)
+         return inventory, recent
+@@ -195,6 +195,7 @@ def _measurements(recent_days: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+ 
+ def metric_history(
+     metric: str,
++    patient_id: int,
+     start_date: Optional[str] = None,
+     end_date: Optional[str] = None,
+     max_points: int = 120,
+@@ -211,7 +212,7 @@ def metric_history(
+     that silently hides half the period.
+     """
+     try:
+-        rows = _rows_from_frame(TrendAnalyzer().data)
++        rows = _rows_from_frame(TrendAnalyzer(patient_id).data)
+     except Exception as e:
+         logger.warning("metric history: cannot load measurements: %s", e)
+         return {"metric": metric, "points": [], "error": "dáta sa nepodarilo načítať"}
+@@ -309,9 +310,9 @@ def _latest_assessment(inventory: Dict[str, Any]) -> Dict[str, Any]:
+         return {"health_score": None, "alerts": []}
+ 
+ 
+-def _trends() -> Dict[str, Any]:
++def _trends(patient_id: int) -> Dict[str, Any]:
+     try:
+-        raw = TrendAnalyzer().analyze_trends() or {}
++        raw = TrendAnalyzer(patient_id).analyze_trends() or {}
+     except Exception as e:
+         logger.warning("chat context: cannot analyze trends: %s", e)
+         return {}
+@@ -327,10 +328,10 @@ def _trends() -> Dict[str, Any]:
+     return trends
+ 
+ 
+-def _patient() -> Dict[str, Any]:
++def _patient(patient_id: int) -> Dict[str, Any]:
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
++        patient = session.query(Patient).filter_by(id=patient_id).first()
+         if not patient:
+             return {}
+         info: Dict[str, Any] = {
+@@ -350,13 +351,10 @@ def _patient() -> Dict[str, Any]:
+         session.close()
+ 
+ 
+-def _family() -> List[Dict[str, Any]]:
++def _family(patient_id: int) -> List[Dict[str, Any]]:
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
+-        if not patient:
+-            return []
+-        members = session.query(FamilyMember).filter_by(patient_id=patient.id).all()
++        members = session.query(FamilyMember).filter_by(patient_id=patient_id).all()
+         family = []
+         for member in members:
+             entry = {
+@@ -378,13 +376,13 @@ def _family() -> List[Dict[str, Any]]:
+         session.close()
+ 
+ 
+-def _risks() -> Dict[str, Any]:
++def _risks(patient_id: int) -> Dict[str, Any]:
+     # Imported lazily: the predictor pulls in scikit-learn and loads its own
+     # view of the data, and a chat answer is still useful without it.
+     try:
+         from app.ml.risk_predictor import RiskPredictor
+ 
+-        risks = RiskPredictor().predict_risks() or {}
++        risks = RiskPredictor(patient_id).predict_risks() or {}
+         return {
+             "overall_risk_score": risks.get("overall_risk_score"),
+             "high_risk_conditions": risks.get("high_risk_conditions", []),
+@@ -396,7 +394,7 @@ def _risks() -> Dict[str, Any]:
+         return {}
+ 
+ 
+-def _documents(question: Optional[str]) -> Dict[str, Any]:
++def _documents(patient_id: int, question: Optional[str]) -> Dict[str, Any]:
+     """What is on file, plus the passages that match this particular question.
+ 
+     The structured metrics answer "koľko"; this answers "čo k tomu napísal
+@@ -404,7 +402,7 @@ def _documents(question: Optional[str]) -> Dict[str, Any]:
+     a context built for any other purpose still gets the inventory.
+     """
+     try:
+-        inventory = document_inventory()[:MAX_LISTED_DOCUMENTS]
++        inventory = document_inventory(patient_id)[:MAX_LISTED_DOCUMENTS]
+     except Exception as e:
+         logger.warning("chat context: cannot list documents: %s", e)
+         inventory = []
+@@ -412,7 +410,7 @@ def _documents(question: Optional[str]) -> Dict[str, Any]:
+     passages: List[Dict[str, Any]] = []
+     if question:
+         try:
+-            passages = search_documents(question, limit=MAX_PASSAGES)
++            passages = search_documents(question, patient_id, limit=MAX_PASSAGES)
+         except Exception as e:
+             logger.warning("chat context: document search failed: %s", e)
+ 
+@@ -420,6 +418,7 @@ def _documents(question: Optional[str]) -> Dict[str, Any]:
+ 
+ 
+ def build_health_context(
++    patient_id: int,
+     recent_days: int = DEFAULT_RECENT_DAYS,
+     question: Optional[str] = None,
+ ) -> Dict[str, Any]:
+@@ -428,19 +427,19 @@ def build_health_context(
+     `question` is what retrieval runs against; without it the context still
+     describes the numbers and lists the documents, just without passages.
+     """
+-    inventory, recent = _measurements(recent_days)
++    inventory, recent = _measurements(patient_id, recent_days)
+     context: Dict[str, Any] = {
+         "today": date.today().isoformat(),
+         "generated_at": datetime.now().isoformat(timespec="seconds"),
+         "recent_days": recent_days,
+-        "patient": _patient(),
++        "patient": _patient(patient_id),
+         "inventory": inventory,
+         "recent": recent,
+         "assessment": _latest_assessment(inventory),
+-        "trends": _trends(),
+-        "family": _family(),
+-        "risks": _risks(),
+-        "documents": _documents(question),
++        "trends": _trends(patient_id),
++        "family": _family(patient_id),
++        "risks": _risks(patient_id),
++        "documents": _documents(patient_id, question),
+     }
+     return context
+ 
+diff --git a/app/analysis/health_metrics.py b/app/analysis/health_metrics.py
+index b9df2ac..5cad079 100644
+--- a/app/analysis/health_metrics.py
++++ b/app/analysis/health_metrics.py
+@@ -2,9 +2,7 @@ import logging
+ import pandas as pd
+ from datetime import datetime, timedelta
+ from typing import Dict, Optional
+-import json
+ 
+-from app.config import settings
+ from app.analysis.sources import load_all_measurements
+ 
+ logger = logging.getLogger(__name__)
+@@ -22,23 +20,26 @@ def _to_float(value):
+ 
+ 
+ class HealthMetricsAnalyzer:
+-    def __init__(self):
++    def __init__(self, patient_id: int):
++        self.patient_id = patient_id
+         self.data = self._load_all_data()
+ 
+     def _load_all_data(self) -> pd.DataFrame:
+         all_metrics = []
+ 
+-        # Legacy JSON files
+-        for json_file in settings.PROCESSED_DATA_DIR.glob("extracted_data_*.json"):
+-            try:
+-                with open(json_file, 'r', encoding='utf-8') as f:
+-                    all_metrics.extend(json.load(f))
+-            except Exception as e:
+-                logger.warning('Error loading %s: %s', json_file, e)
+-
+-        # Every stored source, including Apple Health — which this analyzer
+-        # used to skip, so an import left the dashboard reading zero.
+-        all_metrics.extend(load_all_measurements())
++        # Legacy JSON files (extracted_data_*.json) predate the database and
++        # per-patient scoping entirely — a flat file on disk with no
++        # patient_id of its own. Now that patient_id is the isolation
++        # boundary between tenants, a file with no owner cannot be safely
++        # attributed to any one of them; showing it to every patient would be
++        # a cross-tenant leak of whatever it contains. Deliberately dropped
++        # here rather than guessed at — all of this app's actual data has
++        # lived in the database for a long time (see the DB-backed loaders
++        # below), so nothing observable should depend on this path still
++        # existing. If it turns out something does, that data needs a real
++        # patient_id and an import into the database, not a reason to bring
++        # this branch back.
++        all_metrics.extend(load_all_measurements(self.patient_id))
+ 
+         if not all_metrics:
+             return pd.DataFrame()
+diff --git a/app/analysis/sources.py b/app/analysis/sources.py
+index 81cd6b6..128fedb 100644
+--- a/app/analysis/sources.py
++++ b/app/analysis/sources.py
+@@ -63,14 +63,17 @@ def _parse_value(raw):
+     return _to_float(raw)
+ 
+ 
+-def load_health_records() -> List[Dict]:
+-    """Manually entered, OCR-extracted and Withings records."""
++def load_health_records(patient_id: int) -> List[Dict]:
++    """Manually entered, OCR-extracted and Withings records, for one patient."""
+     metrics = []
+     session = get_session()
+     try:
+         records = (
+             session.query(HealthRecord)
+-            .filter(HealthRecord.source.in_(HEALTH_RECORD_SOURCES))
++            .filter(
++                HealthRecord.patient_id == patient_id,
++                HealthRecord.source.in_(HEALTH_RECORD_SOURCES),
++            )
+             .all()
+         )
+         by_source: Dict[str, int] = {}
+@@ -97,14 +100,17 @@ def load_health_records() -> List[Dict]:
+     return metrics
+ 
+ 
+-def load_apple_health() -> List[Dict]:
+-    """Apple Health measurements that map onto interpreted metrics."""
++def load_apple_health(patient_id: int) -> List[Dict]:
++    """Apple Health measurements that map onto interpreted metrics, for one patient."""
+     metrics = []
+     session = get_session()
+     try:
+         records = (
+             session.query(AppleHealthData)
+-            .filter(AppleHealthData.record_type.in_(list(APPLE_TO_METRIC.keys())))
++            .filter(
++                AppleHealthData.patient_id == patient_id,
++                AppleHealthData.record_type.in_(list(APPLE_TO_METRIC.keys())),
++            )
+             .all()
+         )
+         for record in records:
+@@ -128,6 +134,6 @@ def load_apple_health() -> List[Dict]:
+     return metrics
+ 
+ 
+-def load_all_measurements() -> List[Dict]:
+-    """Every measurement the app can interpret, from all stored sources."""
+-    return load_health_records() + load_apple_health()
++def load_all_measurements(patient_id: int) -> List[Dict]:
++    """Every measurement the app can interpret, from all stored sources, for one patient."""
++    return load_health_records(patient_id) + load_apple_health(patient_id)
+diff --git a/app/analysis/trend_analyzer.py b/app/analysis/trend_analyzer.py
+index d750f29..d70ec8e 100644
+--- a/app/analysis/trend_analyzer.py
++++ b/app/analysis/trend_analyzer.py
+@@ -3,10 +3,7 @@ import pandas as pd
+ import numpy as np
+ from datetime import datetime, timedelta
+ from typing import Optional, Dict, List
+-from pathlib import Path
+-import json
+ 
+-from app.config import settings
+ from app.analysis.sources import load_all_measurements
+ 
+ logger = logging.getLogger(__name__)
+@@ -22,62 +19,79 @@ def _to_float(value):
+ 
+ 
+ class TrendAnalyzer:
+-    _data_cache = None
+-    _cache_timestamp = None
++    """Loads and caches one patient's measurements.
++
++    The cache used to be a single shared slot (`_data_cache`/`_cache_timestamp`
++    held one DataFrame for the whole process) because there was only ever one
++    patient to cache. It is now a dict keyed by patient_id — the risk of
++    getting this wrong is not just a stale cache, it is one patient's request
++    reading another patient's cached rows, so every access below goes through
++    the patient_id key rather than a bare class attribute.
++    """
++
+     _cache_ttl = 300  # seconds
++    _data_cache: Dict[int, pd.DataFrame] = {}
++    _cache_timestamp: Dict[int, datetime] = {}
+ 
+-    def __init__(self):
++    def __init__(self, patient_id: int):
++        self.patient_id = patient_id
+         self.refresh()
+ 
+     @classmethod
+-    def invalidate_cache(cls):
+-        """Drop the shared cache so the next request reloads from the database.
++    def invalidate_cache(cls, patient_id: Optional[int] = None):
++        """Drop the cache for one patient, or every patient if none is given.
+ 
+         Call this from every endpoint that writes health data, otherwise new
+-        records stay invisible in /trends for up to the cache TTL.
++        records stay invisible in /trends for up to the cache TTL. Passing the
++        specific patient_id is preferred — clearing everyone's cache because
++        one patient wrote a record is safe (nothing leaks) but forces every
++        other patient's next request to recompute for no reason. A caller that
++        does not have a patient_id handy (e.g. a maintenance script) can still
++        omit it to clear all of them.
+         """
+-        cls._data_cache = None
+-        cls._cache_timestamp = None
++        if patient_id is None:
++            cls._data_cache.clear()
++            cls._cache_timestamp.clear()
++        else:
++            cls._data_cache.pop(patient_id, None)
++            cls._cache_timestamp.pop(patient_id, None)
+ 
+     def refresh(self):
+         """Load data, reusing the shared cache while it is still fresh.
+ 
+-        This has to run per request, not once in __init__. The router keeps a
+-        single module-level analyzer, so doing the TTL check at construction
+-        time froze self.data for the life of the process — newly imported
+-        records never showed up in /trends until a restart.
++        This has to run per request, not once in __init__. The router used to
++        keep a single module-level analyzer, so doing the TTL check at
++        construction time froze self.data for the life of the process — newly
++        imported records never showed up in /trends until a restart. Analyzers
++        are now built per request (see app/api/analysis.py), so this mostly
++        guards against a caller that keeps one around across requests.
+         """
+-        if (
+-            TrendAnalyzer._data_cache is not None
+-            and TrendAnalyzer._cache_timestamp
+-            and (datetime.now() - TrendAnalyzer._cache_timestamp).total_seconds() < TrendAnalyzer._cache_ttl
+-        ):
+-            self.data = TrendAnalyzer._data_cache
+-            logger.debug('Using cached trend data (%d rows)', len(self.data))
++        cached_at = TrendAnalyzer._cache_timestamp.get(self.patient_id)
++        fresh = (
++            self.patient_id in TrendAnalyzer._data_cache
++            and cached_at is not None
++            and (datetime.now() - cached_at).total_seconds() < TrendAnalyzer._cache_ttl
++        )
++        if fresh:
++            self.data = TrendAnalyzer._data_cache[self.patient_id]
++            logger.debug('Using cached trend data for patient %s (%d rows)', self.patient_id, len(self.data))
+         else:
+             self.data = self._load_data()
+-            TrendAnalyzer._data_cache = self.data
+-            TrendAnalyzer._cache_timestamp = datetime.now()
+-            logger.info('Loaded fresh trend data (%d rows), cached for %ds', len(self.data), TrendAnalyzer._cache_ttl)
++            TrendAnalyzer._data_cache[self.patient_id] = self.data
++            TrendAnalyzer._cache_timestamp[self.patient_id] = datetime.now()
++            logger.info(
++                'Loaded fresh trend data for patient %s (%d rows), cached for %ds',
++                self.patient_id, len(self.data), TrendAnalyzer._cache_ttl,
++            )
+ 
+     def _load_data(self) -> pd.DataFrame:
+-        all_metrics = []
+-
+-        # 1. Legacy JSON files (older exports)
+-        for json_file in settings.PROCESSED_DATA_DIR.glob("extracted_data_*.json"):
+-            try:
+-                with open(json_file, 'r', encoding='utf-8') as f:
+-                    metrics = json.load(f)
+-                    for metric in metrics:
+-                        if metric.get('metric') == 'pulse':
+-                            metric['metric'] = 'heart_rate'
+-                    all_metrics.extend(metrics)
+-            except Exception as e:
+-                logger.warning('Error loading %s: %s', json_file, e)
+-
+-        # Every stored source, loaded in one place so this and the dashboard
++        # Legacy JSON exports (extracted_data_*.json) predate per-patient
++        # scoping and carry no patient_id of their own — see the identical
++        # note in app.analysis.health_metrics for why that path was dropped
++        # rather than attributed to every patient. Every stored source is now
++        # loaded through the one DB-backed loader, so this and the dashboard
+         # analyzer can never drift apart on which tables they read.
+-        all_metrics.extend(load_all_measurements())
++        all_metrics = load_all_measurements(self.patient_id)
+ 
+         if not all_metrics:
+             return pd.DataFrame()
+diff --git a/app/chat_tools.py b/app/chat_tools.py
+index 9f97217..8d8263e 100644
+--- a/app/chat_tools.py
++++ b/app/chat_tools.py
+@@ -77,20 +77,21 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
+ ]
+ 
+ 
+-def _get_metric_history(payload: Dict[str, Any]) -> Dict[str, Any]:
++def _get_metric_history(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
+     return metric_history(
+         metric=payload.get("metric", ""),
++        patient_id=patient_id,
+         start_date=payload.get("start_date"),
+         end_date=payload.get("end_date"),
+     )
+ 
+ 
+-def _search_documents(payload: Dict[str, Any]) -> Dict[str, Any]:
++def _search_documents(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
+     try:
+         limit = int(payload.get("limit") or 5)
+     except (TypeError, ValueError):
+         limit = 5
+-    results = search_documents(payload.get("query", ""), limit=max(1, min(limit, 8)))
++    results = search_documents(payload.get("query", ""), patient_id, limit=max(1, min(limit, 8)))
+     for result in results:
+         text = result.get("text") or ""
+         if len(text) > MAX_DOCUMENT_CHARS:
+@@ -104,9 +105,15 @@ _HANDLERS = {
+ }
+ 
+ 
+-def run_tool(name: str, payload: Dict[str, Any]) -> str:
++def run_tool(name: str, payload: Dict[str, Any], patient_id: int) -> str:
+     """Execute one tool call and return its result as JSON text.
+ 
++    patient_id is never taken from the model's tool input — it comes from the
++    authenticated request that started this chat turn (see app/api/chat.py),
++    the same as every other data access in the app. A tool schema that let the
++    model pass its own patient_id would turn "look up my metric history" into
++    a parameter an attacker-controlled prompt could set to someone else's.
++
+     A failing tool comes back as an error string rather than an exception: the
+     model can say what it could not look up, which is a better answer than a
+     500 for the whole question.
+@@ -116,7 +123,7 @@ def run_tool(name: str, payload: Dict[str, Any]) -> str:
+         return json.dumps({"error": f"Neznámy nástroj: {name}"}, ensure_ascii=False)
+ 
+     try:
+-        result = handler(payload or {})
++        result = handler(payload or {}, patient_id)
+     except Exception as e:
+         logger.warning("chat tool %s failed: %s", name, e)
+         result = {"error": f"Nástroj zlyhal: {e}"}
+diff --git a/app/ml/risk_predictor.py b/app/ml/risk_predictor.py
+index f6d8cfd..e35c567 100644
+--- a/app/ml/risk_predictor.py
++++ b/app/ml/risk_predictor.py
+@@ -10,17 +10,18 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ class RiskPredictor:
+-    """ML model pre predikciu zdravotných rizík"""
++    """ML model pre predikciu zdravotných rizík, scoped to one patient."""
+ 
+-    def __init__(self):
++    def __init__(self, patient_id: int):
++        self.patient_id = patient_id
+         # The trend analyzer is the single place that knows how to load every
+-        # stored source — legacy JSON exports, manual and OCR records, Apple
+-        # Health — and it keeps a shared cache that every write path already
+-        # invalidates. Reading through it is why the risks screen can no
+-        # longer disagree with /analysis/trends about what data exists: this
+-        # class used to read only extracted_data_*.json off local disk, which
+-        # is empty on the deployed instance, so every risk came back zero.
+-        self._analyzer = TrendAnalyzer()
++        # stored source — manual and OCR records, Apple Health — and it keeps
++        # a per-patient cache that every write path already invalidates.
++        # Reading through it is why the risks screen can no longer disagree
++        # with /analysis/trends about what data exists: this class used to
++        # read only extracted_data_*.json off local disk, which is empty on
++        # the deployed instance, so every risk came back zero.
++        self._analyzer = TrendAnalyzer(patient_id)
+         self.refresh()
+ 
+     def refresh(self):
+diff --git a/app/rag/retriever.py b/app/rag/retriever.py
+index 2fd4b11..6b41fab 100644
+--- a/app/rag/retriever.py
++++ b/app/rag/retriever.py
+@@ -195,27 +195,36 @@ class _Index:
+         return scores
+ 
+ 
+-_index: Optional[_Index] = None
+-_index_built_at: Optional[datetime] = None
++_index_cache: Dict[int, _Index] = {}
++_index_built_at: Dict[int, datetime] = {}
+ 
+ 
+-def invalidate_cache() -> None:
++def invalidate_cache(patient_id: Optional[int] = None) -> None:
+     """Drop the in-memory index so the next search reloads from the database.
+ 
+     Called after an upload, for the same reason TrendAnalyzer.invalidate_cache
+     is: without it a freshly uploaded report stays invisible for the TTL.
++    Keyed per patient for the same reason TrendAnalyzer's cache is — one flat
++    process-wide index would return one patient's medical report passages to
++    another patient's chat. Omit patient_id to clear every patient's index at
++    once (used by tests and maintenance scripts).
+     """
+-    global _index, _index_built_at
+-    _index = None
+-    _index_built_at = None
++    global _index_cache, _index_built_at
++    if patient_id is None:
++        _index_cache = {}
++        _index_built_at = {}
++    else:
++        _index_cache.pop(patient_id, None)
++        _index_built_at.pop(patient_id, None)
+ 
+ 
+-def _load_chunks() -> List[_IndexedChunk]:
++def _load_chunks(patient_id: int) -> List[_IndexedChunk]:
+     session = get_session()
+     try:
+         rows = (
+             session.query(DocumentChunk, Document)
+-            .outerjoin(Document, DocumentChunk.document_id == Document.id)
++            .join(Document, DocumentChunk.document_id == Document.id)
++            .filter(Document.patient_id == patient_id)
+             .all()
+         )
+         chunks = []
+@@ -235,7 +244,7 @@ def _load_chunks() -> List[_IndexedChunk]:
+             )
+             indexed.tokens = _tokenize(indexed.text)
+             chunks.append(indexed)
+-        logger.info("RAG: indexed %d chunks from documents", len(chunks))
++        logger.info("RAG: indexed %d chunks from documents for patient %s", len(chunks), patient_id)
+         return chunks
+     except Exception as e:
+         logger.warning("RAG: cannot load document chunks: %s", e)
+@@ -244,26 +253,26 @@ def _load_chunks() -> List[_IndexedChunk]:
+         session.close()
+ 
+ 
+-def _get_index() -> _Index:
+-    global _index, _index_built_at
++def _get_index(patient_id: int) -> _Index:
++    built_at = _index_built_at.get(patient_id)
+     fresh = (
+-        _index is not None
+-        and _index_built_at is not None
+-        and (datetime.now() - _index_built_at).total_seconds() < _CACHE_TTL_SECONDS
++        patient_id in _index_cache
++        and built_at is not None
++        and (datetime.now() - built_at).total_seconds() < _CACHE_TTL_SECONDS
+     )
+     if not fresh:
+-        _index = _Index(_load_chunks())
+-        _index_built_at = datetime.now()
+-    return _index
++        _index_cache[patient_id] = _Index(_load_chunks(patient_id))
++        _index_built_at[patient_id] = datetime.now()
++    return _index_cache[patient_id]
+ 
+ 
+-def search(query: str, limit: int = DEFAULT_TOP_K) -> List[Dict]:
+-    """Passages most relevant to the question, best first."""
++def search(query: str, patient_id: int, limit: int = DEFAULT_TOP_K) -> List[Dict]:
++    """Passages most relevant to the question, best first — one patient's documents only."""
+     tokens = _tokenize(query or "")
+     if not tokens:
+         return []
+ 
+-    index = _get_index()
++    index = _get_index(patient_id)
+     if not index.total:
+         return []
+ 
+@@ -288,8 +297,8 @@ def search(query: str, limit: int = DEFAULT_TOP_K) -> List[Dict]:
+     return results
+ 
+ 
+-def document_inventory() -> List[Dict]:
+-    """Every stored document, so the assistant knows what exists at all.
++def document_inventory(patient_id: int) -> List[Dict]:
++    """Every stored document for one patient, so the assistant knows what exists at all.
+ 
+     Retrieval can miss; a list of what is on file cannot. It is small enough to
+     carry in every prompt and stops the model from claiming a report is not
+@@ -297,7 +306,12 @@ def document_inventory() -> List[Dict]:
+     """
+     session = get_session()
+     try:
+-        documents = session.query(Document).order_by(Document.uploaded_at.desc()).all()
++        documents = (
++            session.query(Document)
++            .filter(Document.patient_id == patient_id)
++            .order_by(Document.uploaded_at.desc())
++            .all()
++        )
+         inventory = []
+         for document in documents:
+             inventory.append({
+@@ -318,6 +332,7 @@ def document_inventory() -> List[Dict]:
+ def index_document(
+     filename: str,
+     text: str,
++    patient_id: int,
+     file_path: Optional[str] = None,
+     file_type: Optional[str] = None,
+     file_size_bytes: Optional[int] = None,
+@@ -328,16 +343,23 @@ def index_document(
+ 
+     Re-uploading the same filename replaces the previous text and chunks rather
+     than stacking a second copy, so retrieval cannot return the same passage
+-    twice with different wording.
++    twice with different wording. The lookup for "is this a re-upload" is
++    scoped to the same patient — two different patients uploading a file with
++    the same name (e.g. both named it "vysledky.pdf") must not overwrite each
++    other's document.
+     """
+     if not text or not text.strip():
+         return None
+ 
+     session = get_session()
+     try:
+-        document = session.query(Document).filter_by(filename=filename).first()
++        document = (
++            session.query(Document)
++            .filter_by(filename=filename, patient_id=patient_id)
++            .first()
++        )
+         if document is None:
+-            document = Document(filename=filename)
++            document = Document(filename=filename, patient_id=patient_id)
+             session.add(document)
+ 
+         document.file_path = file_path or document.file_path or ""
+@@ -365,7 +387,7 @@ def index_document(
+         session.commit()
+         document_id = document.id
+         logger.info("RAG: stored document %s (id=%s)", filename, document_id)
+-        invalidate_cache()
++        invalidate_cache(patient_id)
+         return document_id
+ 
+     except Exception as e:
+-- 
+2.43.0
+
+
+From ed900f45cca55750f2c1ffb9993c66de1890e270 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 14 Sep 2026 11:28:15 +0000
+Subject: [PATCH 3/3] Scope every API router to the authenticated patient; fix
+ IDOR gaps found along the way
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every endpoint that reads or writes patient data now depends on
+get_current_patient_id instead of assuming a single implicit patient:
+
+- analysis.py, chat.py, nutrition.py: straightforward scoping, analyzers now
+  built per-request (see previous commit).
+- manual_entry.py: same, plus fixes update_family_member, delete_family_member
+  and delete_health_record, which looked up by bare id with no ownership
+  check — any authenticated user could edit or delete another patient's row
+  by guessing/incrementing its id. Now filtered by (id, patient_id).
+  delete_nutrition_entry in nutrition.py had the same gap, fixed the same way.
+- upload.py: OCR-extracted metrics now save with the uploading patient's id —
+  app/ocr/data_extractor.py previously hardcoded patient_id=1 for every
+  extracted record, regardless of who uploaded the document. index_document's
+  call site updated for its new patient_id parameter. /documents (raw
+  filenames on the shared container disk) restricted to admins.
+- apple_health.py: patient_id=1 was hardcoded here too, and the Apple Health
+  dedup check (and every read/stats/delete endpoint) queried across all
+  patients with no filter at all — DELETE /data was an unconditional
+  `DELETE FROM apple_health_data`, deletable by any authenticated user for
+  every patient. All fixed; background-import jobs now record and check the
+  owning patient_id so /import-status can't be polled by anyone else.
+- predictions.py: dropped the module-level RiskPredictor() singleton (same
+  cross-tenant risk as TrendAnalyzer/RAG in the previous commit); ~
+  RecommendationEngine/MedicalAdvisor stay shared since they hold no patient
+  data of their own.
+- integrations.py: Garmin, Withings and Google Calendar each hold one
+  process-wide OAuth session, not one per user — turning that into real
+  multi-tenancy (a token per patient) is a separate, larger piece of work.
+  For this pass every endpoint that reads or syncs through them requires
+  require_admin (ADMIN_EMAILS), instead of either ripping the integrations
+  out or leaving them reachable by any tester. withings_sync.py's
+  sync_withings_to_db now takes the calling admin's own patient_id rather
+  than "whichever Patient row sorts first", which mattered once ADMIN_EMAILS
+  can list more than one address.
+
+New tests/test_multi_tenant_isolation.py is the one this branch exists for:
+two independently registered accounts, checked both through normal list
+endpoints (B must never see A's rows) and through the id-based endpoints
+(B must not read/edit/delete A's rows by id — the IDOR class fixed above).
+tests/test_auth.py covers register/login/logout/me and the rate limiter.
+
+Known limitation, disclosed rather than hidden: this sandbox has no PyPI
+access, so fastapi/sqlalchemy/anthropic could not be installed and none of
+this — old or new — could actually be run here. Every changed file was
+syntax-checked with `python3 -m py_compile`; the real test suite still needs
+to run in CI or locally before this merges to master.
+---
+ app/api/analysis.py                  |  54 +++++---
+ app/api/apple_health.py              | 135 +++++++++++-------
+ app/api/chat.py                      |  37 ++---
+ app/api/integrations.py              |  51 ++++---
+ app/api/manual_entry.py              | 161 ++++++++++-----------
+ app/api/nutrition.py                 |  51 ++++---
+ app/api/predictions.py               |  17 ++-
+ app/api/upload.py                    |  42 ++++--
+ app/integrations/withings_sync.py    |  23 +--
+ app/ocr/data_extractor.py            |  23 ++-
+ tests/test_auth.py                   | 160 +++++++++++++++++++++
+ tests/test_chat_context.py           |  44 +++---
+ tests/test_chat_history.py           |  27 ++--
+ tests/test_empty_data_shapes.py      |   2 +
+ tests/test_multi_tenant_isolation.py | 200 +++++++++++++++++++++++++++
+ tests/test_rag.py                    |  41 ++++--
+ tests/test_sources.py                |   7 +-
+ tests/test_tools.py                  |  44 +++---
+ tests/test_trend_cache.py            |  58 ++++++--
+ 19 files changed, 871 insertions(+), 306 deletions(-)
+ create mode 100644 tests/test_auth.py
+ create mode 100644 tests/test_multi_tenant_isolation.py
+
+diff --git a/app/api/analysis.py b/app/api/analysis.py
+index 5e69a21..8b05ae2 100644
+--- a/app/api/analysis.py
++++ b/app/api/analysis.py
+@@ -1,33 +1,44 @@
+ import logging
+-from fastapi import APIRouter, HTTPException
++from fastapi import APIRouter, Depends, HTTPException
+ from typing import Optional
+ 
+ from app.analysis.trend_analyzer import TrendAnalyzer
+ from app.analysis.health_metrics import HealthMetricsAnalyzer
++from app.auth.dependencies import get_current_patient_id
+ 
+ logger = logging.getLogger(__name__)
+ 
+ router = APIRouter()
+-trend_analyzer = TrendAnalyzer()
+-metrics_analyzer = HealthMetricsAnalyzer()
++
++# Analyzers used to be built once at import time and shared by every request
++# (`trend_analyzer = TrendAnalyzer()` at module scope) — that was already a
++# bug before multi-user (data imported after startup never showed up without
++# a restart, see the comments inside TrendAnalyzer.refresh), and with more
++# than one patient it would have been a straight cross-tenant leak: every
++# request would have shared one process-wide instance regardless of who was
++# asking. Each endpoint below builds its own analyzer, scoped to the
++# authenticated caller's patient_id.
++
+ 
+ @router.get("/trends")
+ async def get_health_trends(
+     metric: Optional[str] = None,
+     start_date: Optional[str] = None,
+-    end_date: Optional[str] = None
++    end_date: Optional[str] = None,
++    patient_id: int = Depends(get_current_patient_id),
+ ):
+     """
+     Analyzuje trendy v zdravotných ukazovateľoch
+-    
++
+     Parameters:
+     - metric: blood_pressure, glucose, cholesterol, bmi (None = všetky)
+     - start_date: YYYY-MM-DD
+     - end_date: YYYY-MM-DD
+     """
+     try:
+-        logger.info('/trends called: metric=%s start=%s end=%s', metric, start_date, end_date)
++        logger.info('/trends called: metric=%s start=%s end=%s patient=%s', metric, start_date, end_date, patient_id)
+ 
++        trend_analyzer = TrendAnalyzer(patient_id)
+         trends = trend_analyzer.analyze_trends(
+             metric=metric,
+             start_date=start_date,
+@@ -55,40 +66,40 @@ async def get_health_trends(
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/metrics/latest")
+-async def get_latest_metrics():
++async def get_latest_metrics(patient_id: int = Depends(get_current_patient_id)):
+     """Získa najnovšie zdravotné ukazovatele"""
+     try:
+-        latest = metrics_analyzer.get_latest_metrics()
++        latest = HealthMetricsAnalyzer(patient_id).get_latest_metrics()
+         return latest
+-    
++
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/metrics/history")
+-async def get_metrics_history(days: int = 365):
++async def get_metrics_history(days: int = 365, patient_id: int = Depends(get_current_patient_id)):
+     """Získa históriu meraní za posledných N dní"""
+     try:
+-        history = metrics_analyzer.get_metrics_history(days=days)
++        history = HealthMetricsAnalyzer(patient_id).get_metrics_history(days=days)
+         return {
+             "period_days": days,
+             "metrics": history
+         }
+-    
++
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/summary")
+-async def get_health_summary():
++async def get_health_summary(patient_id: int = Depends(get_current_patient_id)):
+     """Komplexný zdravotný prehľad"""
+     try:
+-        summary = metrics_analyzer.get_comprehensive_summary()
++        summary = HealthMetricsAnalyzer(patient_id).get_comprehensive_summary()
+         return summary
+-    
++
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ @router.get("/latest")
+-async def get_latest_analysis():
++async def get_latest_analysis(patient_id: int = Depends(get_current_patient_id)):
+     """Snapshot of the current state, in the shape the chat page loads on open.
+ 
+     The frontend has always called this endpoint; it never existed, so the page
+@@ -102,6 +113,7 @@ async def get_latest_analysis():
+     object with trends, warnings and the health score.
+     """
+     try:
++        metrics_analyzer = HealthMetricsAnalyzer(patient_id)
+         summary = metrics_analyzer.get_comprehensive_summary()
+         latest = summary.get("latest_metrics", {}) or {}
+ 
+@@ -117,6 +129,7 @@ async def get_latest_analysis():
+ 
+         trends = []
+         try:
++            trend_analyzer = TrendAnalyzer(patient_id)
+             for metric_name, trend_data in (trend_analyzer.analyze_trends() or {}).items():
+                 if isinstance(trend_data, dict) and "error" not in trend_data:
+                     trends.append({
+@@ -144,14 +157,11 @@ async def get_latest_analysis():
+ 
+ 
+ @router.post("/refresh-cache")
+-async def refresh_trend_cache():
++async def refresh_trend_cache(patient_id: int = Depends(get_current_patient_id)):
+     """Vymaže cache a znova načíta všetky dáta"""
+     try:
+-        TrendAnalyzer.invalidate_cache()
+-
+-        # Refresh the analyzer the router actually serves from, rather than
+-        # building a throwaway one and leaving the old data in place.
+-        trend_analyzer.refresh()
++        TrendAnalyzer.invalidate_cache(patient_id)
++        trend_analyzer = TrendAnalyzer(patient_id)
+ 
+         return {
+             "success": True,
+diff --git a/app/api/apple_health.py b/app/api/apple_health.py
+index 0a2b0c0..6091c3d 100644
+--- a/app/api/apple_health.py
++++ b/app/api/apple_health.py
+@@ -2,7 +2,7 @@
+ Apple Health API - Import dát z iPhone Health appky
+ Podporuje import z export.xml, export.xml.gz a export.zip
+ """
+-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
++from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Request
+ from fastapi.responses import JSONResponse
+ import asyncio
+ import tempfile
+@@ -29,6 +29,7 @@ _UPLOAD_CHUNK_SIZE = 1024 * 1024
+ _import_jobs: Dict[str, Dict[str, Any]] = {}
+ 
+ from ..database.models import AppleHealthData, get_session
++from ..auth.dependencies import get_current_patient_id
+ 
+ router = APIRouter(prefix="/api/apple-health", tags=["apple_health"])
+ 
+@@ -244,13 +245,17 @@ def parse_apple_health_xml(xml_source, on_record=None) -> Dict[str, Any]:
+         raise Exception(f"Chyba pri parsovaní Apple Health XML: {str(e)}")
+ 
+ 
+-def _stream_import(xml_path, batch_id: str, progress=None):
++def _stream_import(xml_path, batch_id: str, patient_id: int, progress=None):
+     """Parse and insert in one streaming pass.
+ 
+     Records are handed over one at a time and flushed in batches, so a
+     multi-hundred-MB export never materialises as a list. Duplicates are
+     checked against a set built from one query instead of one SELECT per
+     record — the latter turned a large import into millions of table scans.
++    The dedup set and every inserted row are scoped to patient_id: without
++    that, one patient's export would both write into another patient's data
++    and be silently short-circuited by rows that happen to match someone
++    else's identical readings.
+     """
+     session = get_session()
+     counts = {"saved": 0, "skipped": 0, "duplicates": 0}
+@@ -264,7 +269,7 @@ def _stream_import(xml_path, batch_id: str, progress=None):
+             AppleHealthData.start_date,
+             AppleHealthData.value,
+             AppleHealthData.unit,
+-        ).all()
++        ).filter(AppleHealthData.patient_id == patient_id).all()
+     }
+     print(f"[APPLE HEALTH] Loaded {len(seen):,} existing keys for duplicate check")
+ 
+@@ -287,7 +292,7 @@ def _stream_import(xml_path, batch_id: str, progress=None):
+ 
+         device = record["device"] or {}
+         batch.append(AppleHealthData(
+-            patient_id=1,
++            patient_id=patient_id,
+             record_type=record["type"],
+             value=record["value"],
+             unit=record["unit"],
+@@ -503,7 +508,10 @@ async def _spool_upload(file: UploadFile) -> tuple[Path, int]:
+ 
+ 
+ @router.post("/import")
+-async def import_apple_health_data(file: UploadFile = File(...)):
++async def import_apple_health_data(
++    file: UploadFile = File(...),
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """
+     Import Apple Health XML súboru (akýkoľvek .xml súbor)
+ 
+@@ -520,7 +528,7 @@ async def import_apple_health_data(file: UploadFile = File(...)):
+         batch_id = str(uuid.uuid4())[:8]
+ 
+         # Parsing and importing are CPU/DB bound — keep them off the event loop.
+-        stats, counts = await asyncio.to_thread(_stream_import, tmp_path, batch_id)
++        stats, counts = await asyncio.to_thread(_stream_import, tmp_path, batch_id, patient_id)
+ 
+         saved_count = counts["saved"]
+         skipped_count = counts["skipped"]
+@@ -543,7 +551,7 @@ async def import_apple_health_data(file: UploadFile = File(...)):
+ 
+         # Newly imported records must be visible in /trends straight away.
+         from app.analysis.trend_analyzer import TrendAnalyzer
+-        TrendAnalyzer.invalidate_cache()
++        TrendAnalyzer.invalidate_cache(patient_id)
+ 
+         return JSONResponse(content={
+             "success": True,
+@@ -574,7 +582,7 @@ async def import_apple_health_data(file: UploadFile = File(...)):
+             tmp_path.unlink(missing_ok=True)
+ 
+ 
+-def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename: str):
++def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename: str, patient_id: int):
+     """Run an import outside the request cycle, recording progress as it goes."""
+     job = _import_jobs[job_id]
+     job.update(status="running", started_at=datetime.now().isoformat())
+@@ -583,7 +591,7 @@ def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename:
+         job["counts"] = counts
+ 
+     try:
+-        stats, counts = _stream_import(tmp_path, batch_id, progress=progress)
++        stats, counts = _stream_import(tmp_path, batch_id, patient_id, progress=progress)
+         job["counts"] = counts
+ 
+         if stats["total_records"] == 0:
+@@ -597,7 +605,7 @@ def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename:
+             return
+ 
+         from app.analysis.trend_analyzer import TrendAnalyzer
+-        TrendAnalyzer.invalidate_cache()
++        TrendAnalyzer.invalidate_cache(patient_id)
+ 
+         job.update(
+             status="completed",
+@@ -625,7 +633,10 @@ def _run_background_import(job_id: str, tmp_path: Path, batch_id: str, filename:
+ 
+ 
+ @router.post("/import-async")
+-async def import_apple_health_async(file: UploadFile = File(...)):
++async def import_apple_health_async(
++    file: UploadFile = File(...),
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """Import a large export without holding the HTTP connection open.
+ 
+     Railway closes a request after 5 minutes with no data transferred, so a
+@@ -643,10 +654,13 @@ async def import_apple_health_async(file: UploadFile = File(...)):
+         "size_mb": round(bytes_written / (1024 * 1024), 1),
+         "counts": {"saved": 0, "skipped": 0, "duplicates": 0},
+         "created_at": datetime.now().isoformat(),
++        # Who this job belongs to — checked by /import-status so one patient
++        # cannot poll (or infer the existence of) another patient's import.
++        "patient_id": patient_id,
+     }
+ 
+     asyncio.create_task(
+-        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, file.filename)
++        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, file.filename, patient_id)
+     )
+ 
+     print(f"[APPLE HEALTH] Queued job {job_id} for {file.filename} "
+@@ -662,7 +676,11 @@ async def import_apple_health_async(file: UploadFile = File(...)):
+ 
+ 
+ @router.post("/import-raw")
+-async def import_apple_health_raw(request: Request, filename: str = "export.xml"):
++async def import_apple_health_raw(
++    request: Request,
++    filename: str = "export.xml",
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """Import an export sent as the raw request body, with no multipart wrapper.
+ 
+     Multipart uploads need a form field named exactly `file`; clients that build
+@@ -691,10 +709,11 @@ async def import_apple_health_raw(request: Request, filename: str = "export.xml"
+         "size_mb": round(bytes_written / (1024 * 1024), 1),
+         "counts": {"saved": 0, "skipped": 0, "duplicates": 0},
+         "created_at": datetime.now().isoformat(),
++        "patient_id": patient_id,
+     }
+ 
+     asyncio.create_task(
+-        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, filename)
++        asyncio.to_thread(_run_background_import, job_id, tmp_path, batch_id, filename, patient_id)
+     )
+ 
+     print(f"[APPLE HEALTH] Queued raw job {job_id} "
+@@ -710,16 +729,19 @@ async def import_apple_health_raw(request: Request, filename: str = "export.xml"
+ 
+ 
+ @router.get("/import-status/{job_id}")
+-async def import_status(job_id: str):
++async def import_status(job_id: str, patient_id: int = Depends(get_current_patient_id)):
+     """Progress of a background import."""
+     job = _import_jobs.get(job_id)
+-    if job is None:
++    # Owner check folded into the same 404 as "job does not exist" — a job
++    # that belongs to someone else must not be distinguishable from a job
++    # that was never created.
++    if job is None or job.get("patient_id") != patient_id:
+         raise HTTPException(status_code=404, detail="Neznáme job_id")
+     return job
+ 
+ 
+ @router.get("/imports")
+-async def list_imports():
++async def list_imports(patient_id: int = Depends(get_current_patient_id)):
+     """History of Apple Health imports, newest first.
+ 
+     Reconstructed from the stored rows rather than the in-memory job list, so
+@@ -737,6 +759,7 @@ async def list_imports():
+                 func.min(AppleHealthData.start_date).label('period_start'),
+                 func.max(AppleHealthData.start_date).label('period_end'),
+             )
++            .filter(AppleHealthData.patient_id == patient_id)
+             .group_by(AppleHealthData.import_batch_id)
+             .order_by(func.min(AppleHealthData.imported_at).desc())
+             .all()
+@@ -765,41 +788,45 @@ async def list_imports():
+ 
+ 
+ @router.get("/stats")
+-async def get_apple_health_stats():
++async def get_apple_health_stats(patient_id: int = Depends(get_current_patient_id)):
+     """Získať štatistiky importovaných Apple Health dát"""
+     try:
+         session = get_session()
+-        
++
+         # Total records
+-        total_records = session.query(AppleHealthData).count()
+-        
++        total_records = session.query(AppleHealthData).filter(
++            AppleHealthData.patient_id == patient_id
++        ).count()
++
+         # By type
+         from sqlalchemy import func
+         by_type = session.query(
+             AppleHealthData.record_type,
+             func.count(AppleHealthData.id).label('count')
+-        ).group_by(AppleHealthData.record_type).all()
+-        
++        ).filter(AppleHealthData.patient_id == patient_id).group_by(AppleHealthData.record_type).all()
++
+         by_type_dict = {}
+         for record_type, count in by_type:
+             friendly_name = APPLE_HEALTH_TYPE_MAPPING.get(record_type, record_type)
+             by_type_dict[friendly_name] = count
+-        
++
+         # Date range
+         date_range = session.query(
+             func.min(AppleHealthData.start_date).label('start'),
+             func.max(AppleHealthData.start_date).label('end')
+-        ).first()
+-        
++        ).filter(AppleHealthData.patient_id == patient_id).first()
++
+         # Unique devices
+-        unique_devices = session.query(AppleHealthData.device_name).distinct().all()
++        unique_devices = session.query(AppleHealthData.device_name).filter(
++            AppleHealthData.patient_id == patient_id
++        ).distinct().all()
+         devices = [d[0] for d in unique_devices if d[0]]
+-        
++
+         # Latest import
+         latest_import = session.query(
+             func.max(AppleHealthData.imported_at)
+-        ).scalar()
+-        
++        ).filter(AppleHealthData.patient_id == patient_id).scalar()
++
+         session.close()
+         
+         return JSONResponse(content={
+@@ -822,11 +849,12 @@ async def get_apple_health_data_by_type(
+     record_type: str,
+     start_date: str = None,
+     end_date: str = None,
+-    limit: int = 100
++    limit: int = 100,
++    patient_id: int = Depends(get_current_patient_id),
+ ):
+     """
+     Získať Apple Health dáta podľa typu
+-    
++
+     Príklady record_type:
+     - HKQuantityTypeIdentifierStepCount (kroky)
+     - HKQuantityTypeIdentifierHeartRate (srdcový tep)
+@@ -834,9 +862,10 @@ async def get_apple_health_data_by_type(
+     """
+     try:
+         session = get_session()
+-        
++
+         query = session.query(AppleHealthData).filter(
+-            AppleHealthData.record_type == record_type
++            AppleHealthData.record_type == record_type,
++            AppleHealthData.patient_id == patient_id,
+         )
+         
+         # Date filter
+@@ -881,13 +910,19 @@ async def get_apple_health_data_by_type(
+ 
+ 
+ @router.delete("/data")
+-async def delete_all_apple_health_data():
+-    """Vymazať všetky Apple Health dáta z databázy"""
++async def delete_all_apple_health_data(patient_id: int = Depends(get_current_patient_id)):
++    """Vymazať všetky Apple Health dáta prihláseného pacienta z databázy.
++
++    Scoped by patient_id — this used to be an unconditional `DELETE FROM
++    apple_health_data` with no WHERE clause at all, which under multi-tenancy
++    would let any authenticated user wipe every other patient's imported data.
++    """
+     try:
+         session = get_session()
+-        
+-        count = session.query(AppleHealthData).count()
+-        session.query(AppleHealthData).delete()
++
++        query = session.query(AppleHealthData).filter(AppleHealthData.patient_id == patient_id)
++        count = query.count()
++        query.delete()
+         session.commit()
+         session.close()
+         
+@@ -901,13 +936,15 @@ async def delete_all_apple_health_data():
+ 
+ 
+ @router.get("/types")
+-async def get_available_types():
++async def get_available_types(patient_id: int = Depends(get_current_patient_id)):
+     """Získať zoznam všetkých dostupných typov záznamov v databáze"""
+     try:
+         session = get_session()
+-        
+-        types = session.query(AppleHealthData.record_type).distinct().all()
+-        
++
++        types = session.query(AppleHealthData.record_type).filter(
++            AppleHealthData.patient_id == patient_id
++        ).distinct().all()
++
+         session.close()
+         
+         result = []
+@@ -927,23 +964,24 @@ async def get_available_types():
+ 
+ 
+ @router.get("/sport-stats")
+-async def get_sport_statistics():
++async def get_sport_statistics(patient_id: int = Depends(get_current_patient_id)):
+     """Získať agregované športové štatistiky pre dashboard"""
+     try:
+         from sqlalchemy import func
+         from datetime import timedelta
+         import pandas as pd
+-        
++
+         session = get_session()
+         now = datetime.now()
+-        
++
+         # Helper funkcia pre agregáciu
+         def aggregate_daily(record_type: str, days: int = 7):
+             """Agreguje denné hodnoty pre daný typ metriky"""
+             start_date = now - timedelta(days=days)
+             records = session.query(AppleHealthData).filter(
+                 AppleHealthData.record_type == record_type,
+-                AppleHealthData.start_date >= start_date
++                AppleHealthData.start_date >= start_date,
++                AppleHealthData.patient_id == patient_id,
+             ).all()
+             
+             if not records:
+@@ -978,7 +1016,8 @@ async def get_sport_statistics():
+         # SPÁNOK (v hodinách)
+         sleep_records = session.query(AppleHealthData).filter(
+             AppleHealthData.record_type == 'HKCategoryTypeIdentifierSleepAnalysis',
+-            AppleHealthData.start_date >= now - timedelta(days=7)
++            AppleHealthData.start_date >= now - timedelta(days=7),
++            AppleHealthData.patient_id == patient_id,
+         ).all()
+         
+         sleep_by_day = {}
+diff --git a/app/api/chat.py b/app/api/chat.py
+index ebef2cd..1629329 100644
+--- a/app/api/chat.py
++++ b/app/api/chat.py
+@@ -1,13 +1,14 @@
+ import asyncio
+ import logging
+-from fastapi import APIRouter, HTTPException
++from fastapi import APIRouter, Depends, HTTPException
+ from pydantic import BaseModel
+ from typing import Optional, Dict, Any
+ import anthropic
+ from app.analysis.chat_context import build_health_context, format_health_context
++from app.auth.dependencies import get_current_patient_id
+ from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
+ from app.config import settings
+-from app.database import ChatMessage, Patient, get_session
++from app.database import ChatMessage, get_session
+ 
+ _MODEL = "claude-haiku-4-5-20251001"
+ 
+@@ -41,7 +42,7 @@ class ChatResponse(BaseModel):
+ 
+ 
+ @router.post("/ask", response_model=ChatResponse)
+-async def ask_question(request: ChatRequest):
++async def ask_question(request: ChatRequest, patient_id: int = Depends(get_current_patient_id)):
+     """
+     Spracuje otázku používateľa a vráti odpoveď založenú na zdravotných dátach
+     """
+@@ -52,7 +53,7 @@ async def ask_question(request: ChatRequest):
+         # always did, because the endpoint it calls did not exist — every
+         # question reached the model with no data attached and got "nemám
+         # žiadne údaje" as the honest answer to an empty context.
+-        context = format_health_context(build_health_context(question=request.question))
++        context = format_health_context(build_health_context(patient_id, question=request.question))
+ 
+         if not context:
+             # Nothing stored yet. A client-supplied snapshot is still accepted
+@@ -113,11 +114,11 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
+             answer = response.choices[0].message.content
+         elif settings.ANTHROPIC_API_KEY:
+             client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+-            history = await asyncio.to_thread(load_history)
++            history = await asyncio.to_thread(load_history, patient_id)
+             # Off the event loop: the SDK call is blocking and there can now be
+             # several of them in one question.
+             answer = await asyncio.to_thread(
+-                _ask_claude, client, system_prompt, user_prompt, history
++                _ask_claude, client, system_prompt, user_prompt, history, patient_id
+             )
+         else:
+             raise HTTPException(
+@@ -125,7 +126,7 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
+                 detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
+             )
+ 
+-        await asyncio.to_thread(_save_turn, request.question, answer)
++        await asyncio.to_thread(_save_turn, patient_id, request.question, answer)
+         return ChatResponse(answer=answer)
+ 
+     except HTTPException:
+@@ -135,8 +136,8 @@ Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."
+         raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
+ 
+ 
+-def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
+-    """The last turns, oldest first, in the shape the Messages API expects.
++def load_history(patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
++    """The last turns for one patient, oldest first, in the shape the Messages API expects.
+ 
+     A failure here must not cost the patient an answer: a chat without memory
+     is worse than one with it, and far better than a 500.
+@@ -148,6 +149,7 @@ def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
+         session = get_session()
+         rows = (
+             session.query(ChatMessage)
++            .filter(ChatMessage.patient_id == patient_id)
+             .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+             .limit(limit)
+             .all()
+@@ -171,12 +173,10 @@ def load_history(limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
+             session.close()
+ 
+ 
+-def _save_turn(question: str, answer: str) -> None:
++def _save_turn(patient_id: int, question: str, answer: str) -> None:
+     session = None
+     try:
+         session = get_session()
+-        patient = session.query(Patient).first()
+-        patient_id = patient.id if patient else None
+         session.add(ChatMessage(patient_id=patient_id, role='user', content=question))
+         session.add(ChatMessage(patient_id=patient_id, role='assistant', content=answer))
+         session.commit()
+@@ -190,12 +190,15 @@ def _save_turn(question: str, answer: str) -> None:
+ 
+ 
+ @router.get("/history")
+-async def get_chat_history(limit: int = 50):
+-    """Every question and answer, with its timestamp, oldest first."""
+-    return {"messages": load_history(limit=max(1, min(limit, 500)), full=True)}
++async def get_chat_history(limit: int = 50, patient_id: int = Depends(get_current_patient_id)):
++    """Every question and answer for the current patient, with its timestamp, oldest first."""
++    return {"messages": load_history(patient_id, limit=max(1, min(limit, 500)), full=True)}
+ 
+ 
+-def _ask_claude(client, system_prompt: str, user_prompt: str, history: Optional[list] = None) -> str:
++def _ask_claude(
++    client, system_prompt: str, user_prompt: str,
++    history: Optional[list] = None, patient_id: Optional[int] = None,
++) -> str:
+     """Ask, letting the model fetch what the prompt does not already carry.
+ 
+     The context is a snapshot of the recent window; a question about a longer
+@@ -230,7 +233,7 @@ def _ask_claude(client, system_prompt: str, user_prompt: str, history: Optional[
+             results.append({
+                 "type": "tool_result",
+                 "tool_use_id": block.id,
+-                "content": run_tool(block.name, block.input),
++                "content": run_tool(block.name, block.input, patient_id),
+             })
+         messages.append({"role": "user", "content": results})
+     else:
+diff --git a/app/api/integrations.py b/app/api/integrations.py
+index dcffb10..bcfe539 100644
+--- a/app/api/integrations.py
++++ b/app/api/integrations.py
+@@ -1,8 +1,22 @@
+-from fastapi import APIRouter, HTTPException, BackgroundTasks
++from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+ from pydantic import BaseModel
+ from typing import Optional, Dict, Any, List
+ from datetime import datetime, timedelta
+ 
++from app.auth.dependencies import get_current_patient_id, require_admin
++
++# Garmin, Withings and Google Calendar connectors are process-global
++# singletons holding one OAuth session each (see get_garmin_connector() etc.
++# below) — they authenticate once per container, not once per patient. That
++# was fine with a single implicit patient; under multi-tenancy it would let
++# any authenticated tester read (or overwrite, via /sync) whichever account
++# happens to be connected. Making these properly per-user would mean storing
++# a separate OAuth token per patient and is a larger, separate piece of work
++# (see the multi-user-auth PR description). For this pass, every endpoint
++# below that reads or triggers a sync is restricted to ADMIN_EMAILS via
++# require_admin, instead of either deleting the integrations or silently
++# leaving them open to cross-tenant access.
++
+ try:
+     from app.integrations.garmin_connector import get_garmin_connector
+     GARMIN_AVAILABLE = True
+@@ -44,7 +58,7 @@ class CorrelationAnalysisRequest(BaseModel):
+ 
+ 
+ @router.post("/garmin/auth")
+-async def authenticate_garmin(request: GarminAuthRequest):
++async def authenticate_garmin(request: GarminAuthRequest, _admin=Depends(require_admin)):
+     """
+     Autentifikácia do Garmin Connect
+     """
+@@ -67,7 +81,7 @@ async def authenticate_garmin(request: GarminAuthRequest):
+ 
+ 
+ @router.get("/garmin/daily")
+-async def get_garmin_daily_data(date: Optional[str] = None):
++async def get_garmin_daily_data(date: Optional[str] = None, _admin=Depends(require_admin)):
+     """
+     Získať denné dáta z Garmin hodinek
+     """
+@@ -90,7 +104,7 @@ async def get_garmin_daily_data(date: Optional[str] = None):
+ 
+ 
+ @router.post("/garmin/sync")
+-async def sync_garmin_data(request: SyncRequest, background_tasks: BackgroundTasks):
++async def sync_garmin_data(request: SyncRequest, background_tasks: BackgroundTasks, _admin=Depends(require_admin)):
+     """
+     Synchronizovať historické dáta z Garmin (na pozadí)
+     """
+@@ -138,7 +152,7 @@ def _require_withings():
+ 
+ 
+ @router.get("/withings/auth")
+-async def authenticate_withings():
++async def authenticate_withings(_admin=Depends(require_admin)):
+     """
+     Vráti URL, na ktorú treba používateľa presmerovať (OAuth2 consent screen)
+     """
+@@ -175,7 +189,7 @@ async def withings_callback(code: Optional[str] = None, state: str = ""):
+ 
+ 
+ @router.get("/withings/sleep")
+-async def get_withings_sleep(days: int = 30):
++async def get_withings_sleep(days: int = 30, _admin=Depends(require_admin)):
+     """
+     Spánok z hodiniek — fázy, prebúdzania, tep, dychové poruchy
+     """
+@@ -188,7 +202,7 @@ async def get_withings_sleep(days: int = 30):
+ 
+ 
+ @router.get("/withings/activity")
+-async def get_withings_activity(days: int = 30):
++async def get_withings_activity(days: int = 30, _admin=Depends(require_admin)):
+     """
+     Denná aktivita — kroky, vzdialenosť, poschodia, pásma tepu
+     """
+@@ -201,7 +215,7 @@ async def get_withings_activity(days: int = 30):
+ 
+ 
+ @router.get("/withings/measures")
+-async def get_withings_measures(days: int = 30):
++async def get_withings_measures(days: int = 30, _admin=Depends(require_admin)):
+     """
+     Merania — tep, SpO2, teplota, VO2max, EKG intervaly
+     """
+@@ -214,7 +228,7 @@ async def get_withings_measures(days: int = 30):
+ 
+ 
+ @router.get("/withings/hrv")
+-async def get_withings_hrv(nights: int = 14):
++async def get_withings_hrv(nights: int = 14, _admin=Depends(require_admin)):
+     """
+     Variabilita srdcovej frekvencie zo spánku (rmssd, sdnn_1).
+ 
+@@ -230,7 +244,7 @@ async def get_withings_hrv(nights: int = 14):
+ 
+ 
+ @router.get("/withings/ecg")
+-async def get_withings_ecg(with_signal: bool = False):
++async def get_withings_ecg(with_signal: bool = False, _admin=Depends(require_admin)):
+     """
+     EKG záznamy. with_signal=true stiahne aj surové krivky
+     (9000 vzoriek na záznam, ~29 KB) — nepoužívaj pri každom načítaní stránky.
+@@ -244,7 +258,12 @@ async def get_withings_ecg(with_signal: bool = False):
+ 
+ 
+ @router.post("/withings/sync-db")
+-async def sync_withings_to_database(days: int = 30, hrv_nights: int = 14):
++async def sync_withings_to_database(
++    days: int = 30,
++    hrv_nights: int = 14,
++    _admin=Depends(require_admin),
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """
+     Zapíše Withings dáta do kanonickej tabuľky health_records.
+ 
+@@ -258,7 +277,7 @@ async def sync_withings_to_database(days: int = 30, hrv_nights: int = 14):
+     _require_withings()
+     try:
+         from app.integrations.withings_sync import sync_withings_to_db
+-        return await sync_withings_to_db(days=days, hrv_nights=hrv_nights)
++        return await sync_withings_to_db(patient_id, days=days, hrv_nights=hrv_nights)
+     except HTTPException:
+         raise
+     except Exception as e:
+@@ -266,7 +285,7 @@ async def sync_withings_to_database(days: int = 30, hrv_nights: int = 14):
+ 
+ 
+ @router.post("/withings/sync")
+-async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundTasks):
++async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundTasks, _admin=Depends(require_admin)):
+     """
+     Synchronizovať historické dáta z Withings (na pozadí)
+     """
+@@ -280,7 +299,7 @@ async def sync_withings_data(request: SyncRequest, background_tasks: BackgroundT
+ 
+ 
+ @router.get("/calendar/auth")
+-async def authenticate_calendar():
++async def authenticate_calendar(_admin=Depends(require_admin)):
+     """
+     Autentifikácia do Google Calendar
+     """
+@@ -303,7 +322,7 @@ async def authenticate_calendar():
+ 
+ 
+ @router.get("/calendar/events")
+-async def get_calendar_events(days_back: int = 30, days_forward: int = 7):
++async def get_calendar_events(days_back: int = 30, days_forward: int = 7, _admin=Depends(require_admin)):
+     """
+     Získať udalosti z kalendára
+     """
+@@ -331,7 +350,7 @@ async def get_calendar_events(days_back: int = 30, days_forward: int = 7):
+ 
+ 
+ @router.post("/analyze/correlations")
+-async def analyze_correlations(request: CorrelationAnalysisRequest):
++async def analyze_correlations(request: CorrelationAnalysisRequest, _admin=Depends(require_admin)):
+     """
+     Analyzovať korelácie medzi kalendárom a zdravotnými metrikami
+     """
+diff --git a/app/api/manual_entry.py b/app/api/manual_entry.py
+index 8d24ef7..a899fcc 100644
+--- a/app/api/manual_entry.py
++++ b/app/api/manual_entry.py
+@@ -1,16 +1,17 @@
+-from fastapi import APIRouter, HTTPException
++from fastapi import APIRouter, Depends, HTTPException
+ from pydantic import BaseModel
+ from typing import List, Optional, Dict, Any
+ from datetime import date, datetime
++from app.auth.dependencies import get_current_patient_id
+ from app.database import get_session, Patient, FamilyMember, HealthRecord
+ 
+ router = APIRouter(prefix="/api/manual", tags=["manual-entry"])
+ 
+ 
+-def _invalidate_trends():
++def _invalidate_trends(patient_id: Optional[int] = None):
+     """Manually entered records must show up in /trends immediately."""
+     from app.analysis.trend_analyzer import TrendAnalyzer
+-    TrendAnalyzer.invalidate_cache()
++    TrendAnalyzer.invalidate_cache(patient_id)
+ 
+ 
+ # Pydantic models pre requesty
+@@ -22,18 +23,18 @@ class FamilyMemberCreate(BaseModel):
+     date_of_death: Optional[date] = None
+     gender: str
+     blood_type: Optional[str] = None
+-    
++
+     chronic_conditions: Optional[List[str]] = []
+     genetic_conditions: Optional[List[str]] = []
+     allergies: Optional[List[str]] = []
+     medications: Optional[List[Dict[str, str]]] = []
+     surgeries: Optional[List[Dict[str, str]]] = []
+-    
++
+     smoking: bool = False
+     smoking_years: Optional[int] = None
+     alcohol: bool = False
+     exercise_frequency: Optional[str] = None
+-    
++
+     cause_of_death: Optional[str] = None
+     notes: Optional[str] = None
+ 
+@@ -46,18 +47,18 @@ class FamilyMemberUpdate(BaseModel):
+     date_of_death: Optional[date] = None
+     gender: Optional[str] = None
+     blood_type: Optional[str] = None
+-    
++
+     chronic_conditions: Optional[List[str]] = None
+     genetic_conditions: Optional[List[str]] = None
+     allergies: Optional[List[str]] = None
+     medications: Optional[List[Dict[str, str]]] = None
+     surgeries: Optional[List[Dict[str, str]]] = None
+-    
++
+     smoking: Optional[bool] = None
+     smoking_years: Optional[int] = None
+     alcohol: Optional[bool] = None
+     exercise_frequency: Optional[str] = None
+-    
++
+     cause_of_death: Optional[str] = None
+     notes: Optional[str] = None
+ 
+@@ -89,14 +90,14 @@ class PatientUpdate(BaseModel):
+ # === PATIENT ENDPOINTS ===
+ 
+ @router.get("/patient")
+-async def get_patient_info():
++async def get_patient_info(patient_id: int = Depends(get_current_patient_id)):
+     """Získať informácie o pacientovi"""
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
++        patient = session.query(Patient).filter_by(id=patient_id).first()
+         if not patient:
+             raise HTTPException(status_code=404, detail="Patient not found")
+-        
++
+         return {
+             "id": patient.id,
+             "first_name": patient.first_name,
+@@ -113,14 +114,14 @@ async def get_patient_info():
+ 
+ 
+ @router.put("/patient")
+-async def update_patient_info(data: PatientUpdate):
++async def update_patient_info(data: PatientUpdate, patient_id: int = Depends(get_current_patient_id)):
+     """Aktualizovať informácie o pacientovi"""
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
++        patient = session.query(Patient).filter_by(id=patient_id).first()
+         if not patient:
+             raise HTTPException(status_code=404, detail="Patient not found")
+-        
++
+         # Update fields
+         if data.first_name is not None:
+             patient.first_name = data.first_name
+@@ -138,10 +139,10 @@ async def update_patient_info(data: PatientUpdate):
+             patient.email = data.email
+         if data.phone is not None:
+             patient.phone = data.phone
+-        
++
+         patient.updated_at = datetime.now()
+         session.commit()
+-        
++
+         return {"success": True, "message": "Patient info updated"}
+     finally:
+         session.close()
+@@ -150,17 +151,12 @@ async def update_patient_info(data: PatientUpdate):
+ # === FAMILY MEMBER ENDPOINTS ===
+ 
+ @router.get("/family")
+-async def get_family_members():
++async def get_family_members(patient_id: int = Depends(get_current_patient_id)):
+     """Získať všetkých rodinných príbuzných"""
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
+-        if not patient:
+-            # A list endpoint with nothing to list returns an empty list, not 404.
+-            return []
++        members = session.query(FamilyMember).filter_by(patient_id=patient_id).all()
+ 
+-        members = session.query(FamilyMember).filter_by(patient_id=patient.id).all()
+-        
+         result = []
+         for member in members:
+             result.append({
+@@ -184,23 +180,19 @@ async def get_family_members():
+                 "cause_of_death": member.cause_of_death,
+                 "notes": member.notes,
+             })
+-        
++
+         return result
+     finally:
+         session.close()
+ 
+ 
+ @router.post("/family")
+-async def add_family_member(data: FamilyMemberCreate):
++async def add_family_member(data: FamilyMemberCreate, patient_id: int = Depends(get_current_patient_id)):
+     """Pridať rodinného príbuzného"""
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
+-        if not patient:
+-            raise HTTPException(status_code=404, detail="Patient not found")
+-        
+         member = FamilyMember(
+-            patient_id=patient.id,
++            patient_id=patient_id,
+             first_name=data.first_name,
+             last_name=data.last_name,
+             relationship_type=data.relationship_type,
+@@ -220,10 +212,10 @@ async def add_family_member(data: FamilyMemberCreate):
+             cause_of_death=data.cause_of_death,
+             notes=data.notes,
+         )
+-        
++
+         session.add(member)
+         session.commit()
+-        
++
+         return {
+             "success": True,
+             "message": f"Family member {data.first_name} {data.last_name} added",
+@@ -234,14 +226,25 @@ async def add_family_member(data: FamilyMemberCreate):
+ 
+ 
+ @router.put("/family/{member_id}")
+-async def update_family_member(member_id: int, data: FamilyMemberUpdate):
++async def update_family_member(
++    member_id: int,
++    data: FamilyMemberUpdate,
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """Aktualizovať rodinného príbuzného"""
+     session = get_session()
+     try:
+-        member = session.query(FamilyMember).filter_by(id=member_id).first()
++        # Scoped by patient_id, not just id: an id-only lookup would let any
++        # authenticated user edit another patient's family member by
++        # guessing/incrementing the id (IDOR).
++        member = (
++            session.query(FamilyMember)
++            .filter_by(id=member_id, patient_id=patient_id)
++            .first()
++        )
+         if not member:
+             raise HTTPException(status_code=404, detail="Family member not found")
+-        
++
+         # Update fields
+         if data.first_name is not None:
+             member.first_name = data.first_name
+@@ -279,27 +282,32 @@ async def update_family_member(member_id: int, data: FamilyMemberUpdate):
+             member.cause_of_death = data.cause_of_death
+         if data.notes is not None:
+             member.notes = data.notes
+-        
++
+         member.updated_at = datetime.now()
+         session.commit()
+-        
++
+         return {"success": True, "message": "Family member updated"}
+     finally:
+         session.close()
+ 
+ 
+ @router.delete("/family/{member_id}")
+-async def delete_family_member(member_id: int):
++async def delete_family_member(member_id: int, patient_id: int = Depends(get_current_patient_id)):
+     """Vymazať rodinného príbuzného"""
+     session = get_session()
+     try:
+-        member = session.query(FamilyMember).filter_by(id=member_id).first()
++        # Scoped by patient_id — see update_family_member above (IDOR).
++        member = (
++            session.query(FamilyMember)
++            .filter_by(id=member_id, patient_id=patient_id)
++            .first()
++        )
+         if not member:
+             raise HTTPException(status_code=404, detail="Family member not found")
+-        
++
+         session.delete(member)
+         session.commit()
+-        
++
+         return {"success": True, "message": "Family member deleted"}
+     finally:
+         session.close()
+@@ -308,16 +316,12 @@ async def delete_family_member(member_id: int):
+ # === HEALTH RECORD ENDPOINTS ===
+ 
+ @router.post("/health-record")
+-async def add_health_record(data: HealthRecordCreate):
++async def add_health_record(data: HealthRecordCreate, patient_id: int = Depends(get_current_patient_id)):
+     """Manuálne pridať zdravotný záznam"""
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
+-        if not patient:
+-            raise HTTPException(status_code=404, detail="Patient not found")
+-        
+         record = HealthRecord(
+-            patient_id=patient.id,
++            patient_id=patient_id,
+             record_type="manual_entry",
+             record_date=data.record_date,
+             source="manual",
+@@ -331,10 +335,10 @@ async def add_health_record(data: HealthRecordCreate):
+             facility_name=data.facility_name,
+             notes=data.notes,
+         )
+-        
++
+         session.add(record)
+         session.commit()
+-        _invalidate_trends()
++        _invalidate_trends(patient_id)
+ 
+         return {
+             "success": True,
+@@ -346,21 +350,21 @@ async def add_health_record(data: HealthRecordCreate):
+ 
+ 
+ @router.get("/health-records")
+-async def get_health_records(metric_type: Optional[str] = None, limit: int = 100):
++async def get_health_records(
++    metric_type: Optional[str] = None,
++    limit: int = 100,
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """Získať zdravotné záznamy (s optional filtrom)"""
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
+-        if not patient:
+-            return []
++        query = session.query(HealthRecord).filter_by(patient_id=patient_id)
+ 
+-        query = session.query(HealthRecord).filter_by(patient_id=patient.id)
+-        
+         if metric_type:
+             query = query.filter_by(metric_type=metric_type)
+-        
++
+         records = query.order_by(HealthRecord.record_date.desc()).limit(limit).all()
+-        
++
+         result = []
+         for record in records:
+             result.append({
+@@ -377,24 +381,29 @@ async def get_health_records(metric_type: Optional[str] = None, limit: int = 100
+                 "facility_name": record.facility_name,
+                 "notes": record.notes,
+             })
+-        
++
+         return result
+     finally:
+         session.close()
+ 
+ 
+ @router.delete("/health-record/{record_id}")
+-async def delete_health_record(record_id: int):
++async def delete_health_record(record_id: int, patient_id: int = Depends(get_current_patient_id)):
+     """Vymazať zdravotný záznam"""
+     session = get_session()
+     try:
+-        record = session.query(HealthRecord).filter_by(id=record_id).first()
++        # Scoped by patient_id — see update_family_member above (IDOR).
++        record = (
++            session.query(HealthRecord)
++            .filter_by(id=record_id, patient_id=patient_id)
++            .first()
++        )
+         if not record:
+             raise HTTPException(status_code=404, detail="Health record not found")
+-        
++
+         session.delete(record)
+         session.commit()
+-        _invalidate_trends()
++        _invalidate_trends(patient_id)
+ 
+         return {"success": True, "message": "Health record deleted"}
+     finally:
+@@ -404,32 +413,28 @@ async def delete_health_record(record_id: int):
+ # === UTILITY ENDPOINTS ===
+ 
+ @router.get("/genetic-risk-analysis")
+-async def analyze_genetic_risks():
++async def analyze_genetic_risks(patient_id: int = Depends(get_current_patient_id)):
+     """Analyzovať genetické riziká na základe rodinnej anamnézy"""
+     session = get_session()
+     try:
+-        patient = session.query(Patient).first()
+-        if not patient:
+-            raise HTTPException(status_code=404, detail="Patient not found")
+-        
+-        members = session.query(FamilyMember).filter_by(patient_id=patient.id).all()
+-        
++        members = session.query(FamilyMember).filter_by(patient_id=patient_id).all()
++
+         # Počítať výskyt chorôb v rodine
+         condition_counts = {}
+         genetic_conditions = {}
+-        
++
+         for member in members:
+             # Chronické choroby
+             for condition in (member.chronic_conditions or []):
+                 condition_counts[condition] = condition_counts.get(condition, 0) + 1
+-            
++
+             # Genetické choroby
+             for condition in (member.genetic_conditions or []):
+                 genetic_conditions[condition] = genetic_conditions.get(condition, 0) + 1
+-        
++
+         # Vypočítať riziká
+         risks = []
+-        
++
+         # Vysoké riziko = 2+ príbuzní s rovnakou chorobou
+         for condition, count in condition_counts.items():
+             risk_level = "low"
+@@ -437,14 +442,14 @@ async def analyze_genetic_risks():
+                 risk_level = "high"
+             elif count >= 2:
+                 risk_level = "medium"
+-            
++
+             risks.append({
+                 "condition": condition,
+                 "family_members_affected": count,
+                 "risk_level": risk_level,
+                 "type": "chronic"
+             })
+-        
++
+         # Genetické choroby = vždy vysoké riziko
+         for condition, count in genetic_conditions.items():
+             risks.append({
+@@ -453,11 +458,11 @@ async def analyze_genetic_risks():
+                 "risk_level": "high",
+                 "type": "genetic"
+             })
+-        
++
+         # Zoradiť podľa rizika
+         risk_order = {"high": 0, "medium": 1, "low": 2}
+         risks.sort(key=lambda x: (risk_order[x["risk_level"]], -x["family_members_affected"]))
+-        
++
+         return {
+             "total_family_members": len(members),
+             "risks": risks,
+diff --git a/app/api/nutrition.py b/app/api/nutrition.py
+index ad05170..25ce3e1 100644
+--- a/app/api/nutrition.py
++++ b/app/api/nutrition.py
+@@ -3,10 +3,11 @@ import logging
+ from datetime import date, datetime, timedelta
+ from typing import List, Optional
+ 
+-from fastapi import APIRouter, HTTPException, UploadFile, File
++from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+ from pydantic import BaseModel, Field
+ 
+-from app.database import get_session, Patient, NutritionEntry
++from app.auth.dependencies import get_current_patient_id
++from app.database import get_session, NutritionEntry
+ from app.nutrition.analyzer import MealAnalyzer
+ 
+ logger = logging.getLogger(__name__)
+@@ -52,13 +53,6 @@ class NutritionEntryCreate(BaseModel):
+     notes: Optional[str] = None
+ 
+ 
+-def _get_default_patient(session) -> Patient:
+-    patient = session.query(Patient).first()
+-    if not patient:
+-        raise HTTPException(status_code=404, detail="Patient not found")
+-    return patient
+-
+-
+ def _serialize_entry(entry: NutritionEntry) -> dict:
+     return {
+         "id": entry.id,
+@@ -161,14 +155,15 @@ async def analyze_meal_text(data: MealTextRequest):
+ 
+ 
+ @router.post("/entries")
+-async def save_nutrition_entry(data: NutritionEntryCreate):
++async def save_nutrition_entry(
++    data: NutritionEntryCreate,
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """Uloží (prípadne používateľom upravenú) analýzu jedla do denníka."""
+     session = get_session()
+     try:
+-        patient = _get_default_patient(session)
+-
+         entry = NutritionEntry(
+-            patient_id=patient.id,
++            patient_id=patient_id,
+             logged_at=datetime.now(),
+             items=[item.model_dump() for item in data.items],
+             total_calories=data.total_calories,
+@@ -189,18 +184,20 @@ async def save_nutrition_entry(data: NutritionEntryCreate):
+ 
+ 
+ @router.get("/entries")
+-async def list_nutrition_entries(target_date: Optional[date] = None):
++async def list_nutrition_entries(
++    target_date: Optional[date] = None,
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """Zoznam zaznamenaných jedál pre daný deň (default: dnes), najnovšie prvé."""
+     day = target_date or date.today()
+     start, end = _day_bounds(day)
+ 
+     session = get_session()
+     try:
+-        patient = _get_default_patient(session)
+         entries = (
+             session.query(NutritionEntry)
+             .filter(
+-                NutritionEntry.patient_id == patient.id,
++                NutritionEntry.patient_id == patient_id,
+                 NutritionEntry.logged_at >= start,
+                 NutritionEntry.logged_at < end,
+             )
+@@ -213,10 +210,20 @@ async def list_nutrition_entries(target_date: Optional[date] = None):
+ 
+ 
+ @router.delete("/entries/{entry_id}")
+-async def delete_nutrition_entry(entry_id: int):
++async def delete_nutrition_entry(
++    entry_id: int,
++    patient_id: int = Depends(get_current_patient_id),
++):
+     session = get_session()
+     try:
+-        entry = session.query(NutritionEntry).filter_by(id=entry_id).first()
++        # Scoped by patient_id, not just id: an id-only lookup would let any
++        # authenticated user delete another patient's entry by guessing/
++        # incrementing the id (IDOR).
++        entry = (
++            session.query(NutritionEntry)
++            .filter_by(id=entry_id, patient_id=patient_id)
++            .first()
++        )
+         if not entry:
+             raise HTTPException(status_code=404, detail="Záznam sa nenašiel.")
+         session.delete(entry)
+@@ -227,7 +234,10 @@ async def delete_nutrition_entry(entry_id: int):
+ 
+ 
+ @router.get("/summary")
+-async def get_daily_summary(target_date: Optional[date] = None):
++async def get_daily_summary(
++    target_date: Optional[date] = None,
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """Súčet kalórií/makier za daný deň + jednoduché pravidlové odporúčanie.
+ 
+     Toto je zámerne "hlúpe" pravidlové odporúčanie, nie AI — plná personalizácia
+@@ -238,11 +248,10 @@ async def get_daily_summary(target_date: Optional[date] = None):
+ 
+     session = get_session()
+     try:
+-        patient = _get_default_patient(session)
+         entries = (
+             session.query(NutritionEntry)
+             .filter(
+-                NutritionEntry.patient_id == patient.id,
++                NutritionEntry.patient_id == patient_id,
+                 NutritionEntry.logged_at >= start,
+                 NutritionEntry.logged_at < end,
+             )
+diff --git a/app/api/predictions.py b/app/api/predictions.py
+index bc34d26..b879c01 100644
+--- a/app/api/predictions.py
++++ b/app/api/predictions.py
+@@ -1,8 +1,9 @@
+ import logging
+ 
+-from fastapi import APIRouter, HTTPException
++from fastapi import APIRouter, Depends, HTTPException
+ from typing import Optional
+ 
++from app.auth.dependencies import get_current_patient_id
+ from app.ml.risk_predictor import RiskPredictor
+ from app.ml.recommendation_engine import RecommendationEngine
+ from app.claude.medical_advisor import MedicalAdvisor
+@@ -10,7 +11,12 @@ from app.claude.medical_advisor import MedicalAdvisor
+ logger = logging.getLogger(__name__)
+ 
+ router = APIRouter()
+-risk_predictor = RiskPredictor()
++
++# RiskPredictor wraps a TrendAnalyzer and must be built per request, scoped to
++# the caller's patient_id (see app/api/analysis.py for the same rationale).
++# RecommendationEngine and MedicalAdvisor touch no patient data of their own —
++# the former is pure age-based static logic, the latter only reasons over the
++# ml_risks dict it is handed — so they stay as shared, stateless instances.
+ recommendation_engine = RecommendationEngine()
+ medical_advisor = MedicalAdvisor()
+ 
+@@ -18,7 +24,7 @@ SUPPORTED_DISEASES = ["diabetes", "cardiovascular", "hypertension", "metabolic_s
+ 
+ 
+ @router.get("/risks")
+-async def predict_health_risks(use_claude: bool = False):
++async def predict_health_risks(use_claude: bool = False, patient_id: int = Depends(get_current_patient_id)):
+     """
+     Predikcia budúcich zdravotných rizík
+ 
+@@ -27,6 +33,7 @@ async def predict_health_risks(use_claude: bool = False):
+     """
+     try:
+         # ML-based risk prediction
++        risk_predictor = RiskPredictor(patient_id)
+         ml_risks = risk_predictor.predict_risks()
+ 
+         result = {
+@@ -75,7 +82,7 @@ async def get_preventive_recommendations(age: Optional[int] = None):
+ 
+ 
+ @router.get("/disease-risk/{disease}")
+-async def get_specific_disease_risk(disease: str):
++async def get_specific_disease_risk(disease: str, patient_id: int = Depends(get_current_patient_id)):
+     """
+     Špecifická predikcia rizika pre konkrétne ochorenie
+ 
+@@ -91,7 +98,7 @@ async def get_specific_disease_risk(disease: str):
+         )
+ 
+     try:
+-        risk_assessment = risk_predictor.predict_disease_risk(disease)
++        risk_assessment = RiskPredictor(patient_id).predict_disease_risk(disease)
+ 
+         return {
+             "disease": disease,
+diff --git a/app/api/upload.py b/app/api/upload.py
+index a96c3a2..5c370a0 100644
+--- a/app/api/upload.py
++++ b/app/api/upload.py
+@@ -1,11 +1,12 @@
+ import asyncio
+ import logging
+-from fastapi import APIRouter, UploadFile, File, HTTPException
++from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+ from typing import List
+ import shutil
+ from pathlib import Path
+ from datetime import datetime
+ 
++from app.auth.dependencies import get_current_patient_id, require_admin
+ from app.config import settings
+ from app.ocr.document_processor import DocumentProcessor, split_document_output
+ from app.ocr.data_extractor import HealthDataExtractor
+@@ -41,10 +42,10 @@ def _resolve_extension(file: UploadFile) -> str:
+     return _CONTENT_TYPE_MAP.get(ct, ext)
+ 
+ 
+-def _invalidate_analyzers():
++def _invalidate_analyzers(patient_id: int):
+     """Clear cached data so next request reloads from DB."""
+     from app.analysis.trend_analyzer import TrendAnalyzer
+-    TrendAnalyzer.invalidate_cache()
++    TrendAnalyzer.invalidate_cache(patient_id)
+ 
+ 
+ def _document_date(health_data: List[dict]):
+@@ -61,7 +62,7 @@ def _document_date(health_data: List[dict]):
+     return max(dates) if dates else None
+ 
+ 
+-async def _process_single_file(file: UploadFile) -> dict:
++async def _process_single_file(file: UploadFile, patient_id: int) -> dict:
+     """Save and process one uploaded file. Runs Claude call in a thread."""
+     file_ext = _resolve_extension(file)
+ 
+@@ -94,7 +95,7 @@ async def _process_single_file(file: UploadFile) -> dict:
+         # in the record would otherwise swallow the real array.
+         record_text, metrics_text = split_document_output(text_content)
+         health_data = await asyncio.to_thread(
+-            data_extractor.extract_health_metrics, metrics_text, file.filename
++            data_extractor.extract_health_metrics, metrics_text, file.filename, patient_id
+         )
+ 
+     # The transcription used to end here: the metrics were parsed out and the
+@@ -108,6 +109,7 @@ async def _process_single_file(file: UploadFile) -> dict:
+             index_document,
+             file.filename or safe_filename,
+             record_text,
++            patient_id,
+             str(file_path),
+             file_ext.lstrip('.'),
+             file_path.stat().st_size if file_path.exists() else None,
+@@ -126,7 +128,10 @@ async def _process_single_file(file: UploadFile) -> dict:
+ 
+ 
+ @router.post("/documents")
+-async def upload_documents(files: List[UploadFile] = File(...)):
++async def upload_documents(
++    files: List[UploadFile] = File(...),
++    patient_id: int = Depends(get_current_patient_id),
++):
+     """
+     Upload health documents (PDF, images, CSV) for processing.
+     Supported formats: PDF, JPG, JPEG, PNG, HEIC, HEIF, CSV
+@@ -134,7 +139,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
+     """
+     try:
+         # Process all files concurrently
+-        tasks = [_process_single_file(f) for f in files]
++        tasks = [_process_single_file(f, patient_id) for f in files]
+         results = await asyncio.gather(*tasks, return_exceptions=True)
+ 
+         uploaded_files = []
+@@ -149,7 +154,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
+ 
+         # Invalidate analyzer cache so dashboard reflects new data immediately
+         if uploaded_files:
+-            _invalidate_analyzers()
++            _invalidate_analyzers(patient_id)
+ 
+         if errors and not uploaded_files:
+             raise HTTPException(status_code=500, detail=f"All files failed: {errors}")
+@@ -182,7 +187,7 @@ async def download_csv_template():
+ 
+ 
+ @router.get("/history")
+-async def upload_history():
++async def upload_history(patient_id: int = Depends(get_current_patient_id)):
+     """History of processed documents, newest first.
+ 
+     Built from the extracted records rather than the upload directory, which
+@@ -203,6 +208,7 @@ async def upload_history():
+             )
+             .filter(HealthRecord.source == 'ocr')
+             .filter(HealthRecord.source_file.isnot(None))
++            .filter(HealthRecord.patient_id == patient_id)
+             .group_by(HealthRecord.source_file)
+             .order_by(func.min(HealthRecord.created_at).desc())
+             .all()
+@@ -227,6 +233,7 @@ async def upload_history():
+             session.query(func.count(HealthRecord.id))
+             .filter(HealthRecord.source == 'ocr')
+             .filter(HealthRecord.source_file.is_(None))
++            .filter(HealthRecord.patient_id == patient_id)
+             .scalar()
+         ) or 0
+ 
+@@ -240,24 +247,31 @@ async def upload_history():
+ 
+ 
+ @router.get("/search")
+-async def search_documents_endpoint(q: str, limit: int = 5):
++async def search_documents_endpoint(
++    q: str, limit: int = 5, patient_id: int = Depends(get_current_patient_id),
++):
+     """Passages retrieval returns for a query — the chat calls the same function.
+ 
+     Exposed so a bad answer can be traced: if the chat missed something that is
+     in a report, this shows whether retrieval failed or the model ignored what
+     it was given.
+     """
+-    documents = document_inventory()
++    documents = document_inventory(patient_id)
+     return {
+         "query": q,
+         "documents_indexed": sum(1 for d in documents if d.get("has_text")),
+-        "results": search_documents(q, limit=limit),
++        "results": search_documents(q, patient_id, limit=limit),
+     }
+ 
+ 
+ @router.get("/documents")
+-async def list_documents():
+-    """Files currently on disk. Ephemeral — kept for debugging only."""
++async def list_documents(_admin=Depends(require_admin)):
++    """Files currently on disk. Ephemeral — kept for debugging only.
++
++    Admin-only: the container's upload directory is shared by every tenant,
++    so listing it without scoping would otherwise show every patient's
++    filenames to any authenticated user.
++    """
+     try:
+         files = list(settings.RAW_DATA_DIR.glob("*"))
+         return {
+diff --git a/app/integrations/withings_sync.py b/app/integrations/withings_sync.py
+index 55cc278..50b5186 100644
+--- a/app/integrations/withings_sync.py
++++ b/app/integrations/withings_sync.py
+@@ -16,9 +16,9 @@ import logging
+ import statistics
+ from collections import defaultdict
+ from datetime import datetime, timedelta
+-from typing import Dict, List, Optional
++from typing import Dict, List
+ 
+-from app.database import get_session, HealthRecord, Patient
++from app.database import get_session, HealthRecord
+ from app.integrations.withings_connector import get_withings_connector
+ 
+ logger = logging.getLogger(__name__)
+@@ -59,11 +59,6 @@ METRIC_UNITS = {
+ }
+ 
+ 
+-def _default_patient_id(session) -> Optional[int]:
+-    patient = session.query(Patient).first()
+-    return patient.id if patient else None
+-
+-
+ def _day(iso: str):
+     """ISO reťazec s offsetom -> dátum. Časy z konektora sú v UTC."""
+     return datetime.fromisoformat(iso).date()
+@@ -116,8 +111,15 @@ async def collect_daily_metrics(days: int = 30, hrv_nights: int = 14) -> Dict:
+     return {key: statistics.median(vals) for key, vals in daily.items() if vals}
+ 
+ 
+-async def sync_withings_to_db(days: int = 30, hrv_nights: int = 14) -> Dict:
+-    """Stiahne dáta a zapíše ich do health_records. Idempotentné."""
++async def sync_withings_to_db(patient_id: int, days: int = 30, hrv_nights: int = 14) -> Dict:
++    """Stiahne dáta a zapíše ich do health_records. Idempotentné.
++
++    patient_id is the calling admin's own patient id (see app/api/integrations.py)
++    rather than "whichever Patient row sorts first" — this endpoint is
++    admin-only, but ADMIN_EMAILS can list more than one address, and the old
++    session.query(Patient).first() would have let a second admin's sync
++    silently write into (or overwrite) the first admin's records.
++    """
+     values = await collect_daily_metrics(days, hrv_nights)
+     if not values:
+         return {"written": 0, "updated": 0, "metrics": []}
+@@ -125,12 +127,11 @@ async def sync_withings_to_db(days: int = 30, hrv_nights: int = 14) -> Dict:
+     session = get_session()
+     written = updated = 0
+     try:
+-        patient_id = _default_patient_id(session)
+-
+         existing = {
+             (r.metric_type, r.record_date): r
+             for r in session.query(HealthRecord)
+             .filter(HealthRecord.source == SOURCE)
++            .filter(HealthRecord.patient_id == patient_id)
+             .filter(HealthRecord.record_date >= (datetime.now().date()
+                                                  - timedelta(days=days + 1)))
+             .all()
+diff --git a/app/ocr/data_extractor.py b/app/ocr/data_extractor.py
+index 8c094d3..96f7948 100644
+--- a/app/ocr/data_extractor.py
++++ b/app/ocr/data_extractor.py
+@@ -11,15 +11,23 @@ class HealthDataExtractor:
+     def __init__(self):
+         pass
+ 
+-    def extract_health_metrics(self, text: str, source_file: Optional[str] = None) -> List[Dict]:
+-        """Parse Claude's JSON response, fall back to regex if needed."""
++    def extract_health_metrics(
++        self, text: str, source_file: Optional[str] = None, patient_id: Optional[int] = None,
++    ) -> List[Dict]:
++        """Parse Claude's JSON response, fall back to regex if needed.
++
++        patient_id must come from the authenticated request that uploaded the
++        document (see app/api/upload.py) — it used to be hardcoded to 1 here,
++        which meant every OCR-extracted record landed on patient 1 regardless
++        of who actually uploaded it.
++        """
+         metrics = self._parse_json(text)
+         if not metrics:
+             logger.warning('JSON parsing returned 0 metrics, trying regex fallback')
+             metrics = self._regex_extract(text)
+ 
+         logger.info('Found %d health metrics', len(metrics))
+-        self._save_extracted_data(metrics, source_file)
++        self._save_extracted_data(metrics, source_file, patient_id)
+         return metrics
+ 
+     # ------------------------------------------------------------------ #
+@@ -164,9 +172,14 @@ class HealthDataExtractor:
+     # Database persistence
+     # ------------------------------------------------------------------ #
+ 
+-    def _save_extracted_data(self, metrics: List[Dict], source_file: Optional[str] = None):
++    def _save_extracted_data(
++        self, metrics: List[Dict], source_file: Optional[str] = None, patient_id: Optional[int] = None,
++    ):
+         if not metrics:
+             return
++        if patient_id is None:
++            logger.error('Refusing to save extracted metrics without a patient_id (source_file=%s)', source_file)
++            return
+         try:
+             from app.database import get_session, HealthRecord
+             session = get_session()
+@@ -186,7 +199,7 @@ class HealthDataExtractor:
+                         if metric_date else date.today()
+                     )
+                     record = HealthRecord(
+-                        patient_id=1,
++                        patient_id=patient_id,
+                         record_type='lab_test',
+                         record_date=record_date,
+                         source='ocr',
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+new file mode 100644
+index 0000000..47980e0
+--- /dev/null
++++ b/tests/test_auth.py
+@@ -0,0 +1,160 @@
++"""Registration, login and session handling for open, multi-user signup.
++
++Every tester gets their own account with email + password (no invite code) and
++exactly one Patient row created at registration — see app/api/auth.py. These
++tests exercise the endpoints exactly as the frontend calls them: through
++TestClient, cookies and all, not by calling the auth helpers directly, since
++the whole point of this feature is what happens at the HTTP boundary (a wrong
++password must not authenticate, a missing cookie must not authorize, and so
++on).
++
++The app falls back to a persistent SQLite file when DATABASE_URL is not set
++(see app/database/models.py) — there is no per-test reset — so every test
++here uses a fresh, randomly generated email rather than a fixed one, to stay
++correct however many times the suite has already run against that file.
++"""
++import uuid
++
++import pytest
++from fastapi.testclient import TestClient
++
++from app.auth import dependencies as auth_dependencies
++from app.config import settings
++from app.main import app
++
++
++def _email() -> str:
++    return f"tester-{uuid.uuid4().hex[:12]}@example.com"
++
++
++@pytest.fixture
++def client():
++    return TestClient(app)
++
++
++@pytest.fixture(autouse=True)
++def unguarded(monkeypatch):
++    # Same reasoning as test_proxy_secret.py: PROXY_SHARED_SECRET is unset by
++    # default, but pin it explicitly so these tests do not depend on that.
++    monkeypatch.setattr(settings, "PROXY_SHARED_SECRET", "")
++
++
++@pytest.fixture(autouse=True)
++def reset_rate_limit():
++    """The register/login limiter (app.auth.dependencies) is a module-level,
++    in-memory bucket keyed by (client ip, bucket) — see check_rate_limit. Every
++    TestClient instance in this process looks like the same IP, so without
++    this the register-heavy tests below would eventually trip the same 429
++    a real abusive script is meant to hit. Clearing it per test keeps each
++    test's own limit accounting independent of how many other tests ran
++    first, in this file or others."""
++    auth_dependencies._attempts.clear()
++    yield
++    auth_dependencies._attempts.clear()
++
++
++def _register(client, email=None, password="a-strong-enough-password", consent=True):
++    return client.post(
++        "/api/auth/register",
++        json={"email": email or _email(), "password": password, "gdpr_consent": consent},
++    )
++
++
++def test_register_creates_a_user_and_its_own_patient(client):
++    email = _email()
++    r = _register(client, email=email)
++
++    assert r.status_code == 201
++    body = r.json()
++    assert body["email"] == email
++    assert isinstance(body["patient_id"], int)
++    # The cookie is what authenticates the rest of the session — registration
++    # logs the new account in immediately, no separate login step needed.
++    assert settings.AUTH_COOKIE_NAME in client.cookies
++
++
++def test_register_without_consent_is_rejected(client):
++    r = _register(client, consent=False)
++    assert r.status_code == 422
++
++
++def test_register_rejects_a_short_password(client):
++    r = _register(client, password="short1")
++    assert r.status_code == 422
++
++
++def test_duplicate_email_is_rejected(client):
++    email = _email()
++    first = _register(client, email=email)
++    assert first.status_code == 201
++
++    second_client = TestClient(app)
++    second = _register(second_client, email=email)
++    assert second.status_code == 409
++
++
++def test_login_with_correct_password_succeeds(client):
++    email = _email()
++    password = "correct-horse-battery-staple"
++    _register(client, email=email, password=password)
++
++    fresh = TestClient(app)
++    r = fresh.post("/api/auth/login", json={"email": email, "password": password})
++
++    assert r.status_code == 200
++    assert r.json()["email"] == email
++    assert settings.AUTH_COOKIE_NAME in fresh.cookies
++
++
++def test_login_with_wrong_password_is_rejected(client):
++    email = _email()
++    _register(client, email=email, password="the-real-password-123")
++
++    fresh = TestClient(app)
++    r = fresh.post("/api/auth/login", json={"email": email, "password": "not-the-right-one"})
++
++    assert r.status_code == 401
++    assert settings.AUTH_COOKIE_NAME not in fresh.cookies
++
++
++def test_login_with_unknown_email_is_the_same_401_as_wrong_password(client):
++    """Distinguishing the two would turn login into an account-existence oracle."""
++    r = client.post(
++        "/api/auth/login",
++        json={"email": _email(), "password": "whatever-it-is"},
++    )
++    assert r.status_code == 401
++
++
++def test_me_without_a_session_is_401(client):
++    r = client.get("/api/auth/me")
++    assert r.status_code == 401
++
++
++def test_me_with_a_session_returns_the_logged_in_account(client):
++    email = _email()
++    _register(client, email=email)
++
++    r = client.get("/api/auth/me")
++
++    assert r.status_code == 200
++    assert r.json()["email"] == email
++
++
++def test_logout_clears_the_session(client):
++    _register(client)
++    assert client.get("/api/auth/me").status_code == 200
++
++    logout = client.post("/api/auth/logout")
++    assert logout.status_code == 200
++
++    # TestClient keeps whatever cookie the Set-Cookie header on /logout leaves
++    # behind, so the follow-up request is what actually proves the session is
++    # gone rather than just inspecting the response headers.
++    assert client.get("/api/auth/me").status_code == 401
++
++
++def test_a_scoped_endpoint_requires_login_not_just_a_running_server(client):
++    """Every data endpoint depends on get_current_patient_id — spot-check one."""
++    r = client.get("/api/manual/family")
++    assert r.status_code == 401
+diff --git a/tests/test_chat_context.py b/tests/test_chat_context.py
+index 54c5309..5d83303 100644
+--- a/tests/test_chat_context.py
++++ b/tests/test_chat_context.py
+@@ -16,6 +16,7 @@ import pytest
+ from app.analysis import chat_context
+ 
+ TODAY = date.today()
++PATIENT_ID = 1
+ 
+ DOCUMENTS = [
+     {"filename": "kardio-marec.pdf", "type": "lab_report", "date": "2026-03-14",
+@@ -113,7 +114,8 @@ def stub_sources(monkeypatch, rows):
+     test stay real, including the thresholds shared with HealthMetricsAnalyzer.
+     """
+     class _TrendAnalyzer:
+-        def __init__(self):
++        def __init__(self, patient_id):
++            self.patient_id = patient_id
+             self.data = _frame(rows)
+ 
+         def analyze_trends(self):
+@@ -129,11 +131,11 @@ def stub_sources(monkeypatch, rows):
+ 
+     monkeypatch.setattr(chat_context, "TrendAnalyzer", _TrendAnalyzer)
+     monkeypatch.setattr(chat_context, "get_session", lambda: _Session())
+-    monkeypatch.setattr(chat_context, "document_inventory", lambda: list(DOCUMENTS))
++    monkeypatch.setattr(chat_context, "document_inventory", lambda patient_id: list(DOCUMENTS))
+     monkeypatch.setattr(chat_context, "search_documents",
+-                        lambda q, limit=5: list(PASSAGES) if q else [])
++                        lambda q, patient_id, limit=5: list(PASSAGES) if q else [])
+     # the ML predictor loads its own view of the data; not what these cover
+-    monkeypatch.setattr(chat_context, "_risks", lambda: {})
++    monkeypatch.setattr(chat_context, "_risks", lambda patient_id: {})
+ 
+ 
+ @pytest.mark.parametrize("metric,value,expected", [
+@@ -150,7 +152,7 @@ def test_split_value(metric, value, expected):
+ 
+ 
+ def test_inventory_counts_every_source_and_splits_blood_pressure():
+-    inventory = chat_context.build_health_context()["inventory"]
++    inventory = chat_context.build_health_context(PATIENT_ID)["inventory"]
+ 
+     # 12 heart rate + 1 glucose + blood pressure as two series; the undated row drops
+     assert inventory["total_rows"] == 15
+@@ -161,7 +163,7 @@ def test_inventory_counts_every_source_and_splits_blood_pressure():
+ 
+ 
+ def test_latest_value_carries_date_and_status():
+-    by_metric = chat_context.build_health_context()["inventory"]["by_metric"]
++    by_metric = chat_context.build_health_context(PATIENT_ID)["inventory"]["by_metric"]
+ 
+     glucose = by_metric["glucose"]
+     assert glucose["latest_value"] == 7.4
+@@ -171,7 +173,7 @@ def test_latest_value_carries_date_and_status():
+ 
+ 
+ def test_recent_window_aggregates_per_day_and_excludes_older_values():
+-    recent = chat_context.build_health_context(recent_days=30)["recent"]
++    recent = chat_context.build_health_context(PATIENT_ID, recent_days=30)["recent"]
+ 
+     assert len(recent["heart_rate"]) == 3
+     day = recent["heart_rate"][0]
+@@ -182,20 +184,20 @@ def test_recent_window_aggregates_per_day_and_excludes_older_values():
+ 
+ 
+ def test_trends_drop_errors_and_the_full_series():
+-    trends = chat_context.build_health_context()["trends"]
++    trends = chat_context.build_health_context(PATIENT_ID)["trends"]
+ 
+     assert "values_over_time" not in trends["heart_rate"]
+     assert "glucose" not in trends, "entries carrying an error are not trends"
+ 
+ 
+ def test_patient_age_is_derived_from_date_of_birth():
+-    assert chat_context.build_health_context()["patient"]["age"] == (
++    assert chat_context.build_health_context(PATIENT_ID)["patient"]["age"] == (
+         TODAY.year - 1985 - ((TODAY.month, TODAY.day) < (4, 12))
+     )
+ 
+ 
+ def test_rendered_context_holds_what_the_model_needs():
+-    text = chat_context.format_health_context(chat_context.build_health_context())
++    text = chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID))
+ 
+     assert "DNEŠNÝ DÁTUM" in text
+     assert "RODINNÁ ANAMNÉZA" in text and "hypertenzia" in text
+@@ -206,7 +208,7 @@ def test_rendered_context_holds_what_the_model_needs():
+ def test_empty_window_reports_the_latest_values_instead_of_no_data():
+     """The exact case that produced "v systéme nie sú zaznamenané žiadne merania"."""
+     text = chat_context.format_health_context(
+-        chat_context.build_health_context(recent_days=0))
++        chat_context.build_health_context(PATIENT_ID, recent_days=0))
+ 
+     assert "Za toto obdobie nie sú žiadne merania" in text
+     assert "NAJNOVŠIA HODNOTA KAŽDEJ METRIKY" in text
+@@ -214,7 +216,7 @@ def test_empty_window_reports_the_latest_values_instead_of_no_data():
+ 
+ 
+ def test_documents_are_listed_and_passages_retrieved_for_a_question():
+-    context = chat_context.build_health_context(question="čo písal kardiológ?")
++    context = chat_context.build_health_context(PATIENT_ID, question="čo písal kardiológ?")
+     text = chat_context.format_health_context(context)
+ 
+     assert context["documents"]["passages"], "a question must trigger retrieval"
+@@ -248,7 +250,7 @@ def test_a_crowded_profile_does_not_push_the_passages_out(monkeypatch, rows):
+     monkeypatch.setattr(chat_context, "TrendAnalyzer", _Crowded)
+ 
+     text = chat_context.format_health_context(
+-        chat_context.build_health_context(question="aké som mal operácie?"))
++        chat_context.build_health_context(PATIENT_ID, question="aké som mal operácie?"))
+ 
+     assert "kontext skrátený" in text, "this profile has to overflow the cap"
+     assert len(text) <= chat_context.MAX_CONTEXT_CHARS + 40
+@@ -259,7 +261,7 @@ def test_a_crowded_profile_does_not_push_the_passages_out(monkeypatch, rows):
+ 
+ def test_passages_sit_above_the_section_the_size_cap_trims():
+     text = chat_context.format_health_context(
+-        chat_context.build_health_context(question="kardiológ"))
++        chat_context.build_health_context(PATIENT_ID, question="kardiológ"))
+ 
+     assert text.index("RELEVANTNÉ ÚRYVKY") < text.index("MERANIA ZA POSLEDNÝCH")
+ 
+@@ -272,9 +274,9 @@ def test_no_stored_documents_says_so_instead_of_implying_the_card_is_readable(mo
+     about operations as if the card simply did not mention any. The extractor
+     only ever kept the numbers; the text around them was discarded.
+     """
+-    monkeypatch.setattr(chat_context, "document_inventory", list)
++    monkeypatch.setattr(chat_context, "document_inventory", lambda patient_id: [])
+ 
+-    text = chat_context.format_health_context(chat_context.build_health_context())
++    text = chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID))
+ 
+     assert "NAHRANÉ LEKÁRSKE DOKUMENTY (0)" in text
+     assert "operácie" in text
+@@ -283,7 +285,7 @@ def test_no_stored_documents_says_so_instead_of_implying_the_card_is_readable(mo
+ 
+ 
+ def test_without_a_question_there_is_an_inventory_but_no_retrieval():
+-    text = chat_context.format_health_context(chat_context.build_health_context())
++    text = chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID))
+ 
+     assert "NAHRANÉ LEKÁRSKE DOKUMENTY" in text
+     assert "RELEVANTNÉ ÚRYVKY" not in text
+@@ -292,8 +294,8 @@ def test_without_a_question_there_is_an_inventory_but_no_retrieval():
+ def test_nothing_stored_renders_empty_so_the_caller_can_fall_back(monkeypatch, rows):
+     """chat.py falls back to a client snapshot only when this is empty."""
+     rows.clear()
+-    monkeypatch.setattr(chat_context, "document_inventory", list)
+-    monkeypatch.setattr(chat_context, "search_documents", lambda q, limit=5: [])
+-    monkeypatch.setattr(chat_context, "_family", list)
++    monkeypatch.setattr(chat_context, "document_inventory", lambda patient_id: [])
++    monkeypatch.setattr(chat_context, "search_documents", lambda q, patient_id, limit=5: [])
++    monkeypatch.setattr(chat_context, "_family", lambda patient_id: [])
+ 
+-    assert chat_context.format_health_context(chat_context.build_health_context()) == ""
++    assert chat_context.format_health_context(chat_context.build_health_context(PATIENT_ID)) == ""
+diff --git a/tests/test_chat_history.py b/tests/test_chat_history.py
+index 2a29bf6..e0a3f38 100644
+--- a/tests/test_chat_history.py
++++ b/tests/test_chat_history.py
+@@ -12,6 +12,8 @@ import pytest
+ 
+ from app.api import chat as chat_api
+ 
++PATIENT_ID = 1
++
+ 
+ class _Row:
+     def __init__(self, role, content, created_at):
+@@ -28,6 +30,13 @@ class _Query:
+         self.saved = saved
+         self._limit = None
+ 
++    def filter(self, *args):
++        # The mock's rows are already scoped to one patient — the real
++        # `.filter(ChatMessage.patient_id == patient_id)` clause has nothing
++        # further to narrow here, so this is a no-op that keeps the chain
++        # shaped like the real query.
++        return self
++
+     def order_by(self, *args):
+         return self
+ 
+@@ -51,8 +60,6 @@ class _Session:
+         self.committed = False
+ 
+     def query(self, model):
+-        if model is chat_api.Patient:
+-            return _Query([], self.saved)
+         return _Query(self.rows, self.saved)
+ 
+     def add(self, row):
+@@ -88,7 +95,7 @@ def session(monkeypatch, stored, saved):
+ 
+ 
+ def test_history_comes_back_oldest_first_in_message_shape():
+-    history = chat_api.load_history()
++    history = chat_api.load_history(PATIENT_ID)
+ 
+     assert [m["role"] for m in history] == ["user", "assistant"]
+     assert history[0]["content"].startswith("aké mám hodnoty")
+@@ -98,7 +105,7 @@ def test_history_comes_back_oldest_first_in_message_shape():
+ def test_the_history_endpoint_keeps_timestamps_and_the_whole_answer(stored):
+     stored[1].content = "x" * 5000
+ 
+-    history = chat_api.load_history(limit=50, full=True)
++    history = chat_api.load_history(PATIENT_ID, limit=50, full=True)
+ 
+     assert history[1]["content"] == "x" * 5000
+     assert history[1]["created_at"] == "2026-09-11T14:00:08"
+@@ -107,7 +114,7 @@ def test_the_history_endpoint_keeps_timestamps_and_the_whole_answer(stored):
+ def test_a_long_answer_is_trimmed_before_it_is_replayed(stored):
+     stored[1].content = "x" * 5000
+ 
+-    replayed = chat_api.load_history()[1]["content"]
++    replayed = chat_api.load_history(PATIENT_ID)[1]["content"]
+ 
+     assert len(replayed) <= chat_api.MAX_REPLAYED_CHARS + 10
+     assert replayed.endswith("[…]")
+@@ -118,7 +125,7 @@ def test_only_the_last_turns_are_replayed(stored):
+     for index in range(20):
+         stored.append(_Row("user", f"otázka {index}", base + timedelta(minutes=index)))
+ 
+-    assert len(chat_api.load_history()) == chat_api.MAX_HISTORY_TURNS
++    assert len(chat_api.load_history(PATIENT_ID)) == chat_api.MAX_HISTORY_TURNS
+ 
+ 
+ def test_a_broken_database_costs_the_memory_not_the_answer(monkeypatch):
+@@ -127,11 +134,11 @@ def test_a_broken_database_costs_the_memory_not_the_answer(monkeypatch):
+ 
+     monkeypatch.setattr(chat_api, "get_session", _boom)
+ 
+-    assert chat_api.load_history() == []
++    assert chat_api.load_history(PATIENT_ID) == []
+ 
+ 
+ def test_both_sides_of_the_turn_are_saved(saved):
+-    chat_api._save_turn("aké som mal operácie?", "Orchiopexia, 27. 1. 1993.")
++    chat_api._save_turn(PATIENT_ID, "aké som mal operácie?", "Orchiopexia, 27. 1. 1993.")
+ 
+     assert [row.role for row in saved] == ["user", "assistant"]
+     assert saved[0].content == "aké som mal operácie?"
+@@ -154,7 +161,9 @@ def test_earlier_turns_are_sent_ahead_of_the_question():
+ 
+     client = _Client()
+ 
+-    chat_api._ask_claude(client, "system", "a čo tie lieky?", chat_api.load_history())
++    chat_api._ask_claude(
++        client, "system", "a čo tie lieky?", chat_api.load_history(PATIENT_ID), patient_id=PATIENT_ID
++    )
+ 
+     sent = client.calls[0]["messages"]
+     assert len(sent) == 3
+diff --git a/tests/test_empty_data_shapes.py b/tests/test_empty_data_shapes.py
+index 2a16c44..3f5dea3 100644
+--- a/tests/test_empty_data_shapes.py
++++ b/tests/test_empty_data_shapes.py
+@@ -41,6 +41,7 @@ def test_summary_keeps_full_shape(empty_metrics):
+ 
+ def test_trends_is_empty_mapping():
+     a = TrendAnalyzer.__new__(TrendAnalyzer)
++    a.patient_id = 1
+     a.data = pd.DataFrame()
+     result = a.analyze_trends()
+     assert result == {}
+@@ -49,6 +50,7 @@ def test_trends_is_empty_mapping():
+ 
+ def test_risks_keep_full_shape(monkeypatch):
+     p = RiskPredictor.__new__(RiskPredictor)
++    p.patient_id = 1
+     p.data = pd.DataFrame()
+     monkeypatch.setattr(p, "refresh", lambda: None)
+     risks = p.predict_risks()
+diff --git a/tests/test_multi_tenant_isolation.py b/tests/test_multi_tenant_isolation.py
+new file mode 100644
+index 0000000..897bd32
+--- /dev/null
++++ b/tests/test_multi_tenant_isolation.py
+@@ -0,0 +1,200 @@
++"""Používateľ A nikdy nesmie vidieť (ani zmazať) dáta používateľa B.
++
++This is the one property the whole multi-user-auth change exists to
++guarantee. Everything else in this branch — the User/Patient split, threading
++patient_id through every analyzer and cache, filtering every query by it — is
++in service of this single invariant, so it gets its own end-to-end test file
++rather than living as an assertion inside test_auth.py.
++
++Two independently registered accounts (two separate TestClient instances, so
++each keeps its own session cookie) exercise every data-owning router that
++went through this migration: manual entries, family history, nutrition,
++uploaded-document history and Apple Health. For each, B is checked twice —
++once through the normal list endpoint (B must not see A's row at all) and
++once through the id-based endpoints (B must not be able to read or delete
++A's row by guessing/reusing its id — the IDOR class of bug this branch also
++fixed on the way).
++
++Same caveat as test_auth.py: no per-test database reset, so every account
++uses a freshly generated email.
++"""
++import uuid
++
++import pytest
++from fastapi.testclient import TestClient
++
++from app.auth import dependencies as auth_dependencies
++from app.config import settings
++from app.main import app
++
++
++def _email() -> str:
++    return f"isolation-{uuid.uuid4().hex[:12]}@example.com"
++
++
++@pytest.fixture(autouse=True)
++def unguarded(monkeypatch):
++    monkeypatch.setattr(settings, "PROXY_SHARED_SECRET", "")
++
++
++@pytest.fixture(autouse=True)
++def reset_rate_limit():
++    auth_dependencies._attempts.clear()
++    yield
++    auth_dependencies._attempts.clear()
++
++
++@pytest.fixture
++def user_a():
++    client = TestClient(app)
++    r = client.post(
++        "/api/auth/register",
++        json={"email": _email(), "password": "patient-a-password-1", "gdpr_consent": True},
++    )
++    assert r.status_code == 201
++    return client, r.json()["patient_id"]
++
++
++@pytest.fixture
++def user_b():
++    client = TestClient(app)
++    r = client.post(
++        "/api/auth/register",
++        json={"email": _email(), "password": "patient-b-password-1", "gdpr_consent": True},
++    )
++    assert r.status_code == 201
++    return client, r.json()["patient_id"]
++
++
++def test_two_registrations_get_two_distinct_patient_ids(user_a, user_b):
++    _, patient_id_a = user_a
++    _, patient_id_b = user_b
++    assert patient_id_a != patient_id_b
++
++
++def test_health_records_are_not_shared_and_not_deletable_across_accounts(user_a, user_b):
++    client_a, _ = user_a
++    client_b, _ = user_b
++
++    created = client_a.post(
++        "/api/manual/health-record",
++        json={"record_date": "2026-01-15", "metric_type": "glucose", "value": "5.4"},
++    )
++    assert created.status_code == 200
++    record_id = created.json()["id"]
++
++    # B's own list must not contain A's record.
++    listed_by_b = client_b.get("/api/manual/health-records").json()
++    assert all(r["id"] != record_id for r in listed_by_b)
++
++    # A does see it.
++    listed_by_a = client_a.get("/api/manual/health-records").json()
++    assert any(r["id"] == record_id for r in listed_by_a)
++
++    # B cannot delete it by id (IDOR) — this must 404, not succeed.
++    delete_attempt = client_b.delete(f"/api/manual/health-record/{record_id}")
++    assert delete_attempt.status_code == 404
++
++    # And it must still be there for A afterwards.
++    still_there = client_a.get("/api/manual/health-records").json()
++    assert any(r["id"] == record_id for r in still_there)
++
++
++def test_family_members_are_not_shared_and_not_editable_across_accounts(user_a, user_b):
++    client_a, _ = user_a
++    client_b, _ = user_b
++
++    created = client_a.post(
++        "/api/manual/family",
++        json={
++            "first_name": "Anna",
++            "last_name": "Testovacia",
++            "relationship_type": "mother",
++            "gender": "F",
++        },
++    )
++    assert created.status_code == 200
++    member_id = created.json()["id"]
++
++    listed_by_b = client_b.get("/api/manual/family").json()
++    assert all(m["id"] != member_id for m in listed_by_b)
++
++    listed_by_a = client_a.get("/api/manual/family").json()
++    assert any(m["id"] == member_id for m in listed_by_a)
++
++    # B cannot edit A's family member by id (IDOR).
++    edit_attempt = client_b.put(
++        f"/api/manual/family/{member_id}", json={"first_name": "Hijacked"}
++    )
++    assert edit_attempt.status_code == 404
++
++    # B cannot delete it either.
++    delete_attempt = client_b.delete(f"/api/manual/family/{member_id}")
++    assert delete_attempt.status_code == 404
++
++    # Untouched for A.
++    still_there = client_a.get("/api/manual/family").json()
++    matching = [m for m in still_there if m["id"] == member_id]
++    assert matching and matching[0]["first_name"] == "Anna"
++
++
++def test_patient_profile_updates_do_not_cross_accounts(user_a, user_b):
++    client_a, _ = user_a
++    client_b, _ = user_b
++
++    update = client_a.put("/api/manual/patient", json={"first_name": "PacientA"})
++    assert update.status_code == 200
++
++    profile_a = client_a.get("/api/manual/patient").json()
++    profile_b = client_b.get("/api/manual/patient").json()
++
++    assert profile_a["first_name"] == "PacientA"
++    assert profile_b["first_name"] != "PacientA"
++    assert profile_a["id"] != profile_b["id"]
++
++
++def test_nutrition_entries_are_not_shared(user_a, user_b):
++    client_a, _ = user_a
++    client_b, _ = user_b
++
++    created = client_a.post(
++        "/api/nutrition/entries",
++        json={
++            "items": [],
++            "total_calories": 500,
++            "total_protein_g": 20,
++            "total_carbs_g": 60,
++            "total_fat_g": 15,
++        },
++    )
++    assert created.status_code == 200
++    entry_id = created.json()["id"]
++
++    entries_b = client_b.get("/api/nutrition/entries").json()
++    assert all(e["id"] != entry_id for e in entries_b)
++
++    entries_a = client_a.get("/api/nutrition/entries").json()
++    assert any(e["id"] == entry_id for e in entries_a)
++
++
++def test_every_scoped_router_rejects_an_unauthenticated_request():
++    """Spot-check across routers: none of this isolation matters if a router
++    forgot to require login in the first place."""
++    anon = TestClient(app)
++    get_paths = [
++        "/api/manual/family",
++        "/api/manual/health-records",
++        "/api/nutrition/entries",
++        "/api/analysis/summary",
++        "/api/predictions/risks",
++        "/api/upload/history",
++        "/api/apple-health/stats",
++    ]
++    for path in get_paths:
++        response = anon.get(path)
++        assert response.status_code == 401, f"GET {path} must require login, got {response.status_code}"
++
++    chat_response = anon.post("/api/chat/ask", json={"question": "ahoj"})
++    assert chat_response.status_code == 401, (
++        f"POST /api/chat/ask must require login, got {chat_response.status_code}"
++    )
+diff --git a/tests/test_rag.py b/tests/test_rag.py
+index 8613c97..2eea0ba 100644
+--- a/tests/test_rag.py
++++ b/tests/test_rag.py
+@@ -9,6 +9,8 @@ import pytest
+ 
+ from app.rag import retriever
+ 
++PATIENT_ID = 1
++
+ FIXTURES = [
+     ("kardio-marec.pdf", "2026-03-14",
+      "Záver kardiológa: ľahká hypertenzia. Odporúčam Prestarium 5 mg denne "
+@@ -35,7 +37,7 @@ def _indexed(filename, document_date, text, position=0):
+ @pytest.fixture
+ def corpus(monkeypatch):
+     """Index the fixtures instead of reading the database."""
+-    def _load(chunks=None):
++    def _load(patient_id=None):
+         return [_indexed(name, date, text, i)
+                 for i, (name, date, text) in enumerate(FIXTURES)]
+ 
+@@ -88,7 +90,7 @@ def test_paragraphs_are_packed_without_losing_any():
+ 
+ 
+ def test_an_inflected_question_matches_the_report(corpus):
+-    hits = retriever.search("aký mám cholesterol?")
++    hits = retriever.search("aký mám cholesterol?", PATIENT_ID)
+ 
+     assert hits[0]["document"] == "labak-jun.pdf"
+     assert hits[0]["date"] == "2026-06-02"
+@@ -96,45 +98,62 @@ def test_an_inflected_question_matches_the_report(corpus):
+ 
+ 
+ def test_free_text_question_structured_metrics_cannot_answer(corpus):
+-    hits = retriever.search("čo písal kardiológ a aké lieky mi predpísal?")
++    hits = retriever.search("čo písal kardiológ a aké lieky mi predpísal?", PATIENT_ID)
+ 
+     assert hits[0]["document"] == "kardio-marec.pdf"
+     assert "Prestarium" in hits[0]["text"]
+ 
+ 
+ def test_query_without_diacritics_still_lands(corpus):
+-    assert retriever.search("ejekcna frakcia lavej komory")[0]["chunk_index"] == 1
++    assert retriever.search("ejekcna frakcia lavej komory", PATIENT_ID)[0]["chunk_index"] == 1
+ 
+ 
+ @pytest.mark.parametrize("query", ["ahoj", "", "a to je"])
+ def test_a_query_with_nothing_to_match_returns_nothing(corpus, query):
+-    assert retriever.search(query) == []
++    assert retriever.search(query, PATIENT_ID) == []
+ 
+ 
+ def test_results_are_ranked_and_scored(corpus):
+-    hits = retriever.search("cholesterol LDL diéta", limit=4)
++    hits = retriever.search("cholesterol LDL diéta", PATIENT_ID, limit=4)
+ 
+     assert hits == sorted(hits, key=lambda h: h["score"], reverse=True)
+     assert all(hit["score"] > 0 for hit in hits)
+ 
+ 
+ def test_limit_is_honoured(corpus):
+-    assert len(retriever.search("kontrola", limit=1)) == 1
++    assert len(retriever.search("kontrola", PATIENT_ID, limit=1)) == 1
+ 
+ 
+ def test_a_long_passage_is_capped(monkeypatch):
+     monkeypatch.setattr(retriever, "_load_chunks",
+-                        lambda: [_indexed("velky.pdf", None, "kontrola " * 300)])
++                        lambda patient_id: [_indexed("velky.pdf", None, "kontrola " * 300)])
+     retriever.invalidate_cache()
+ 
+-    hit = retriever.search("kontrola")[0]
++    hit = retriever.search("kontrola", PATIENT_ID)[0]
+ 
+     assert len(hit["text"]) <= retriever.MAX_PASSAGE_CHARS + 10
+     assert hit["text"].endswith("[…]")
+ 
+ 
+ def test_an_empty_corpus_is_a_normal_state(monkeypatch):
+-    monkeypatch.setattr(retriever, "_load_chunks", list)
++    monkeypatch.setattr(retriever, "_load_chunks", lambda patient_id: [])
++    retriever.invalidate_cache()
++
++    assert retriever.search("cholesterol", PATIENT_ID) == []
++
++
++def test_two_patients_never_share_the_cached_index(monkeypatch):
++    """The BM25 index is cached per patient_id — see _get_index — so one
++    patient's documents must never answer another patient's search."""
++    corpora = {
++        1: [_indexed("a-only.pdf", "2026-01-01", "jedinečné slovo alfa")],
++        2: [_indexed("b-only.pdf", "2026-01-01", "jedinečné slovo beta")],
++    }
++    monkeypatch.setattr(retriever, "_load_chunks", lambda patient_id: corpora[patient_id])
+     retriever.invalidate_cache()
+ 
+-    assert retriever.search("cholesterol") == []
++    hits_a = retriever.search("alfa", 1)
++    hits_b = retriever.search("alfa", 2)
++
++    assert hits_a and hits_a[0]["document"] == "a-only.pdf"
++    assert hits_b == [], "patient 2 has no document containing 'alfa'"
+diff --git a/tests/test_sources.py b/tests/test_sources.py
+index 1c83f74..535253d 100644
+--- a/tests/test_sources.py
++++ b/tests/test_sources.py
+@@ -13,9 +13,10 @@ from app.analysis.sources import APPLE_TO_METRIC, load_all_measurements
+ def test_both_analyzers_use_the_shared_loader():
+     for module in (health_metrics, trend_analyzer):
+         src = inspect.getsource(module)
+-        assert "load_all_measurements()" in src, (
++        assert "load_all_measurements(self.patient_id)" in src, (
+             f"{module.__name__} must load measurements through the shared loader, "
+-            "otherwise the two can drift on which tables they read"
++            "scoped to its own patient_id, otherwise the two can drift on which "
++            "tables they read or leak another patient's rows"
+         )
+ 
+ 
+@@ -32,4 +33,4 @@ def test_blood_pressure_is_mapped_from_both_halves():
+ 
+ 
+ def test_loader_returns_a_list_on_empty_database():
+-    assert isinstance(load_all_measurements(), list)
++    assert isinstance(load_all_measurements(1), list)
+diff --git a/tests/test_tools.py b/tests/test_tools.py
+index be4331e..635481b 100644
+--- a/tests/test_tools.py
++++ b/tests/test_tools.py
+@@ -33,19 +33,22 @@ def _rows():
+     return rows
+ 
+ 
++PATIENT_ID = 1
++
++
+ @pytest.fixture(autouse=True)
+ def measurements(monkeypatch):
+     frame = pd.DataFrame(_rows())
+     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+     monkeypatch.setattr(
+         chat_context, "TrendAnalyzer",
+-        lambda: SimpleNamespace(data=frame, analyze_trends=dict),
++        lambda patient_id: SimpleNamespace(data=frame, analyze_trends=dict),
+     )
+     return frame
+ 
+ 
+ def test_history_lists_every_measurement_day_by_day():
+-    history = chat_context.metric_history("weight")
++    history = chat_context.metric_history("weight", PATIENT_ID)
+ 
+     assert history["granularity"] == "daily"
+     assert history["measurements"] == len(range(0, 800, 7))
+@@ -55,7 +58,7 @@ def test_history_lists_every_measurement_day_by_day():
+ 
+ def test_a_long_range_collapses_to_months_instead_of_being_cut_off():
+     """A truncated series would silently hide half the period it claims to cover."""
+-    history = chat_context.metric_history("weight", max_points=20)
++    history = chat_context.metric_history("weight", PATIENT_ID, max_points=20)
+ 
+     assert history["granularity"] == "monthly"
+     assert len(history["points"]) <= 20
+@@ -65,7 +68,7 @@ def test_a_long_range_collapses_to_months_instead_of_being_cut_off():
+ def test_dates_narrow_the_series():
+     since = (TODAY - timedelta(days=30)).isoformat()
+ 
+-    history = chat_context.metric_history("weight", start_date=since)
++    history = chat_context.metric_history("weight", PATIENT_ID, start_date=since)
+ 
+     assert history["measurements"] < len(range(0, 800, 7))
+     assert all(point["period"] >= since for point in history["points"])
+@@ -73,7 +76,7 @@ def test_dates_narrow_the_series():
+ 
+ def test_an_unknown_metric_says_what_does_exist():
+     """Better than an empty result: the model can retry with a real name."""
+-    history = chat_context.metric_history("ldl")
++    history = chat_context.metric_history("ldl", PATIENT_ID)
+ 
+     assert history["points"] == []
+     assert {"weight", "glucose"} <= set(history["available_metrics"])
+@@ -81,16 +84,18 @@ def test_an_unknown_metric_says_what_does_exist():
+ 
+ @pytest.mark.parametrize("metric", ["weight", "WEIGHT", " Weight "])
+ def test_metric_names_are_matched_loosely(metric):
+-    assert chat_context.metric_history(metric)["measurements"] > 0
++    assert chat_context.metric_history(metric, PATIENT_ID)["measurements"] > 0
+ 
+ 
+ def test_an_unparseable_date_is_ignored_rather_than_fatal():
+-    assert chat_context.metric_history("weight", start_date="minulý rok")[
++    assert chat_context.metric_history("weight", PATIENT_ID, start_date="minulý rok")[
+         "measurements"] > 0
+ 
+ 
+ def test_history_tool_returns_json():
+-    payload = json.loads(chat_tools.run_tool("get_metric_history", {"metric": "weight"}))
++    payload = json.loads(
++        chat_tools.run_tool("get_metric_history", {"metric": "weight"}, PATIENT_ID)
++    )
+ 
+     assert payload["points"]
+     assert payload["metric"] == "weight"
+@@ -99,32 +104,37 @@ def test_history_tool_returns_json():
+ def test_search_tool_clamps_the_limit_and_caps_the_text(monkeypatch):
+     seen = {}
+ 
+-    def _search(query, limit=5):
++    def _search(query, patient_id, limit=5):
+         seen["limit"] = limit
++        seen["patient_id"] = patient_id
+         return [{"document": "kardio.pdf", "date": "2026-03-14", "chunk_index": 0,
+                  "score": 1.2, "text": "Záver: " + "x" * 6000}]
+ 
+     monkeypatch.setattr(chat_tools, "search_documents", _search)
+ 
+     payload = json.loads(
+-        chat_tools.run_tool("search_documents", {"query": "kardiológ", "limit": 99}))
++        chat_tools.run_tool(
++            "search_documents", {"query": "kardiológ", "limit": 99}, PATIENT_ID
++        )
++    )
+ 
+     assert seen["limit"] == 8
++    assert seen["patient_id"] == PATIENT_ID
+     assert len(payload["results"][0]["text"]) <= chat_tools.MAX_DOCUMENT_CHARS + 10
+ 
+ 
+ def test_an_unknown_tool_is_reported_not_raised():
+-    assert "Neznámy nástroj" in chat_tools.run_tool("drop_table", {})
++    assert "Neznámy nástroj" in chat_tools.run_tool("drop_table", {}, PATIENT_ID)
+ 
+ 
+ def test_a_failing_tool_is_reported_not_raised(monkeypatch):
+     """The model can say what it could not look up; a 500 loses the whole answer."""
+-    def _boom(payload):
++    def _boom(payload, patient_id):
+         raise RuntimeError("nope")
+ 
+     monkeypatch.setitem(chat_tools._HANDLERS, "boom", _boom)
+ 
+-    assert "Nástroj zlyhal" in chat_tools.run_tool("boom", {})
++    assert "Nástroj zlyhal" in chat_tools.run_tool("boom", {}, PATIENT_ID)
+ 
+ 
+ class _Block(dict):
+@@ -160,7 +170,7 @@ class _ScriptedClient:
+ def test_a_question_needing_no_lookup_costs_one_round_trip():
+     client = _ScriptedClient([_text_turn("Priama odpoveď.")])
+ 
+-    assert chat_api._ask_claude(client, "system", "otázka") == "Priama odpoveď."
++    assert chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID) == "Priama odpoveď."
+     assert len(client.calls) == 1
+ 
+ 
+@@ -170,7 +180,7 @@ def test_a_tool_result_is_fed_back_and_the_answer_returned():
+         _text_turn("Vaša váha je stabilná."),
+     ])
+ 
+-    answer = chat_api._ask_claude(client, "system", "otázka")
++    answer = chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID)
+ 
+     assert answer == "Vaša váha je stabilná."
+     assert "tools" in client.calls[0]
+@@ -189,7 +199,7 @@ def test_the_tool_budget_ends_in_an_answer_not_an_empty_turn():
+         + [_text_turn("Odpoveď z toho, čo mám.")]
+     )
+ 
+-    answer = chat_api._ask_claude(client, "system", "otázka")
++    answer = chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID)
+ 
+     assert answer == "Odpoveď z toho, čo mám."
+     assert len(client.calls) == chat_tools.MAX_TOOL_ROUNDS + 1
+@@ -199,4 +209,4 @@ def test_the_tool_budget_ends_in_an_answer_not_an_empty_turn():
+ def test_an_empty_reply_never_reaches_the_patient():
+     client = _ScriptedClient([_text_turn("   ")])
+ 
+-    assert chat_api._ask_claude(client, "system", "otázka").startswith("Prepáčte")
++    assert chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID).startswith("Prepáčte")
+diff --git a/tests/test_trend_cache.py b/tests/test_trend_cache.py
+index 2ae2130..a333a31 100644
+--- a/tests/test_trend_cache.py
++++ b/tests/test_trend_cache.py
+@@ -1,14 +1,20 @@
+-"""New records must appear in /trends without waiting for a restart.
++"""New records must appear in /trends without waiting for a restart, and one
++patient's cached data must never leak into another patient's request.
+ 
+ The TTL check lived in __init__ while the router held one module-level
+ analyzer, so self.data was frozen for the life of the process. Writes also
+-only invalidated the cache from the document-upload path.
++only invalidated the cache from the document-upload path. The cache is now a
++dict keyed by patient_id (see app/analysis/trend_analyzer.py) rather than a
++single shared slot, since there is more than one patient now.
+ """
+ import pandas as pd
+ import pytest
+ 
+ from app.analysis.trend_analyzer import TrendAnalyzer
+ 
++PATIENT_A = 1
++PATIENT_B = 2
++
+ 
+ @pytest.fixture(autouse=True)
+ def clear_cache():
+@@ -20,30 +26,66 @@ def clear_cache():
+ def test_refresh_picks_up_new_data(monkeypatch):
+     rows = []
+     analyzer = TrendAnalyzer.__new__(TrendAnalyzer)
++    analyzer.patient_id = PATIENT_A
+     monkeypatch.setattr(analyzer, "_load_data", lambda: pd.DataFrame(rows))
+ 
+     analyzer.refresh()
+     assert analyzer.data.empty
+ 
+     rows.append({"metric": "glucose", "value": 5.2, "date": pd.Timestamp("2024-01-01")})
+-    TrendAnalyzer.invalidate_cache()
++    TrendAnalyzer.invalidate_cache(PATIENT_A)
+     analyzer.refresh()
+ 
+     assert len(analyzer.data) == 1
+ 
+ 
+-def test_invalidate_cache_clears_shared_state():
+-    TrendAnalyzer._data_cache = pd.DataFrame([{"metric": "x"}])
+-    TrendAnalyzer._cache_timestamp = pd.Timestamp.now().to_pydatetime()
++def test_invalidate_cache_clears_one_patient_without_touching_others():
++    TrendAnalyzer._data_cache[PATIENT_A] = pd.DataFrame([{"metric": "x"}])
++    TrendAnalyzer._data_cache[PATIENT_B] = pd.DataFrame([{"metric": "y"}])
++    TrendAnalyzer._cache_timestamp[PATIENT_A] = pd.Timestamp.now().to_pydatetime()
++    TrendAnalyzer._cache_timestamp[PATIENT_B] = pd.Timestamp.now().to_pydatetime()
++
++    TrendAnalyzer.invalidate_cache(PATIENT_A)
++
++    assert PATIENT_A not in TrendAnalyzer._data_cache
++    assert PATIENT_A not in TrendAnalyzer._cache_timestamp
++    # Clearing one patient's cache must not evict another's.
++    assert PATIENT_B in TrendAnalyzer._data_cache
++    assert PATIENT_B in TrendAnalyzer._cache_timestamp
++
++
++def test_invalidate_cache_with_no_patient_clears_everyone():
++    TrendAnalyzer._data_cache[PATIENT_A] = pd.DataFrame([{"metric": "x"}])
++    TrendAnalyzer._data_cache[PATIENT_B] = pd.DataFrame([{"metric": "y"}])
++    TrendAnalyzer._cache_timestamp[PATIENT_A] = pd.Timestamp.now().to_pydatetime()
++    TrendAnalyzer._cache_timestamp[PATIENT_B] = pd.Timestamp.now().to_pydatetime()
+ 
+     TrendAnalyzer.invalidate_cache()
+ 
+-    assert TrendAnalyzer._data_cache is None
+-    assert TrendAnalyzer._cache_timestamp is None
++    assert TrendAnalyzer._data_cache == {}
++    assert TrendAnalyzer._cache_timestamp == {}
++
++
++def test_two_patients_never_share_a_cached_frame(monkeypatch):
++    """The whole point of keying by patient_id: A's data must never answer B's request."""
++    frames = {PATIENT_A: pd.DataFrame([{"metric": "a-only"}]),
++              PATIENT_B: pd.DataFrame([{"metric": "b-only"}])}
++
++    def fake_load(self):
++        return frames[self.patient_id]
++
++    monkeypatch.setattr(TrendAnalyzer, "_load_data", fake_load)
++
++    analyzer_a = TrendAnalyzer(PATIENT_A)
++    analyzer_b = TrendAnalyzer(PATIENT_B)
++
++    assert analyzer_a.data["metric"].tolist() == ["a-only"]
++    assert analyzer_b.data["metric"].tolist() == ["b-only"]
+ 
+ 
+ def test_analyze_trends_refreshes(monkeypatch):
+     analyzer = TrendAnalyzer.__new__(TrendAnalyzer)
++    analyzer.patient_id = PATIENT_A
+     calls = []
+ 
+     def fake_refresh():
+-- 
+2.43.0
+
