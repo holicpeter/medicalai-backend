@@ -11,7 +11,7 @@ has no fallback that guesses a patient when the token is missing or invalid.
 import logging
 import time
 from collections import defaultdict, deque
-from typing import Deque, Dict, Tuple
+from typing import Deque, Dict, Optional, Tuple
 
 from fastapi import Depends, HTTPException, Request, Response
 
@@ -22,14 +22,23 @@ from app.database import Patient, User, get_session
 logger = logging.getLogger(__name__)
 
 
+def _bearer_token(request: Request) -> Optional[str]:
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return None
+    return value.strip()
+
+
 def get_current_user(request: Request) -> User:
     """The logged-in user, or 401.
 
-    Reads the JWT from the httpOnly cookie only — never from a header or the
-    request body — so a token cannot be lifted into a script the way a
-    header-based bearer token can be, and no client code has to handle it.
+    The web app sends the JWT in the httpOnly cookie, so page scripts never
+    see it. The native mobile app has no cookie jar worth relying on and keeps
+    the token in the Keychain/Keystore instead, sending it as
+    `Authorization: Bearer <token>` — same token, same signature check. The
+    cookie wins when both are present.
     """
-    token = request.cookies.get(settings.AUTH_COOKIE_NAME)
+    token = request.cookies.get(settings.AUTH_COOKIE_NAME) or _bearer_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="Neprihlásený.")
 

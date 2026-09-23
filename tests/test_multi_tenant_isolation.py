@@ -198,3 +198,29 @@ def test_every_scoped_router_rejects_an_unauthenticated_request():
     assert chat_response.status_code == 401, (
         f"POST /api/chat/ask must require login, got {chat_response.status_code}"
     )
+
+
+def test_a_bearer_token_sees_only_its_own_account(user_a):
+    """The mobile app's Bearer path goes through the same get_current_patient_id."""
+    client_a, _ = user_a
+    created = client_a.post(
+        "/api/manual/health-record",
+        json={"record_date": "2026-01-15", "metric_type": "glucose", "value": "5.4"},
+    )
+    assert created.status_code == 200
+    record_id = created.json()["id"]
+
+    r = TestClient(app).post(
+        "/api/auth/register",
+        json={"email": _email(), "password": "patient-c-password-1", "gdpr_consent": True},
+        headers={"X-Auth-Mode": "token"},
+    )
+    auth = {"Authorization": f"Bearer {r.json()['token']}"}
+    mobile = TestClient(app)
+
+    listed = mobile.get("/api/manual/health-records", headers=auth)
+    assert listed.status_code == 200
+    assert all(row["id"] != record_id for row in listed.json())
+
+    delete_attempt = mobile.delete(f"/api/manual/health-record/{record_id}", headers=auth)
+    assert delete_attempt.status_code in (403, 404)

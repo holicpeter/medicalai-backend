@@ -158,3 +158,65 @@ def test_a_scoped_endpoint_requires_login_not_just_a_running_server(client):
     """Every data endpoint depends on get_current_patient_id — spot-check one."""
     r = client.get("/api/manual/family")
     assert r.status_code == 401
+
+
+# ─── Mobile app: token in the body, Bearer header back ──────────────────────
+
+_TOKEN_MODE = {"X-Auth-Mode": "token"}
+
+
+def test_web_login_does_not_expose_the_token(client):
+    r = _register(client)
+    assert r.status_code == 201
+    assert "token" not in r.json()
+    assert client.cookies.get(settings.AUTH_COOKIE_NAME)
+
+
+def test_mobile_register_returns_a_token_and_sets_no_cookie(client):
+    r = client.post(
+        "/api/auth/register",
+        json={"email": _email(), "password": "a-strong-enough-password", "gdpr_consent": True},
+        headers=_TOKEN_MODE,
+    )
+    assert r.status_code == 201
+    assert r.json()["token"]
+    assert not client.cookies.get(settings.AUTH_COOKIE_NAME)
+
+
+def test_mobile_login_token_authenticates_as_bearer():
+    email = _email()
+    TestClient(app).post(
+        "/api/auth/register",
+        json={"email": email, "password": "a-strong-enough-password", "gdpr_consent": True},
+    )
+
+    mobile = TestClient(app)
+    r = mobile.post(
+        "/api/auth/login",
+        json={"email": email, "password": "a-strong-enough-password"},
+        headers=_TOKEN_MODE,
+    )
+    assert r.status_code == 200
+    token = r.json()["token"]
+
+    me = mobile.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert me.status_code == 200
+    assert me.json()["email"] == email
+
+
+def test_mobile_login_with_wrong_password_gets_no_token(client):
+    email = _email()
+    _register(client, email=email)
+    r = TestClient(app).post(
+        "/api/auth/login",
+        json={"email": email, "password": "not-the-password"},
+        headers=_TOKEN_MODE,
+    )
+    assert r.status_code == 401
+    assert "token" not in r.json()
+
+
+@pytest.mark.parametrize("header", ["Bearer garbage", "Bearer ", "Basic abc", "garbage"])
+def test_a_bad_authorization_header_is_401(header):
+    r = TestClient(app).get("/api/auth/me", headers={"Authorization": header})
+    assert r.status_code == 401

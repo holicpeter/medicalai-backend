@@ -13,6 +13,7 @@ app.auth.dependencies.get_current_patient_id.
 import logging
 import re
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
@@ -80,6 +81,31 @@ class UserOut(BaseModel):
     email: str
     patient_id: int
     created_at: str
+    # Only for the mobile app (see _wants_token); the web never gets it.
+    token: Optional[str] = None
+
+
+# The native mobile app asks for the token in the response body with this
+# header, stores it in the Keychain/Keystore and sends it back as a Bearer
+# header. The web app never sends it, so for the web the token stays in the
+# httpOnly cookie and no page script can read it. A password is needed to get
+# a body token at all, so an XSS on the web page cannot mint one from the
+# cookie alone.
+_TOKEN_MODE_HEADER = "x-auth-mode"
+
+
+def _wants_token(request: Request) -> bool:
+    return request.headers.get(_TOKEN_MODE_HEADER, "").strip().lower() == "token"
+
+
+def _issue_session(request: Request, response: Response, user: User, patient_id: int) -> UserOut:
+    token = create_access_token(user.id)
+    out = _serialize(user, patient_id)
+    if _wants_token(request):
+        out.token = token
+    else:
+        set_auth_cookie(response, token)
+    return out
 
 
 def _serialize(user: User, patient_id: int) -> UserOut:
@@ -91,7 +117,7 @@ def _serialize(user: User, patient_id: int) -> UserOut:
     )
 
 
-@router.post("/register", response_model=UserOut, status_code=201)
+@router.post("/register", response_model=UserOut, response_model_exclude_none=True, status_code=201)
 async def register(data: RegisterRequest, request: Request, response: Response):
     check_rate_limit(request, bucket="register")
 
@@ -127,11 +153,8 @@ async def register(data: RegisterRequest, request: Request, response: Response):
         session.refresh(user)
         session.refresh(patient)
 
-        token = create_access_token(user.id)
-        set_auth_cookie(response, token)
-
         logger.info("auth: registered user id=%s", user.id)
-        return _serialize(user, patient.id)
+        return _issue_session(request, response, user, patient.id)
     except HTTPException:
         session.rollback()
         raise
@@ -143,7 +166,7 @@ async def register(data: RegisterRequest, request: Request, response: Response):
         session.close()
 
 
-@router.post("/login", response_model=UserOut)
+@router.post("/login", response_model=UserOut, response_model_exclude_none=True)
 async def login(data: LoginRequest, request: Request, response: Response):
     check_rate_limit(request, bucket="login")
 
@@ -169,11 +192,8 @@ async def login(data: LoginRequest, request: Request, response: Response):
             logger.error("login: user %s has no linked Patient row", user.id)
             raise HTTPException(status_code=500, detail="Profil sa nenašiel. Kontaktujte podporu.")
 
-        token = create_access_token(user.id)
-        set_auth_cookie(response, token)
-
         logger.info("auth: logged in user id=%s", user.id)
-        return _serialize(user, patient.id)
+        return _issue_session(request, response, user, patient.id)
     except HTTPException:
         raise
     finally:
@@ -186,7 +206,7 @@ async def logout(response: Response):
     return {"success": True}
 
 
-@router.get("/me", response_model=UserOut)
+@router.get("/me", response_model=UserOut, response_model_exclude_none=True)
 async def me(current_user: User = Depends(get_current_user)):
     session = get_session()
     try:
