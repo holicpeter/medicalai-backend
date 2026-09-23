@@ -10,12 +10,14 @@ Every user gets exactly one Patient row, created here at registration time —
 that is what every other scoped endpoint in the app resolves through
 app.auth.dependencies.get_current_patient_id.
 """
+import asyncio
 import logging
 import re
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app.auth.dependencies import (
@@ -25,6 +27,7 @@ from app.auth.dependencies import (
     set_auth_cookie,
 )
 from app.auth.account_deletion import delete_account
+from app.auth.account_export import export_account
 from app.auth.quota import is_unlimited, resets_at, usage_summary
 from app.auth.security import create_access_token, hash_password, verify_password
 from app.database import Patient, User, get_session
@@ -273,3 +276,19 @@ async def delete_my_account(
 
     clear_auth_cookie(response)
     return {"success": True}
+
+
+@router.get("/export")
+async def export_my_data(request: Request, current_user: User = Depends(get_current_user)):
+    """Download everything stored about the logged-in user as one JSON file.
+
+    Rate-limited: for an account with a large Apple Health import this is a
+    heavy query, and nobody needs more than a few exports in five minutes.
+    """
+    check_rate_limit(request, bucket="export")
+    data = await asyncio.to_thread(export_account, current_user.id)
+    filename = f"medicalai-export-{datetime.now():%Y-%m-%d}.json"
+    return JSONResponse(
+        content=data,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
