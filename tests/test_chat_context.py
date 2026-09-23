@@ -238,7 +238,7 @@ def test_a_crowded_profile_does_not_push_the_passages_out(monkeypatch, rows):
                      "value": float(index), "unit": "u", "source": "ocr"})
 
     class _Crowded:
-        def __init__(self):
+        def __init__(self, patient_id=None):
             self.data = _frame(rows)
 
         def analyze_trends(self):

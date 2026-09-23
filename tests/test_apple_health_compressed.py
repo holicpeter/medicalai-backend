@@ -11,6 +11,8 @@ import gzip
 import io
 import zipfile
 
+import uuid
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -31,7 +33,19 @@ CDA_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    # The import endpoint is scoped to the logged-in patient, so every request
+    # needs a session: register a throwaway account (the cookie stays on the client).
+    client = TestClient(app)
+    r = client.post(
+        "/api/auth/register",
+        json={
+            "email": f"apple-{uuid.uuid4().hex[:12]}@example.com",
+            "password": "apple-health-password-1",
+            "gdpr_consent": True,
+        },
+    )
+    assert r.status_code == 201
+    return client
 
 
 def _zip(members: dict) -> bytes:
