@@ -14,7 +14,7 @@ python-dotenv==1.0.0
 httpx>=0.25.0
 pydantic>=2.0.0
 garminconnect>=0.2.0
-pydantic-settings>=2.0.0
+pydantic-settings>=2.7.0  # NoDecode, used for the email lists in app/config.py
 PyPDF2>=3.0.0
 # maintained successor to PyPDF2; document_processor prefers it and falls back
 pypdf>=4.0.0

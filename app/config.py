@@ -1,7 +1,9 @@
 import logging
-from pydantic_settings import BaseSettings
+import json
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode
 from pathlib import Path
-from typing import List
+from typing import Annotated, List
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,7 @@ class Settings(BaseSettings):
     # admin's own email is what stops a second tester from either reading
     # the admin's Withings data through an authenticated-but-wrong-tenant
     # request, or silently overwriting the admin's connector session.
-    ADMIN_EMAILS: List[str] = []
+    ADMIN_EMAILS: Annotated[List[str], NoDecode] = []
     # Free daily AI allowance per user (app/auth/quota.py). Registration is
     # open, and every one of these calls is paid for by this app's Anthropic
     # key. Resets at midnight Europe/Bratislava. ADMIN_EMAILS are exempt.
@@ -50,7 +52,7 @@ class Settings(BaseSettings):
     # Accounts in DEMO_EMAILS cannot be deleted from the app, since many
     # visitors log into the same one; re-run the script to reset it.
     DEMO_EMAIL: str = "demo@medicalai.peterholic.com"
-    DEMO_EMAILS: List[str] = ["demo@medicalai.peterholic.com"]
+    DEMO_EMAILS: Annotated[List[str], NoDecode] = ["demo@medicalai.peterholic.com"]
 
     # Shared secret with the Cloudflare Worker that fronts this API.
     #
@@ -65,6 +67,23 @@ class Settings(BaseSettings):
     PROXY_SHARED_SECRET: str = ""
 
     # CORS — override via ALLOWED_ORIGINS env var (JSON array or comma-separated)
+    @field_validator("ADMIN_EMAILS", "DEMO_EMAILS", mode="before")
+    @classmethod
+    def _email_list(cls, value):
+        """Accept a JSON list, a comma-separated list or a single address.
+
+        Set in the Railway dashboard by hand, these usually arrive as
+        `me@example.com` or `a@x.com, b@y.com`, not JSON. pydantic-settings
+        would reject that and the API would not start at all.
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                value = json.loads(text)
+            else:
+                value = text.split(",")
+        return [str(v).strip() for v in (value or []) if str(v).strip()]
+
     ALLOWED_ORIGINS: List[str] = [
         "https://medicalai.peterholic.com",
         "http://localhost:3000",
