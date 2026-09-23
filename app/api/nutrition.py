@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
-from app.auth.dependencies import get_current_patient_id
+from app.auth.dependencies import get_current_patient_id, get_current_user
 from app.database import get_session, NutritionEntry, NutritionTextCache
 from app.nutrition.analyzer import MealAnalyzer
 
@@ -90,7 +90,10 @@ def _normalize_description(text: str) -> str:
 
 
 @router.post("/analyze")
-async def analyze_meal_photo(file: UploadFile = File(...)):
+async def analyze_meal_photo(
+    file: UploadFile = File(...),
+    _user=Depends(get_current_user),
+):
     """Odfotené jedlo -> Claude vision -> štruktúrovaný odhad nutričných hodnôt.
 
     Toto len analyzuje a vráti výsledok, neukladá nič do denníka — uloženie
@@ -146,7 +149,10 @@ _TEXT_CACHE_DISCLAIMER = (
 
 
 @router.post("/analyze-text")
-async def analyze_meal_text(data: MealTextRequest):
+async def analyze_meal_text(
+    data: MealTextRequest,
+    _user=Depends(get_current_user),
+):
     """Textový popis jedla -> Claude -> štruktúrovaný odhad nutričných hodnôt.
 
     Rovnaký kontrakt ako POST /analyze (fotka): len analyzuje a vráti výsledok,
