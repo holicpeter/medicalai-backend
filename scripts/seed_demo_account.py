@@ -21,9 +21,12 @@ Usage (Railway):
     railway ssh --service web
     DEMO_PASSWORD='…' python -m scripts.seed_demo_account
 
-DEMO_EMAIL defaults to settings.DEMO_EMAIL. Add that address to DEMO_EMAILS
-on Railway (it is by default) so visitors cannot delete the shared account.
-Without DEMO_PASSWORD a random one is generated and printed once.
+Visitors do not need the password: "Try the demo" calls
+POST /api/auth/demo-login, and the account is read-only (app/auth/demo.py).
+DEMO_EMAIL defaults to settings.DEMO_EMAIL and must be listed in DEMO_EMAILS
+(it is by default) — that is what makes it read-only. Without DEMO_PASSWORD
+a random one is generated and printed once; it is only needed to log in
+through the normal form.
 """
 import os
 import random

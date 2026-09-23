@@ -56,10 +56,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     # Lets the web app tell "daily AI allowance used up" apart from other 429s.
-    expose_headers=["X-AI-Quota-Exceeded"],
+    expose_headers=["X-AI-Quota-Exceeded", "X-Demo-Read-Only"],
 )
 
 PROXY_SECRET_HEADER = 'X-Proxy-Secret'
+
+
+from app.auth.demo import demo_read_only  # noqa: E402
+
+app.middleware("http")(demo_read_only)
 
 
 @app.middleware("http")

@@ -28,6 +28,7 @@ from app.auth.dependencies import (
 )
 from app.auth.account_deletion import delete_account
 from app.auth.account_export import export_account
+from app.auth.demo import is_demo_email
 from app.auth.quota import is_unlimited, resets_at, usage_summary
 from app.auth.security import create_access_token, hash_password, verify_password
 from app.config import settings
@@ -87,6 +88,9 @@ class UserOut(BaseModel):
     email: str
     patient_id: int
     created_at: str
+    # The shared read-only demo account (app/auth/demo.py): clients show a
+    # banner and offer registration instead of the editing tools.
+    is_demo: bool = False
     # Only for the mobile app (see _wants_token); the web never gets it.
     token: Optional[str] = None
 
@@ -120,6 +124,7 @@ def _serialize(user: User, patient_id: int) -> UserOut:
         email=user.email,
         patient_id=patient_id,
         created_at=user.created_at.isoformat() if user.created_at else "",
+        is_demo=is_demo_email(user.email),
     )
 
 
@@ -300,3 +305,26 @@ async def export_my_data(request: Request, current_user: User = Depends(get_curr
         content=data,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/demo-login", response_model=UserOut, response_model_exclude_none=True)
+async def demo_login(request: Request, response: Response):
+    """Sign in to the shared demo account — no password, made-up data, read-only.
+
+    Anyone may do this; that is the point. What keeps it safe is not the
+    login but the account: fictional data only, and the demo_read_only
+    middleware refusing every change and every AI call from it.
+    """
+    check_rate_limit(request, bucket="demo")
+
+    session = get_session()
+    try:
+        user = session.query(User).filter_by(email=settings.DEMO_EMAIL.lower()).first()
+        if user is None or not user.is_active or not is_demo_email(user.email):
+            raise HTTPException(status_code=503, detail="Ukážka momentálne nie je dostupná.")
+        patient = session.query(Patient).filter_by(user_id=user.id).first()
+        if patient is None:
+            raise HTTPException(status_code=503, detail="Ukážka momentálne nie je dostupná.")
+        return _issue_session(request, response, user, patient.id)
+    finally:
+        session.close()
