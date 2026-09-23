@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 from app.api import auth, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
+from app.auth.demo import demo_read_only
 from app.config import settings
 from app.database import init_database
 
@@ -43,6 +44,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Registered before CORS on purpose: Starlette runs the last-added middleware
+# outermost, so CORS wraps this one and its 403 still carries the CORS
+# headers the browser needs to read it (and the X-Demo-Read-Only header).
+app.middleware("http")(demo_read_only)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -60,11 +66,6 @@ app.add_middleware(
 )
 
 PROXY_SECRET_HEADER = 'X-Proxy-Secret'
-
-
-from app.auth.demo import demo_read_only  # noqa: E402
-
-app.middleware("http")(demo_read_only)
 
 
 @app.middleware("http")
