@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     AI_DAILY_LIMIT_DOCUMENTS: int = 10
     AI_DAILY_LIMIT_NUTRITION: int = 15
     AI_DAILY_LIMIT_RISK_ANALYSIS: int = 5
+    # Shared promo account with made-up data (scripts/seed_demo_account.py).
+    # Accounts in DEMO_EMAILS cannot be deleted from the app, since many
+    # visitors log into the same one; re-run the script to reset it.
+    DEMO_EMAIL: str = "demo@medicalai.peterholic.com"
+    DEMO_EMAILS: List[str] = ["demo@medicalai.peterholic.com"]
 
     # Shared secret with the Cloudflare Worker that fronts this API.
     #

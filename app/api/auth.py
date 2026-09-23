@@ -30,6 +30,7 @@ from app.auth.account_deletion import delete_account
 from app.auth.account_export import export_account
 from app.auth.quota import is_unlimited, resets_at, usage_summary
 from app.auth.security import create_access_token, hash_password, verify_password
+from app.config import settings
 from app.database import Patient, User, get_session
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,13 @@ async def delete_my_account(
             status_code=403,
             detail="Administrátorský účet sa nedá zmazať v aplikácii. "
                    "Najprv odstráňte email z ADMIN_EMAILS.",
+        )
+
+    if current_user.email.lower() in {e.lower() for e in settings.DEMO_EMAILS}:
+        raise HTTPException(
+            status_code=403,
+            detail="Ukážkový účet sa nedá zmazať — zdieľajú ho všetci návštevníci. "
+                   "Vo vlastnom účte táto funkcia funguje.",
         )
 
     try:
