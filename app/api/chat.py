@@ -5,10 +5,11 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import anthropic
 from app.analysis.chat_context import build_health_context, format_health_context
-from app.auth.dependencies import get_current_patient_id
+from app.auth.dependencies import get_current_patient_id, get_current_user
+from app.auth.quota import ai_call
 from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
 from app.config import settings
-from app.database import ChatMessage, get_session
+from app.database import ChatMessage, User, get_session
 
 _MODEL = "claude-haiku-4-5-20251001"
 
@@ -42,98 +43,103 @@ class ChatResponse(BaseModel):
 
 
 @router.post("/ask", response_model=ChatResponse)
-async def ask_question(request: ChatRequest, patient_id: int = Depends(get_current_patient_id)):
+async def ask_question(
+    request: ChatRequest,
+    patient_id: int = Depends(get_current_patient_id),
+    user: User = Depends(get_current_user),
+):
     """
     Spracuje otázku používateľa a vráti odpoveď založenú na zdravotných dátach
     """
-    try:
-        # The context is built here, from the database, rather than taken from
-        # the request body. The client used to be the only source: it loaded a
-        # snapshot and posted it back, so whenever that load failed — and it
-        # always did, because the endpoint it calls did not exist — every
-        # question reached the model with no data attached and got "nemám
-        # žiadne údaje" as the honest answer to an empty context.
-        context = format_health_context(build_health_context(patient_id, question=request.question))
+    with ai_call(user, "chat"):
+        try:
+            # The context is built here, from the database, rather than taken from
+            # the request body. The client used to be the only source: it loaded a
+            # snapshot and posted it back, so whenever that load failed — and it
+            # always did, because the endpoint it calls did not exist — every
+            # question reached the model with no data attached and got "nemám
+            # žiadne údaje" as the honest answer to an empty context.
+            context = format_health_context(build_health_context(patient_id, question=request.question))
 
-        if not context:
-            # Nothing stored yet. A client-supplied snapshot is still accepted
-            # so an older frontend keeps working against a new backend.
-            context = _prepare_health_context(request.health_data)
+            if not context:
+                # Nothing stored yet. A client-supplied snapshot is still accepted
+                # so an older frontend keeps working against a new backend.
+                context = _prepare_health_context(request.health_data)
 
-        # Vytvoríme prompt pre Claude AI
-        system_prompt = """Si odborný zdravotný asistent s hlbokými znalosťami medicíny.
-Tvoja úloha je odpovedať na otázky pacienta o jeho zdravotných výsledkoch.
+            # Vytvoríme prompt pre Claude AI
+            system_prompt = """Si odborný zdravotný asistent s hlbokými znalosťami medicíny.
+    Tvoja úloha je odpovedať na otázky pacienta o jeho zdravotných výsledkoch.
 
-DÔLEŽITÉ PRAVIDLÁ:
-- Odpovedaj VÝHRADNE v slovenskom jazyku
-- Buď presný, faktický a opieraj sa len o poskytnuté dáta
-- Nikdy si nevymýšľaj hodnoty, ktoré v dátach nie sú
-- Ak sa pacient pýta na obdobie, za ktoré nie sú merania, NEPÍŠ, že žiadne dáta
-  neexistujú. Povedz, že za dané obdobie nie sú merania, a odpovedz na základe
-  najnovších dostupných hodnôt — vždy uveď, z ktorého dátumu pochádzajú
-- Pri hodnotách uvádzaj dátum merania a zdroj, ak je relevantný
-- Ak čerpáš z úryvku lekárskej správy, uveď názov dokumentu a jeho dátum
-- Merania nie sú to isté čo obsah zdravotnej karty. Nikdy netvrď, že vidíš
-  naskenované správy alebo celú kartu, ak máš k dispozícii len namerané hodnoty —
-  v sekcii NAHRANÉ LEKÁRSKE DOKUMENTY je napísané, čo z dokumentov naozaj máš
-- Úryvky sú vyhľadané k otázke; ak medzi nimi odpoveď nie je, povedz to a
-  neodvodzuj obsah správy, ktorý nemáš — v zozname vyššie je, aké dokumenty
-  vôbec existujú
-- Nikdy nediagnostikuj choroby - len informuj o hodnotách a trendoch
-- Odporúčaj konzultáciu s lekárom pri akýchkoľvek abnormálnych hodnotách
-- Buď empatický a zrozumiteľný
-- Vysvetľuj medicínske pojmy jednoducho
+    DÔLEŽITÉ PRAVIDLÁ:
+    - Odpovedaj VÝHRADNE v slovenskom jazyku
+    - Buď presný, faktický a opieraj sa len o poskytnuté dáta
+    - Nikdy si nevymýšľaj hodnoty, ktoré v dátach nie sú
+    - Ak sa pacient pýta na obdobie, za ktoré nie sú merania, NEPÍŠ, že žiadne dáta
+      neexistujú. Povedz, že za dané obdobie nie sú merania, a odpovedz na základe
+      najnovších dostupných hodnôt — vždy uveď, z ktorého dátumu pochádzajú
+    - Pri hodnotách uvádzaj dátum merania a zdroj, ak je relevantný
+    - Ak čerpáš z úryvku lekárskej správy, uveď názov dokumentu a jeho dátum
+    - Merania nie sú to isté čo obsah zdravotnej karty. Nikdy netvrď, že vidíš
+      naskenované správy alebo celú kartu, ak máš k dispozícii len namerané hodnoty —
+      v sekcii NAHRANÉ LEKÁRSKE DOKUMENTY je napísané, čo z dokumentov naozaj máš
+    - Úryvky sú vyhľadané k otázke; ak medzi nimi odpoveď nie je, povedz to a
+      neodvodzuj obsah správy, ktorý nemáš — v zozname vyššie je, aké dokumenty
+      vôbec existujú
+    - Nikdy nediagnostikuj choroby - len informuj o hodnotách a trendoch
+    - Odporúčaj konzultáciu s lekárom pri akýchkoľvek abnormálnych hodnotách
+    - Buď empatický a zrozumiteľný
+    - Vysvetľuj medicínske pojmy jednoducho
 
-NÁSTROJE:
-Kontext obsahuje len posledné obdobie. Ak sa otázka týka dlhšieho obdobia alebo
-vývoja hodnoty v čase, zavolaj get_metric_history namiesto odhadovania z
-poslednej hodnoty. Ak potrebuješ iný obsah lekárskej správy než sú priložené
-úryvky, zavolaj search_documents. Neospravedlňuj sa za volanie nástroja a
-nespomínaj ho v odpovedi — pacienta zaujíma výsledok."""
+    NÁSTROJE:
+    Kontext obsahuje len posledné obdobie. Ak sa otázka týka dlhšieho obdobia alebo
+    vývoja hodnoty v čase, zavolaj get_metric_history namiesto odhadovania z
+    poslednej hodnoty. Ak potrebuješ iný obsah lekárskej správy než sú priložené
+    úryvky, zavolaj search_documents. Neospravedlňuj sa za volanie nástroja a
+    nespomínaj ho v odpovedi — pacienta zaujíma výsledok."""
 
-        user_prompt = f"""ZDRAVOTNÉ DÁTA PACIENTA:
-{context}
+            user_prompt = f"""ZDRAVOTNÉ DÁTA PACIENTA:
+    {context}
 
-OTÁZKA PACIENTA:
-{request.question}
+    OTÁZKA PACIENTA:
+    {request.question}
 
-Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."""
+    Prosím, odpovedz na túto otázku na základe poskytnutých zdravotných dát."""
 
-        # Prefer Mistral, fallback na Claude
-        if settings.MISTRAL_API_KEY and MistralClient is not None:
-            client = MistralClient(api_key=settings.MISTRAL_API_KEY)
-            response = client.chat(
-                model="mistral-small-latest",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=2048,
-            )
-            answer = response.choices[0].message.content
-        elif settings.ANTHROPIC_API_KEY:
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-            history = await asyncio.to_thread(load_history, patient_id)
-            # Off the event loop: the SDK call is blocking and there can now be
-            # several of them in one question.
-            answer = await asyncio.to_thread(
-                _ask_claude, client, system_prompt, user_prompt, history, patient_id
-            )
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
-            )
+            # Prefer Mistral, fallback na Claude
+            if settings.MISTRAL_API_KEY and MistralClient is not None:
+                client = MistralClient(api_key=settings.MISTRAL_API_KEY)
+                response = client.chat(
+                    model="mistral-small-latest",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=2048,
+                )
+                answer = response.choices[0].message.content
+            elif settings.ANTHROPIC_API_KEY:
+                client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+                history = await asyncio.to_thread(load_history, patient_id)
+                # Off the event loop: the SDK call is blocking and there can now be
+                # several of them in one question.
+                answer = await asyncio.to_thread(
+                    _ask_claude, client, system_prompt, user_prompt, history, patient_id
+                )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
+                )
 
-        await asyncio.to_thread(_save_turn, patient_id, request.question, answer)
-        return ChatResponse(answer=answer)
+            await asyncio.to_thread(_save_turn, patient_id, request.question, answer)
+            return ChatResponse(answer=answer)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error('Chat error: %s', e)
-        raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error('Chat error: %s', e)
+            raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
 
 
 def load_history(patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:

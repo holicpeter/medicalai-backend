@@ -2,6 +2,7 @@
 from .models import (
     Base,
     User,
+    AiUsage,
     Patient,
     FamilyMember,
     HealthRecord,
@@ -21,6 +22,7 @@ from .models import (
 __all__ = [
     "Base",
     "User",
+    "AiUsage",
     "Patient",
     "FamilyMember",
     "HealthRecord",

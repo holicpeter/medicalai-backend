@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from app.auth.dependencies import get_current_patient_id, get_current_user
+from app.auth.quota import ai_call
 from app.database import get_session, NutritionEntry, NutritionTextCache
 from app.nutrition.analyzer import MealAnalyzer
 
@@ -92,7 +93,7 @@ def _normalize_description(text: str) -> str:
 @router.post("/analyze")
 async def analyze_meal_photo(
     file: UploadFile = File(...),
-    _user=Depends(get_current_user),
+    user=Depends(get_current_user),
 ):
     """Odfotené jedlo -> Claude vision -> štruktúrovaný odhad nutričných hodnôt.
 
@@ -113,24 +114,25 @@ async def analyze_meal_photo(
     if len(image_bytes) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Fotka je príliš veľká (max 8 MB).")
 
-    try:
-        # Blocking Claude API call beží v samostatnom threade, rovnaký prístup
-        # ako pri OCR (app/api/upload.py), nech neblokuje event loop.
-        result = await asyncio.to_thread(
-            analyzer.analyze_meal_photo, image_bytes, content_type,
-        )
-    except RuntimeError as e:
-        logger.error('Meal analysis not configured: %s', e)
-        raise HTTPException(status_code=500, detail=str(e))
-    except ValueError as e:
-        logger.warning('Meal analysis returned unparseable output: %s', e)
-        raise HTTPException(
-            status_code=502,
-            detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s jasnejšou fotkou.",
-        )
-    except Exception as e:
-        logger.error('Meal analysis failed: %s', e)
-        raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze fotky.")
+    with ai_call(user, "nutrition"):
+        try:
+            # Blocking Claude API call beží v samostatnom threade, rovnaký prístup
+            # ako pri OCR (app/api/upload.py), nech neblokuje event loop.
+            result = await asyncio.to_thread(
+                analyzer.analyze_meal_photo, image_bytes, content_type,
+            )
+        except RuntimeError as e:
+            logger.error('Meal analysis not configured: %s', e)
+            raise HTTPException(status_code=500, detail=str(e))
+        except ValueError as e:
+            logger.warning('Meal analysis returned unparseable output: %s', e)
+            raise HTTPException(
+                status_code=502,
+                detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s jasnejšou fotkou.",
+            )
+        except Exception as e:
+            logger.error('Meal analysis failed: %s', e)
+            raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze fotky.")
 
     result['disclaimer'] = (
         'Toto je len orientačný odhad na základe fotky, nie presné laboratórne meranie. '
@@ -151,7 +153,7 @@ _TEXT_CACHE_DISCLAIMER = (
 @router.post("/analyze-text")
 async def analyze_meal_text(
     data: MealTextRequest,
-    _user=Depends(get_current_user),
+    user=Depends(get_current_user),
 ):
     """Textový popis jedla -> Claude -> štruktúrovaný odhad nutričných hodnôt.
 
@@ -184,22 +186,23 @@ async def analyze_meal_text(
     finally:
         session.close()
 
-    try:
-        result = await asyncio.to_thread(
-            analyzer.analyze_meal_text, data.description,
-        )
-    except RuntimeError as e:
-        logger.error('Meal text analysis not configured: %s', e)
-        raise HTTPException(status_code=500, detail=str(e))
-    except ValueError as e:
-        logger.warning('Meal text analysis returned unparseable output: %s', e)
-        raise HTTPException(
-            status_code=502,
-            detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s podrobnejším popisom.",
-        )
-    except Exception as e:
-        logger.error('Meal text analysis failed: %s', e)
-        raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze popisu jedla.")
+    with ai_call(user, "nutrition"):  # cache hits above are free
+        try:
+            result = await asyncio.to_thread(
+                analyzer.analyze_meal_text, data.description,
+            )
+        except RuntimeError as e:
+            logger.error('Meal text analysis not configured: %s', e)
+            raise HTTPException(status_code=500, detail=str(e))
+        except ValueError as e:
+            logger.warning('Meal text analysis returned unparseable output: %s', e)
+            raise HTTPException(
+                status_code=502,
+                detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s podrobnejším popisom.",
+            )
+        except Exception as e:
+            logger.error('Meal text analysis failed: %s', e)
+            raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze popisu jedla.")
 
     # Cache zápis je best-effort — ak zlyhá (napr. súbežný rovnaký request
     # vyhral unique constraint pretek), analýza sa aj tak vráti používateľovi.

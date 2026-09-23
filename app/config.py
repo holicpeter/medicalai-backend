@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     # the admin's Withings data through an authenticated-but-wrong-tenant
     # request, or silently overwriting the admin's connector session.
     ADMIN_EMAILS: List[str] = []
+    # Free daily AI allowance per user (app/auth/quota.py). Registration is
+    # open, and every one of these calls is paid for by this app's Anthropic
+    # key. Resets at midnight Europe/Bratislava. ADMIN_EMAILS are exempt.
+    AI_DAILY_LIMIT_CHAT: int = 50
+    AI_DAILY_LIMIT_DOCUMENTS: int = 10
+    AI_DAILY_LIMIT_NUTRITION: int = 30
+    AI_DAILY_LIMIT_RISK_ANALYSIS: int = 5
 
     # Shared secret with the Cloudflare Worker that fronts this API.
     #

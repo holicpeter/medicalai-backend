@@ -24,6 +24,7 @@ from app.auth.dependencies import (
     get_current_user,
     set_auth_cookie,
 )
+from app.auth.quota import resets_at, usage_summary
 from app.auth.security import create_access_token, hash_password, verify_password
 from app.database import Patient, User, get_session
 
@@ -216,3 +217,15 @@ async def me(current_user: User = Depends(get_current_user)):
         return _serialize(current_user, patient.id)
     finally:
         session.close()
+
+
+@router.get("/usage")
+async def usage(current_user: User = Depends(get_current_user)):
+    """Today's free AI allowance, for the account screen (web and mobile)."""
+    items = usage_summary(current_user)
+    return {
+        "items": items,
+        "any_exhausted": any(item["exhausted"] for item in items),
+        "unlimited": all(item["limit"] is None for item in items),
+        "resets_at": resets_at().isoformat(),
+    }

@@ -6,7 +6,9 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 
-from app.auth.dependencies import get_current_patient_id, require_admin
+from app.auth.dependencies import get_current_patient_id, get_current_user, require_admin
+from app.auth.quota import consume, refund
+from app.database import User
 from app.config import settings
 from app.ocr.document_processor import DocumentProcessor, split_document_output
 from app.ocr.data_extractor import HealthDataExtractor
@@ -131,16 +133,28 @@ async def _process_single_file(file: UploadFile, patient_id: int) -> dict:
 async def upload_documents(
     files: List[UploadFile] = File(...),
     patient_id: int = Depends(get_current_patient_id),
+    user: User = Depends(get_current_user),
 ):
     """
     Upload health documents (PDF, images, CSV) for processing.
     Supported formats: PDF, JPG, JPEG, PNG, HEIC, HEIF, CSV
     Multiple files are processed concurrently.
     """
+    # Every file except a CSV goes through AI (OCR). All of them are charged
+    # up front — a batch that would cross the daily limit is refused whole,
+    # rather than half-imported — and the ones that fail are refunded below.
+    ai_files = [_resolve_extension(f) != '.csv' for f in files]
+    charged = consume(user, "documents", sum(ai_files))
+
     try:
         # Process all files concurrently
         tasks = [_process_single_file(f, patient_id) for f in files]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failed_ai_files = sum(
+            1 for r, is_ai in zip(results, ai_files) if is_ai and isinstance(r, Exception)
+        )
+        refund(user, "documents", min(failed_ai_files, charged))
 
         uploaded_files = []
         errors = []

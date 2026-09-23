@@ -55,6 +55,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Lets the web app tell "daily AI allowance used up" apart from other 429s.
+    expose_headers=["X-AI-Quota-Exceeded"],
 )
 
 PROXY_SECRET_HEADER = 'X-Proxy-Secret'

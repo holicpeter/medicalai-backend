@@ -3,7 +3,9 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 
-from app.auth.dependencies import get_current_patient_id
+from app.auth.dependencies import get_current_patient_id, get_current_user
+from app.auth.quota import ai_call
+from app.database import User
 from app.ml.risk_predictor import RiskPredictor
 from app.ml.recommendation_engine import RecommendationEngine
 from app.claude.medical_advisor import MedicalAdvisor
@@ -24,7 +26,11 @@ SUPPORTED_DISEASES = ["diabetes", "cardiovascular", "hypertension", "metabolic_s
 
 
 @router.get("/risks")
-async def predict_health_risks(use_claude: bool = False, patient_id: int = Depends(get_current_patient_id)):
+async def predict_health_risks(
+    use_claude: bool = False,
+    patient_id: int = Depends(get_current_patient_id),
+    user: User = Depends(get_current_user),
+):
     """
     Predikcia budúcich zdravotných rizík
 
@@ -49,7 +55,8 @@ async def predict_health_risks(use_claude: bool = False, patient_id: int = Depen
 
         # Optional Claude AI analysis
         if use_claude:
-            claude_analysis = await medical_advisor.analyze_health_risks(ml_risks)
+            with ai_call(user, "risk_analysis"):
+                claude_analysis = await medical_advisor.analyze_health_risks(ml_risks)
             result["ai_insights"] = claude_analysis
 
         return result

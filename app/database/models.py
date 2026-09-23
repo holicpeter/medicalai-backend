@@ -2,7 +2,7 @@
 Database models pre MedicalAI
 Podporuje PostgreSQL (Railway/Supabase) aj SQLite (lokálne)
 """
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text, Boolean, ForeignKey, JSON, event
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text, Boolean, ForeignKey, JSON, UniqueConstraint, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -35,6 +35,22 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     patient = relationship("Patient", back_populates="user", uselist=False)
+
+
+class AiUsage(Base):
+    """How many AI calls of one kind a user made on one day (see app/auth/quota.py).
+
+    One row per (user, day, kind), incremented in place. Kept in the database,
+    not in memory, so a redeploy or restart does not hand everyone a fresh
+    daily allowance.
+    """
+    __tablename__ = 'ai_usage'
+    __table_args__ = (UniqueConstraint('user_id', 'day', 'kind', name='uq_ai_usage_user_day_kind'),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    day = Column(Date, nullable=False)
+    kind = Column(String(32), nullable=False)
+    count = Column(Integer, nullable=False, default=0)
 
 
 class Patient(Base):

@@ -30,3 +30,4 @@ PyJWT>=2.8.0
 # scripts/apple_health_watcher.py
 requests>=2.31.0
 watchdog>=4.0.0
+tzdata>=2024.1  # zoneinfo data for the daily AI quota (Europe/Bratislava), in case the image has none
