@@ -24,7 +24,8 @@ from app.auth.dependencies import (
     get_current_user,
     set_auth_cookie,
 )
-from app.auth.quota import resets_at, usage_summary
+from app.auth.account_deletion import delete_account
+from app.auth.quota import is_unlimited, resets_at, usage_summary
 from app.auth.security import create_access_token, hash_password, verify_password
 from app.database import Patient, User, get_session
 
@@ -229,3 +230,46 @@ async def usage(current_user: User = Depends(get_current_user)):
         "unlimited": all(item["limit"] is None for item in items),
         "resets_at": resets_at().isoformat(),
     }
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str
+
+
+@router.post("/delete-account")
+async def delete_my_account(
+    data: DeleteAccountRequest,
+    request: Request,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """Permanently delete the logged-in account and all of its health data.
+
+    The password is asked again: a session alone (a borrowed unlocked phone,
+    a stolen cookie) must not be enough to wipe someone's records for good.
+    """
+    check_rate_limit(request, bucket="delete-account")
+
+    if not verify_password(data.password, current_user.password_hash):
+        raise HTTPException(status_code=401, detail="Nesprávne heslo.")
+
+    # The admin account also holds the Garmin/Withings/Calendar connections
+    # for the whole app; deleting it by accident from a phone would take
+    # those down for everyone. Remove the email from ADMIN_EMAILS first.
+    if is_unlimited(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Administrátorský účet sa nedá zmazať v aplikácii. "
+                   "Najprv odstráňte email z ADMIN_EMAILS.",
+        )
+
+    try:
+        delete_account(current_user.id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Zmazanie účtu zlyhalo, nič sa nezmazalo. Skúste to znova.",
+        ) from e
+
+    clear_auth_cookie(response)
+    return {"success": True}
