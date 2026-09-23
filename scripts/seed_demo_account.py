@@ -377,6 +377,8 @@ def _chat(patient_id: int, today: date):
 
 
 def seed(email: str, password: str) -> dict:
+    # Same demo on every run, whatever ran before in this process.
+    rng.seed(47)
     init_database()
     today = date.today()
 

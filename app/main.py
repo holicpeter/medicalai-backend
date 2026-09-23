@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 from app.api import auth, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
+from app.auth.bootstrap import run_startup_tasks
 from app.auth.demo import demo_read_only
 from app.config import settings
 from app.database import init_database
@@ -34,6 +35,9 @@ async def lifespan(app: FastAPI):
         logger.info('Database initialized successfully')
     except Exception as e:
         logger.error('Failed to initialize database: %s', e)
+    # Admin migration and demo account, when their Railway variables are set
+    # (app/auth/bootstrap.py). Before `yield`, so before any request is served.
+    run_startup_tasks()
     yield
 
 
