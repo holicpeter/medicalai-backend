@@ -31,12 +31,17 @@ _TZ = ZoneInfo("Europe/Bratislava")
 # the login rate limiter's 429 and show the account message instead.
 QUOTA_HEADER = "X-AI-Quota-Exceeded"
 
-# kind -> (settings attribute holding the limit, label shown to the user)
+# kind -> (settings attribute holding the limit, label on the account screen,
+#          phrase for the "used up" message)
 KINDS: Dict[str, tuple] = {
-    "chat": ("AI_DAILY_LIMIT_CHAT", "Správy v AI chate"),
-    "documents": ("AI_DAILY_LIMIT_DOCUMENTS", "Nahraté dokumenty (čítanie cez AI)"),
-    "nutrition": ("AI_DAILY_LIMIT_NUTRITION", "Analýzy jedla"),
-    "risk_analysis": ("AI_DAILY_LIMIT_RISK_ANALYSIS", "AI analýzy rizík"),
+    "chat": ("AI_DAILY_LIMIT_CHAT", "Správy v AI chate", "na správy v AI chate"),
+    "documents": (
+        "AI_DAILY_LIMIT_DOCUMENTS",
+        "Nahraté dokumenty (čítanie cez AI)",
+        "na čítanie dokumentov cez AI",
+    ),
+    "nutrition": ("AI_DAILY_LIMIT_NUTRITION", "Analýzy jedla", "na analýzy jedla"),
+    "risk_analysis": ("AI_DAILY_LIMIT_RISK_ANALYSIS", "AI analýzy rizík", "na AI analýzy rizík"),
 }
 
 
@@ -58,8 +63,8 @@ def is_unlimited(user: User) -> bool:
 
 def exceeded_message(kind: str) -> str:
     return (
-        f"Minuli ste dnešné bezplatné kredity ({KINDS[kind][1].lower()}: "
-        f"{_limit(kind)} denne). Kredity sa obnovia o polnoci."
+        f"Minuli ste dnešné bezplatné kredity {KINDS[kind][2]} "
+        f"({_limit(kind)} denne). Obnovia sa o polnoci."
     )
 
 
@@ -174,7 +179,7 @@ def usage_summary(user: User) -> List[dict]:
         session.close()
 
     out = []
-    for kind, (_, label) in KINDS.items():
+    for kind, (_, label, _phrase) in KINDS.items():
         limit = _limit(kind)
         count = used.get(kind, 0)
         out.append({
