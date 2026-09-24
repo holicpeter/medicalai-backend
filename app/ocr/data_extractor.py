@@ -11,15 +11,23 @@ class HealthDataExtractor:
     def __init__(self):
         pass
 
-    def extract_health_metrics(self, text: str, source_file: Optional[str] = None) -> List[Dict]:
-        """Parse Claude's JSON response, fall back to regex if needed."""
+    def extract_health_metrics(
+        self, text: str, source_file: Optional[str] = None, patient_id: Optional[int] = None,
+    ) -> List[Dict]:
+        """Parse Claude's JSON response, fall back to regex if needed.
+
+        patient_id must come from the authenticated request that uploaded the
+        document (see app/api/upload.py) — it used to be hardcoded to 1 here,
+        which meant every OCR-extracted record landed on patient 1 regardless
+        of who actually uploaded it.
+        """
         metrics = self._parse_json(text)
         if not metrics:
             logger.warning('JSON parsing returned 0 metrics, trying regex fallback')
             metrics = self._regex_extract(text)
 
         logger.info('Found %d health metrics', len(metrics))
-        self._save_extracted_data(metrics, source_file)
+        self._save_extracted_data(metrics, source_file, patient_id)
         return metrics
 
     # ------------------------------------------------------------------ #
@@ -164,8 +172,13 @@ class HealthDataExtractor:
     # Database persistence
     # ------------------------------------------------------------------ #
 
-    def _save_extracted_data(self, metrics: List[Dict], source_file: Optional[str] = None):
+    def _save_extracted_data(
+        self, metrics: List[Dict], source_file: Optional[str] = None, patient_id: Optional[int] = None,
+    ):
         if not metrics:
+            return
+        if patient_id is None:
+            logger.error('Refusing to save extracted metrics without a patient_id (source_file=%s)', source_file)
             return
         try:
             from app.database import get_session, HealthRecord
@@ -186,7 +199,7 @@ class HealthDataExtractor:
                         if metric_date else date.today()
                     )
                     record = HealthRecord(
-                        patient_id=1,
+                        patient_id=patient_id,
                         record_type='lab_test',
                         record_date=record_date,
                         source='ocr',

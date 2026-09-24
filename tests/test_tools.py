@@ -33,19 +33,22 @@ def _rows():
     return rows
 
 
+PATIENT_ID = 1
+
+
 @pytest.fixture(autouse=True)
 def measurements(monkeypatch):
     frame = pd.DataFrame(_rows())
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     monkeypatch.setattr(
         chat_context, "TrendAnalyzer",
-        lambda: SimpleNamespace(data=frame, analyze_trends=dict),
+        lambda patient_id: SimpleNamespace(data=frame, analyze_trends=dict),
     )
     return frame
 
 
 def test_history_lists_every_measurement_day_by_day():
-    history = chat_context.metric_history("weight")
+    history = chat_context.metric_history("weight", PATIENT_ID)
 
     assert history["granularity"] == "daily"
     assert history["measurements"] == len(range(0, 800, 7))
@@ -55,7 +58,7 @@ def test_history_lists_every_measurement_day_by_day():
 
 def test_a_long_range_collapses_to_months_instead_of_being_cut_off():
     """A truncated series would silently hide half the period it claims to cover."""
-    history = chat_context.metric_history("weight", max_points=20)
+    history = chat_context.metric_history("weight", PATIENT_ID, max_points=20)
 
     assert history["granularity"] == "monthly"
     assert len(history["points"]) <= 20
@@ -65,7 +68,7 @@ def test_a_long_range_collapses_to_months_instead_of_being_cut_off():
 def test_dates_narrow_the_series():
     since = (TODAY - timedelta(days=30)).isoformat()
 
-    history = chat_context.metric_history("weight", start_date=since)
+    history = chat_context.metric_history("weight", PATIENT_ID, start_date=since)
 
     assert history["measurements"] < len(range(0, 800, 7))
     assert all(point["period"] >= since for point in history["points"])
@@ -73,7 +76,7 @@ def test_dates_narrow_the_series():
 
 def test_an_unknown_metric_says_what_does_exist():
     """Better than an empty result: the model can retry with a real name."""
-    history = chat_context.metric_history("ldl")
+    history = chat_context.metric_history("ldl", PATIENT_ID)
 
     assert history["points"] == []
     assert {"weight", "glucose"} <= set(history["available_metrics"])
@@ -81,16 +84,18 @@ def test_an_unknown_metric_says_what_does_exist():
 
 @pytest.mark.parametrize("metric", ["weight", "WEIGHT", " Weight "])
 def test_metric_names_are_matched_loosely(metric):
-    assert chat_context.metric_history(metric)["measurements"] > 0
+    assert chat_context.metric_history(metric, PATIENT_ID)["measurements"] > 0
 
 
 def test_an_unparseable_date_is_ignored_rather_than_fatal():
-    assert chat_context.metric_history("weight", start_date="minulý rok")[
+    assert chat_context.metric_history("weight", PATIENT_ID, start_date="minulý rok")[
         "measurements"] > 0
 
 
 def test_history_tool_returns_json():
-    payload = json.loads(chat_tools.run_tool("get_metric_history", {"metric": "weight"}))
+    payload = json.loads(
+        chat_tools.run_tool("get_metric_history", {"metric": "weight"}, PATIENT_ID)
+    )
 
     assert payload["points"]
     assert payload["metric"] == "weight"
@@ -99,32 +104,37 @@ def test_history_tool_returns_json():
 def test_search_tool_clamps_the_limit_and_caps_the_text(monkeypatch):
     seen = {}
 
-    def _search(query, limit=5):
+    def _search(query, patient_id, limit=5):
         seen["limit"] = limit
+        seen["patient_id"] = patient_id
         return [{"document": "kardio.pdf", "date": "2026-03-14", "chunk_index": 0,
                  "score": 1.2, "text": "Záver: " + "x" * 6000}]
 
     monkeypatch.setattr(chat_tools, "search_documents", _search)
 
     payload = json.loads(
-        chat_tools.run_tool("search_documents", {"query": "kardiológ", "limit": 99}))
+        chat_tools.run_tool(
+            "search_documents", {"query": "kardiológ", "limit": 99}, PATIENT_ID
+        )
+    )
 
     assert seen["limit"] == 8
+    assert seen["patient_id"] == PATIENT_ID
     assert len(payload["results"][0]["text"]) <= chat_tools.MAX_DOCUMENT_CHARS + 10
 
 
 def test_an_unknown_tool_is_reported_not_raised():
-    assert "Neznámy nástroj" in chat_tools.run_tool("drop_table", {})
+    assert "Neznámy nástroj" in chat_tools.run_tool("drop_table", {}, PATIENT_ID)
 
 
 def test_a_failing_tool_is_reported_not_raised(monkeypatch):
     """The model can say what it could not look up; a 500 loses the whole answer."""
-    def _boom(payload):
+    def _boom(payload, patient_id):
         raise RuntimeError("nope")
 
     monkeypatch.setitem(chat_tools._HANDLERS, "boom", _boom)
 
-    assert "Nástroj zlyhal" in chat_tools.run_tool("boom", {})
+    assert "Nástroj zlyhal" in chat_tools.run_tool("boom", {}, PATIENT_ID)
 
 
 class _Block(dict):
@@ -160,7 +170,7 @@ class _ScriptedClient:
 def test_a_question_needing_no_lookup_costs_one_round_trip():
     client = _ScriptedClient([_text_turn("Priama odpoveď.")])
 
-    assert chat_api._ask_claude(client, "system", "otázka") == "Priama odpoveď."
+    assert chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID) == "Priama odpoveď."
     assert len(client.calls) == 1
 
 
@@ -170,7 +180,7 @@ def test_a_tool_result_is_fed_back_and_the_answer_returned():
         _text_turn("Vaša váha je stabilná."),
     ])
 
-    answer = chat_api._ask_claude(client, "system", "otázka")
+    answer = chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID)
 
     assert answer == "Vaša váha je stabilná."
     assert "tools" in client.calls[0]
@@ -189,7 +199,7 @@ def test_the_tool_budget_ends_in_an_answer_not_an_empty_turn():
         + [_text_turn("Odpoveď z toho, čo mám.")]
     )
 
-    answer = chat_api._ask_claude(client, "system", "otázka")
+    answer = chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID)
 
     assert answer == "Odpoveď z toho, čo mám."
     assert len(client.calls) == chat_tools.MAX_TOOL_ROUNDS + 1
@@ -199,4 +209,4 @@ def test_the_tool_budget_ends_in_an_answer_not_an_empty_turn():
 def test_an_empty_reply_never_reaches_the_patient():
     client = _ScriptedClient([_text_turn("   ")])
 
-    assert chat_api._ask_claude(client, "system", "otázka").startswith("Prepáčte")
+    assert chat_api._ask_claude(client, "system", "otázka", patient_id=PATIENT_ID).startswith("Prepáčte")

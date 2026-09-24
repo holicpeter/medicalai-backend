@@ -63,14 +63,17 @@ def _parse_value(raw):
     return _to_float(raw)
 
 
-def load_health_records() -> List[Dict]:
-    """Manually entered, OCR-extracted and Withings records."""
+def load_health_records(patient_id: int) -> List[Dict]:
+    """Manually entered, OCR-extracted and Withings records, for one patient."""
     metrics = []
     session = get_session()
     try:
         records = (
             session.query(HealthRecord)
-            .filter(HealthRecord.source.in_(HEALTH_RECORD_SOURCES))
+            .filter(
+                HealthRecord.patient_id == patient_id,
+                HealthRecord.source.in_(HEALTH_RECORD_SOURCES),
+            )
             .all()
         )
         by_source: Dict[str, int] = {}
@@ -97,14 +100,17 @@ def load_health_records() -> List[Dict]:
     return metrics
 
 
-def load_apple_health() -> List[Dict]:
-    """Apple Health measurements that map onto interpreted metrics."""
+def load_apple_health(patient_id: int) -> List[Dict]:
+    """Apple Health measurements that map onto interpreted metrics, for one patient."""
     metrics = []
     session = get_session()
     try:
         records = (
             session.query(AppleHealthData)
-            .filter(AppleHealthData.record_type.in_(list(APPLE_TO_METRIC.keys())))
+            .filter(
+                AppleHealthData.patient_id == patient_id,
+                AppleHealthData.record_type.in_(list(APPLE_TO_METRIC.keys())),
+            )
             .all()
         )
         for record in records:
@@ -128,6 +134,6 @@ def load_apple_health() -> List[Dict]:
     return metrics
 
 
-def load_all_measurements() -> List[Dict]:
-    """Every measurement the app can interpret, from all stored sources."""
-    return load_health_records() + load_apple_health()
+def load_all_measurements(patient_id: int) -> List[Dict]:
+    """Every measurement the app can interpret, from all stored sources, for one patient."""
+    return load_health_records(patient_id) + load_apple_health(patient_id)

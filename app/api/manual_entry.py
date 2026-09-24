@@ -1,16 +1,17 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import date, datetime
+from app.auth.dependencies import get_current_patient_id
 from app.database import get_session, Patient, FamilyMember, HealthRecord
 
 router = APIRouter(prefix="/api/manual", tags=["manual-entry"])
 
 
-def _invalidate_trends():
+def _invalidate_trends(patient_id: Optional[int] = None):
     """Manually entered records must show up in /trends immediately."""
     from app.analysis.trend_analyzer import TrendAnalyzer
-    TrendAnalyzer.invalidate_cache()
+    TrendAnalyzer.invalidate_cache(patient_id)
 
 
 # Pydantic models pre requesty
@@ -22,18 +23,18 @@ class FamilyMemberCreate(BaseModel):
     date_of_death: Optional[date] = None
     gender: str
     blood_type: Optional[str] = None
-    
+
     chronic_conditions: Optional[List[str]] = []
     genetic_conditions: Optional[List[str]] = []
     allergies: Optional[List[str]] = []
     medications: Optional[List[Dict[str, str]]] = []
     surgeries: Optional[List[Dict[str, str]]] = []
-    
+
     smoking: bool = False
     smoking_years: Optional[int] = None
     alcohol: bool = False
     exercise_frequency: Optional[str] = None
-    
+
     cause_of_death: Optional[str] = None
     notes: Optional[str] = None
 
@@ -46,18 +47,18 @@ class FamilyMemberUpdate(BaseModel):
     date_of_death: Optional[date] = None
     gender: Optional[str] = None
     blood_type: Optional[str] = None
-    
+
     chronic_conditions: Optional[List[str]] = None
     genetic_conditions: Optional[List[str]] = None
     allergies: Optional[List[str]] = None
     medications: Optional[List[Dict[str, str]]] = None
     surgeries: Optional[List[Dict[str, str]]] = None
-    
+
     smoking: Optional[bool] = None
     smoking_years: Optional[int] = None
     alcohol: Optional[bool] = None
     exercise_frequency: Optional[str] = None
-    
+
     cause_of_death: Optional[str] = None
     notes: Optional[str] = None
 
@@ -89,14 +90,14 @@ class PatientUpdate(BaseModel):
 # === PATIENT ENDPOINTS ===
 
 @router.get("/patient")
-async def get_patient_info():
+async def get_patient_info(patient_id: int = Depends(get_current_patient_id)):
     """Získať informácie o pacientovi"""
     session = get_session()
     try:
-        patient = session.query(Patient).first()
+        patient = session.query(Patient).filter_by(id=patient_id).first()
         if not patient:
             raise HTTPException(status_code=404, detail="Patient not found")
-        
+
         return {
             "id": patient.id,
             "first_name": patient.first_name,
@@ -113,14 +114,14 @@ async def get_patient_info():
 
 
 @router.put("/patient")
-async def update_patient_info(data: PatientUpdate):
+async def update_patient_info(data: PatientUpdate, patient_id: int = Depends(get_current_patient_id)):
     """Aktualizovať informácie o pacientovi"""
     session = get_session()
     try:
-        patient = session.query(Patient).first()
+        patient = session.query(Patient).filter_by(id=patient_id).first()
         if not patient:
             raise HTTPException(status_code=404, detail="Patient not found")
-        
+
         # Update fields
         if data.first_name is not None:
             patient.first_name = data.first_name
@@ -138,10 +139,10 @@ async def update_patient_info(data: PatientUpdate):
             patient.email = data.email
         if data.phone is not None:
             patient.phone = data.phone
-        
+
         patient.updated_at = datetime.now()
         session.commit()
-        
+
         return {"success": True, "message": "Patient info updated"}
     finally:
         session.close()
@@ -150,17 +151,12 @@ async def update_patient_info(data: PatientUpdate):
 # === FAMILY MEMBER ENDPOINTS ===
 
 @router.get("/family")
-async def get_family_members():
+async def get_family_members(patient_id: int = Depends(get_current_patient_id)):
     """Získať všetkých rodinných príbuzných"""
     session = get_session()
     try:
-        patient = session.query(Patient).first()
-        if not patient:
-            # A list endpoint with nothing to list returns an empty list, not 404.
-            return []
+        members = session.query(FamilyMember).filter_by(patient_id=patient_id).all()
 
-        members = session.query(FamilyMember).filter_by(patient_id=patient.id).all()
-        
         result = []
         for member in members:
             result.append({
@@ -184,23 +180,19 @@ async def get_family_members():
                 "cause_of_death": member.cause_of_death,
                 "notes": member.notes,
             })
-        
+
         return result
     finally:
         session.close()
 
 
 @router.post("/family")
-async def add_family_member(data: FamilyMemberCreate):
+async def add_family_member(data: FamilyMemberCreate, patient_id: int = Depends(get_current_patient_id)):
     """Pridať rodinného príbuzného"""
     session = get_session()
     try:
-        patient = session.query(Patient).first()
-        if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        
         member = FamilyMember(
-            patient_id=patient.id,
+            patient_id=patient_id,
             first_name=data.first_name,
             last_name=data.last_name,
             relationship_type=data.relationship_type,
@@ -220,10 +212,10 @@ async def add_family_member(data: FamilyMemberCreate):
             cause_of_death=data.cause_of_death,
             notes=data.notes,
         )
-        
+
         session.add(member)
         session.commit()
-        
+
         return {
             "success": True,
             "message": f"Family member {data.first_name} {data.last_name} added",
@@ -234,14 +226,25 @@ async def add_family_member(data: FamilyMemberCreate):
 
 
 @router.put("/family/{member_id}")
-async def update_family_member(member_id: int, data: FamilyMemberUpdate):
+async def update_family_member(
+    member_id: int,
+    data: FamilyMemberUpdate,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Aktualizovať rodinného príbuzného"""
     session = get_session()
     try:
-        member = session.query(FamilyMember).filter_by(id=member_id).first()
+        # Scoped by patient_id, not just id: an id-only lookup would let any
+        # authenticated user edit another patient's family member by
+        # guessing/incrementing the id (IDOR).
+        member = (
+            session.query(FamilyMember)
+            .filter_by(id=member_id, patient_id=patient_id)
+            .first()
+        )
         if not member:
             raise HTTPException(status_code=404, detail="Family member not found")
-        
+
         # Update fields
         if data.first_name is not None:
             member.first_name = data.first_name
@@ -279,27 +282,32 @@ async def update_family_member(member_id: int, data: FamilyMemberUpdate):
             member.cause_of_death = data.cause_of_death
         if data.notes is not None:
             member.notes = data.notes
-        
+
         member.updated_at = datetime.now()
         session.commit()
-        
+
         return {"success": True, "message": "Family member updated"}
     finally:
         session.close()
 
 
 @router.delete("/family/{member_id}")
-async def delete_family_member(member_id: int):
+async def delete_family_member(member_id: int, patient_id: int = Depends(get_current_patient_id)):
     """Vymazať rodinného príbuzného"""
     session = get_session()
     try:
-        member = session.query(FamilyMember).filter_by(id=member_id).first()
+        # Scoped by patient_id — see update_family_member above (IDOR).
+        member = (
+            session.query(FamilyMember)
+            .filter_by(id=member_id, patient_id=patient_id)
+            .first()
+        )
         if not member:
             raise HTTPException(status_code=404, detail="Family member not found")
-        
+
         session.delete(member)
         session.commit()
-        
+
         return {"success": True, "message": "Family member deleted"}
     finally:
         session.close()
@@ -308,16 +316,12 @@ async def delete_family_member(member_id: int):
 # === HEALTH RECORD ENDPOINTS ===
 
 @router.post("/health-record")
-async def add_health_record(data: HealthRecordCreate):
+async def add_health_record(data: HealthRecordCreate, patient_id: int = Depends(get_current_patient_id)):
     """Manuálne pridať zdravotný záznam"""
     session = get_session()
     try:
-        patient = session.query(Patient).first()
-        if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        
         record = HealthRecord(
-            patient_id=patient.id,
+            patient_id=patient_id,
             record_type="manual_entry",
             record_date=data.record_date,
             source="manual",
@@ -331,10 +335,10 @@ async def add_health_record(data: HealthRecordCreate):
             facility_name=data.facility_name,
             notes=data.notes,
         )
-        
+
         session.add(record)
         session.commit()
-        _invalidate_trends()
+        _invalidate_trends(patient_id)
 
         return {
             "success": True,
@@ -346,21 +350,21 @@ async def add_health_record(data: HealthRecordCreate):
 
 
 @router.get("/health-records")
-async def get_health_records(metric_type: Optional[str] = None, limit: int = 100):
+async def get_health_records(
+    metric_type: Optional[str] = None,
+    limit: int = 100,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Získať zdravotné záznamy (s optional filtrom)"""
     session = get_session()
     try:
-        patient = session.query(Patient).first()
-        if not patient:
-            return []
+        query = session.query(HealthRecord).filter_by(patient_id=patient_id)
 
-        query = session.query(HealthRecord).filter_by(patient_id=patient.id)
-        
         if metric_type:
             query = query.filter_by(metric_type=metric_type)
-        
+
         records = query.order_by(HealthRecord.record_date.desc()).limit(limit).all()
-        
+
         result = []
         for record in records:
             result.append({
@@ -377,24 +381,29 @@ async def get_health_records(metric_type: Optional[str] = None, limit: int = 100
                 "facility_name": record.facility_name,
                 "notes": record.notes,
             })
-        
+
         return result
     finally:
         session.close()
 
 
 @router.delete("/health-record/{record_id}")
-async def delete_health_record(record_id: int):
+async def delete_health_record(record_id: int, patient_id: int = Depends(get_current_patient_id)):
     """Vymazať zdravotný záznam"""
     session = get_session()
     try:
-        record = session.query(HealthRecord).filter_by(id=record_id).first()
+        # Scoped by patient_id — see update_family_member above (IDOR).
+        record = (
+            session.query(HealthRecord)
+            .filter_by(id=record_id, patient_id=patient_id)
+            .first()
+        )
         if not record:
             raise HTTPException(status_code=404, detail="Health record not found")
-        
+
         session.delete(record)
         session.commit()
-        _invalidate_trends()
+        _invalidate_trends(patient_id)
 
         return {"success": True, "message": "Health record deleted"}
     finally:
@@ -404,32 +413,28 @@ async def delete_health_record(record_id: int):
 # === UTILITY ENDPOINTS ===
 
 @router.get("/genetic-risk-analysis")
-async def analyze_genetic_risks():
+async def analyze_genetic_risks(patient_id: int = Depends(get_current_patient_id)):
     """Analyzovať genetické riziká na základe rodinnej anamnézy"""
     session = get_session()
     try:
-        patient = session.query(Patient).first()
-        if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        
-        members = session.query(FamilyMember).filter_by(patient_id=patient.id).all()
-        
+        members = session.query(FamilyMember).filter_by(patient_id=patient_id).all()
+
         # Počítať výskyt chorôb v rodine
         condition_counts = {}
         genetic_conditions = {}
-        
+
         for member in members:
             # Chronické choroby
             for condition in (member.chronic_conditions or []):
                 condition_counts[condition] = condition_counts.get(condition, 0) + 1
-            
+
             # Genetické choroby
             for condition in (member.genetic_conditions or []):
                 genetic_conditions[condition] = genetic_conditions.get(condition, 0) + 1
-        
+
         # Vypočítať riziká
         risks = []
-        
+
         # Vysoké riziko = 2+ príbuzní s rovnakou chorobou
         for condition, count in condition_counts.items():
             risk_level = "low"
@@ -437,14 +442,14 @@ async def analyze_genetic_risks():
                 risk_level = "high"
             elif count >= 2:
                 risk_level = "medium"
-            
+
             risks.append({
                 "condition": condition,
                 "family_members_affected": count,
                 "risk_level": risk_level,
                 "type": "chronic"
             })
-        
+
         # Genetické choroby = vždy vysoké riziko
         for condition, count in genetic_conditions.items():
             risks.append({
@@ -453,11 +458,11 @@ async def analyze_genetic_risks():
                 "risk_level": "high",
                 "type": "genetic"
             })
-        
+
         # Zoradiť podľa rizika
         risk_order = {"high": 0, "medium": 1, "low": 2}
         risks.sort(key=lambda x: (risk_order[x["risk_level"]], -x["family_members_affected"]))
-        
+
         return {
             "total_family_members": len(members),
             "risks": risks,

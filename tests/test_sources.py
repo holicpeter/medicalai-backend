@@ -13,9 +13,10 @@ from app.analysis.sources import APPLE_TO_METRIC, load_all_measurements
 def test_both_analyzers_use_the_shared_loader():
     for module in (health_metrics, trend_analyzer):
         src = inspect.getsource(module)
-        assert "load_all_measurements()" in src, (
+        assert "load_all_measurements(self.patient_id)" in src, (
             f"{module.__name__} must load measurements through the shared loader, "
-            "otherwise the two can drift on which tables they read"
+            "scoped to its own patient_id, otherwise the two can drift on which "
+            "tables they read or leak another patient's rows"
         )
 
 
@@ -32,4 +33,4 @@ def test_blood_pressure_is_mapped_from_both_halves():
 
 
 def test_loader_returns_a_list_on_empty_database():
-    assert isinstance(load_all_measurements(), list)
+    assert isinstance(load_all_measurements(1), list)

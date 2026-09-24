@@ -117,13 +117,13 @@ def _rows_from_frame(df: pd.DataFrame) -> List[Tuple[date, str, float, Optional[
     return rows
 
 
-def _measurements(recent_days: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _measurements(patient_id: int, recent_days: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Inventory of everything stored, plus daily aggregates for the window."""
     inventory: Dict[str, Any] = {"total_rows": 0, "by_source": {}, "by_metric": {}}
     recent: Dict[str, List[Dict[str, Any]]] = {}
 
     try:
-        rows = _rows_from_frame(TrendAnalyzer().data)
+        rows = _rows_from_frame(TrendAnalyzer(patient_id).data)
     except Exception as e:  # a broken loader must not take the chat down
         logger.warning("chat context: cannot load measurements: %s", e)
         return inventory, recent
@@ -195,6 +195,7 @@ def _measurements(recent_days: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
 def metric_history(
     metric: str,
+    patient_id: int,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     max_points: int = 120,
@@ -211,7 +212,7 @@ def metric_history(
     that silently hides half the period.
     """
     try:
-        rows = _rows_from_frame(TrendAnalyzer().data)
+        rows = _rows_from_frame(TrendAnalyzer(patient_id).data)
     except Exception as e:
         logger.warning("metric history: cannot load measurements: %s", e)
         return {"metric": metric, "points": [], "error": "dáta sa nepodarilo načítať"}
@@ -309,9 +310,9 @@ def _latest_assessment(inventory: Dict[str, Any]) -> Dict[str, Any]:
         return {"health_score": None, "alerts": []}
 
 
-def _trends() -> Dict[str, Any]:
+def _trends(patient_id: int) -> Dict[str, Any]:
     try:
-        raw = TrendAnalyzer().analyze_trends() or {}
+        raw = TrendAnalyzer(patient_id).analyze_trends() or {}
     except Exception as e:
         logger.warning("chat context: cannot analyze trends: %s", e)
         return {}
@@ -327,10 +328,10 @@ def _trends() -> Dict[str, Any]:
     return trends
 
 
-def _patient() -> Dict[str, Any]:
+def _patient(patient_id: int) -> Dict[str, Any]:
     session = get_session()
     try:
-        patient = session.query(Patient).first()
+        patient = session.query(Patient).filter_by(id=patient_id).first()
         if not patient:
             return {}
         info: Dict[str, Any] = {
@@ -350,13 +351,10 @@ def _patient() -> Dict[str, Any]:
         session.close()
 
 
-def _family() -> List[Dict[str, Any]]:
+def _family(patient_id: int) -> List[Dict[str, Any]]:
     session = get_session()
     try:
-        patient = session.query(Patient).first()
-        if not patient:
-            return []
-        members = session.query(FamilyMember).filter_by(patient_id=patient.id).all()
+        members = session.query(FamilyMember).filter_by(patient_id=patient_id).all()
         family = []
         for member in members:
             entry = {
@@ -378,13 +376,13 @@ def _family() -> List[Dict[str, Any]]:
         session.close()
 
 
-def _risks() -> Dict[str, Any]:
+def _risks(patient_id: int) -> Dict[str, Any]:
     # Imported lazily: the predictor pulls in scikit-learn and loads its own
     # view of the data, and a chat answer is still useful without it.
     try:
         from app.ml.risk_predictor import RiskPredictor
 
-        risks = RiskPredictor().predict_risks() or {}
+        risks = RiskPredictor(patient_id).predict_risks() or {}
         return {
             "overall_risk_score": risks.get("overall_risk_score"),
             "high_risk_conditions": risks.get("high_risk_conditions", []),
@@ -396,7 +394,7 @@ def _risks() -> Dict[str, Any]:
         return {}
 
 
-def _documents(question: Optional[str]) -> Dict[str, Any]:
+def _documents(patient_id: int, question: Optional[str]) -> Dict[str, Any]:
     """What is on file, plus the passages that match this particular question.
 
     The structured metrics answer "koľko"; this answers "čo k tomu napísal
@@ -404,7 +402,7 @@ def _documents(question: Optional[str]) -> Dict[str, Any]:
     a context built for any other purpose still gets the inventory.
     """
     try:
-        inventory = document_inventory()[:MAX_LISTED_DOCUMENTS]
+        inventory = document_inventory(patient_id)[:MAX_LISTED_DOCUMENTS]
     except Exception as e:
         logger.warning("chat context: cannot list documents: %s", e)
         inventory = []
@@ -412,7 +410,7 @@ def _documents(question: Optional[str]) -> Dict[str, Any]:
     passages: List[Dict[str, Any]] = []
     if question:
         try:
-            passages = search_documents(question, limit=MAX_PASSAGES)
+            passages = search_documents(question, patient_id, limit=MAX_PASSAGES)
         except Exception as e:
             logger.warning("chat context: document search failed: %s", e)
 
@@ -420,6 +418,7 @@ def _documents(question: Optional[str]) -> Dict[str, Any]:
 
 
 def build_health_context(
+    patient_id: int,
     recent_days: int = DEFAULT_RECENT_DAYS,
     question: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -428,19 +427,19 @@ def build_health_context(
     `question` is what retrieval runs against; without it the context still
     describes the numbers and lists the documents, just without passages.
     """
-    inventory, recent = _measurements(recent_days)
+    inventory, recent = _measurements(patient_id, recent_days)
     context: Dict[str, Any] = {
         "today": date.today().isoformat(),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "recent_days": recent_days,
-        "patient": _patient(),
+        "patient": _patient(patient_id),
         "inventory": inventory,
         "recent": recent,
         "assessment": _latest_assessment(inventory),
-        "trends": _trends(),
-        "family": _family(),
-        "risks": _risks(),
-        "documents": _documents(question),
+        "trends": _trends(patient_id),
+        "family": _family(patient_id),
+        "risks": _risks(patient_id),
+        "documents": _documents(patient_id, question),
     }
     return context
 

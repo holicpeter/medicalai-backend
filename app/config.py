@@ -1,7 +1,9 @@
 import logging
-from pydantic_settings import BaseSettings
+import json
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode
 from pathlib import Path
-from typing import List
+from typing import Annotated, List
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,42 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = _DEFAULT_SECRET_KEY
 
+    # Auth — JWT session cookie (HS256, signed with SECRET_KEY).
+    #
+    # Registration is open (no invite code) by design for this phase: the
+    # goal is letting more testers in quickly, not gatekeeping them. See
+    # claude/prompt-multi-profil-rodina.md in the project for the tradeoff —
+    # revisit if the tester count grows past what a few dozen open signups
+    # can absorb.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 14  # 14 days
+    AUTH_COOKIE_NAME: str = "medicalai_session"
+    # False only for local http://localhost development; Railway/Cloudflare
+    # serve https, so this must be True there or the cookie is silently
+    # dropped by the browser over http and, worse, would be sent in the
+    # clear if it somehow were not.
+    AUTH_COOKIE_SECURE: bool = True
+    # Emails allowed to call the Garmin/Withings/Calendar integration
+    # endpoints. Those connectors hold one OAuth session per process (see
+    # app/integrations/*_connector.py) — they were never built to be
+    # multi-tenant, and making them so means storing per-user OAuth tokens in
+    # the database, which is out of scope here. Restricting them to the
+    # admin's own email is what stops a second tester from either reading
+    # the admin's Withings data through an authenticated-but-wrong-tenant
+    # request, or silently overwriting the admin's connector session.
+    ADMIN_EMAILS: Annotated[List[str], NoDecode] = []
+    # Free daily AI allowance per user (app/auth/quota.py). Registration is
+    # open, and every one of these calls is paid for by this app's Anthropic
+    # key. Resets at midnight Europe/Bratislava. ADMIN_EMAILS are exempt.
+    AI_DAILY_LIMIT_CHAT: int = 50
+    AI_DAILY_LIMIT_DOCUMENTS: int = 10
+    AI_DAILY_LIMIT_NUTRITION: int = 15
+    AI_DAILY_LIMIT_RISK_ANALYSIS: int = 5
+    # Shared promo account with made-up data (scripts/seed_demo_account.py).
+    # Accounts in DEMO_EMAILS cannot be deleted from the app, since many
+    # visitors log into the same one; re-run the script to reset it.
+    DEMO_EMAIL: str = "demo@medicalai.peterholic.com"
+    DEMO_EMAILS: Annotated[List[str], NoDecode] = ["demo@medicalai.peterholic.com"]
+
     # Shared secret with the Cloudflare Worker that fronts this API.
     #
     # Cloudflare Access guards medicalai.peterholic.com, but this Railway
@@ -29,6 +67,23 @@ class Settings(BaseSettings):
     PROXY_SHARED_SECRET: str = ""
 
     # CORS — override via ALLOWED_ORIGINS env var (JSON array or comma-separated)
+    @field_validator("ADMIN_EMAILS", "DEMO_EMAILS", mode="before")
+    @classmethod
+    def _email_list(cls, value):
+        """Accept a JSON list, a comma-separated list or a single address.
+
+        Set in the Railway dashboard by hand, these usually arrive as
+        `me@example.com` or `a@x.com, b@y.com`, not JSON. pydantic-settings
+        would reject that and the API would not start at all.
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                value = json.loads(text)
+            else:
+                value = text.split(",")
+        return [str(v).strip() for v in (value or []) if str(v).strip()]
+
     ALLOWED_ORIGINS: List[str] = [
         "https://medicalai.peterholic.com",
         "http://localhost:3000",
@@ -106,6 +161,14 @@ if settings.WITHINGS_CLIENT_ID and settings.WITHINGS_CLIENT_SECRET:
     logger.info('Withings credentials loaded')
 else:
     logger.warning('WITHINGS_CLIENT_ID / WITHINGS_CLIENT_SECRET not set — Withings sync disabled')
+
+if settings.ADMIN_EMAILS:
+    logger.info('Admin emails loaded (%d) — Garmin/Withings/Calendar restricted to them', len(settings.ADMIN_EMAILS))
+else:
+    logger.warning(
+        'ADMIN_EMAILS is not set — every /api/integrations/{garmin,withings,calendar} '
+        'endpoint will 503 rather than silently share one tenant\'s connector session'
+    )
 
 # Ensure directories exist
 settings.RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)

@@ -2,7 +2,7 @@
 Database models pre MedicalAI
 Podporuje PostgreSQL (Railway/Supabase) aj SQLite (lokálne)
 """
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text, Boolean, ForeignKey, JSON, event
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text, Boolean, ForeignKey, JSON, UniqueConstraint, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -15,9 +15,52 @@ _db_logger = logging.getLogger(__name__)
 Base = declarative_base()
 
 
+class User(Base):
+    """A login. One user owns exactly one Patient — their own profile.
+
+    Kept deliberately separate from Patient: Patient is the clinical profile
+    (name, DOB, the data it owns via patient_id everywhere else), User is the
+    credential (email + password) that logs into it. Splitting them means the
+    existing patient_id scoping on every other table did not have to change —
+    only "which patient does this request belong to" had to be answered, and
+    that answer now comes from the session instead of "the only Patient row
+    that exists".
+    """
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    gdpr_consent_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    patient = relationship("Patient", back_populates="user", uselist=False)
+
+
+class AiUsage(Base):
+    """How many AI calls of one kind a user made on one day (see app/auth/quota.py).
+
+    One row per (user, day, kind), incremented in place. Kept in the database,
+    not in memory, so a redeploy or restart does not hand everyone a fresh
+    daily allowance.
+    """
+    __tablename__ = 'ai_usage'
+    __table_args__ = (UniqueConstraint('user_id', 'day', 'kind', name='uq_ai_usage_user_day_kind'),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    day = Column(Date, nullable=False)
+    kind = Column(String(32), nullable=False)
+    count = Column(Integer, nullable=False, default=0)
+
+
 class Patient(Base):
     __tablename__ = 'patients'
     id = Column(Integer, primary_key=True)
+    # Nullable during the migration window: a deploy that runs init_database()
+    # before scripts/migrate_multi_user.py has linked the pre-existing row
+    # must not crash on a NOT NULL constraint it cannot yet satisfy. New rows
+    # are always created with a user_id — see app/api/auth.py register().
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True, unique=True)
     first_name = Column(String(100))
     last_name = Column(String(100))
     date_of_birth = Column(Date)
@@ -28,6 +71,7 @@ class Patient(Base):
     phone = Column(String(50))
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    user = relationship("User", back_populates="patient")
     health_records = relationship("HealthRecord", back_populates="patient")
     family_members = relationship("FamilyMember", back_populates="patient")
     nutrition_entries = relationship("NutritionEntry", back_populates="patient")
@@ -313,10 +357,41 @@ def init_database():
     engine = _get_engine()
     # checkfirst=True = nevyhadzuje error ak tabuľky už existujú
     Base.metadata.create_all(engine, checkfirst=True)
+    _ensure_columns(engine)
     _ensure_indexes(engine)
     _db_initialized = True
     _db_logger.info("[DATABASE] All tables created/verified")
     return engine
+
+
+# create_all() only creates a table's columns when the table itself is new —
+# an already-deployed `patients` table never gets a column added this way, so
+# a deploy that introduces one needs an explicit ALTER. Both PostgreSQL and
+# SQLite (3.35+, what Railway/modern local installs run) accept "ADD COLUMN
+# IF NOT EXISTS", so this is safe to re-run on every startup, the same way
+# _ensure_indexes is. scripts/migrate_multi_user.py still has to run once to
+# actually create the first user and link the pre-existing Patient row — this
+# only makes sure the column exists so that script (and the app) has
+# somewhere to write.
+_COLUMNS = (
+    ("patients", "user_id", "INTEGER"),
+)
+
+
+def _ensure_columns(engine):
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        for table, column, coltype in _COLUMNS:
+            try:
+                conn.execute(text(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}"
+                ))
+                conn.commit()
+            except Exception as e:
+                _db_logger.warning(
+                    "[DATABASE] Could not ensure column %s.%s: %s", table, column, e
+                )
 
 
 # create_all() only creates indexes alongside a new table, so existing
@@ -331,6 +406,8 @@ _INDEXES = (
     ("ix_chat_messages_created", "chat_messages", "created_at"),
     ("ix_documents_filename", "documents", "filename"),
     ("ix_nutrition_entries_patient_logged", "nutrition_entries", "patient_id, logged_at"),
+    ("ix_patients_user", "patients", "user_id"),
+    ("ix_documents_patient", "documents", "patient_id"),
 )
 
 

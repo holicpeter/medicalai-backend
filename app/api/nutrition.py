@@ -4,11 +4,13 @@ import re
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
-from app.database import get_session, Patient, NutritionEntry, NutritionTextCache
+from app.auth.dependencies import get_current_patient_id, get_current_user
+from app.auth.quota import ai_call
+from app.database import get_session, NutritionEntry, NutritionTextCache
 from app.nutrition.analyzer import MealAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -54,13 +56,6 @@ class NutritionEntryCreate(BaseModel):
     notes: Optional[str] = None
 
 
-def _get_default_patient(session) -> Patient:
-    patient = session.query(Patient).first()
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
-    return patient
-
-
 def _serialize_entry(entry: NutritionEntry) -> dict:
     return {
         "id": entry.id,
@@ -96,7 +91,10 @@ def _normalize_description(text: str) -> str:
 
 
 @router.post("/analyze")
-async def analyze_meal_photo(file: UploadFile = File(...)):
+async def analyze_meal_photo(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
     """Odfotené jedlo -> Claude vision -> štruktúrovaný odhad nutričných hodnôt.
 
     Toto len analyzuje a vráti výsledok, neukladá nič do denníka — uloženie
@@ -116,24 +114,25 @@ async def analyze_meal_photo(file: UploadFile = File(...)):
     if len(image_bytes) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Fotka je príliš veľká (max 8 MB).")
 
-    try:
-        # Blocking Claude API call beží v samostatnom threade, rovnaký prístup
-        # ako pri OCR (app/api/upload.py), nech neblokuje event loop.
-        result = await asyncio.to_thread(
-            analyzer.analyze_meal_photo, image_bytes, content_type,
-        )
-    except RuntimeError as e:
-        logger.error('Meal analysis not configured: %s', e)
-        raise HTTPException(status_code=500, detail=str(e))
-    except ValueError as e:
-        logger.warning('Meal analysis returned unparseable output: %s', e)
-        raise HTTPException(
-            status_code=502,
-            detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s jasnejšou fotkou.",
-        )
-    except Exception as e:
-        logger.error('Meal analysis failed: %s', e)
-        raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze fotky.")
+    with ai_call(user, "nutrition"):
+        try:
+            # Blocking Claude API call beží v samostatnom threade, rovnaký prístup
+            # ako pri OCR (app/api/upload.py), nech neblokuje event loop.
+            result = await asyncio.to_thread(
+                analyzer.analyze_meal_photo, image_bytes, content_type,
+            )
+        except RuntimeError as e:
+            logger.error('Meal analysis not configured: %s', e)
+            raise HTTPException(status_code=500, detail=str(e))
+        except ValueError as e:
+            logger.warning('Meal analysis returned unparseable output: %s', e)
+            raise HTTPException(
+                status_code=502,
+                detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s jasnejšou fotkou.",
+            )
+        except Exception as e:
+            logger.error('Meal analysis failed: %s', e)
+            raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze fotky.")
 
     result['disclaimer'] = (
         'Toto je len orientačný odhad na základe fotky, nie presné laboratórne meranie. '
@@ -152,7 +151,10 @@ _TEXT_CACHE_DISCLAIMER = (
 
 
 @router.post("/analyze-text")
-async def analyze_meal_text(data: MealTextRequest):
+async def analyze_meal_text(
+    data: MealTextRequest,
+    user=Depends(get_current_user),
+):
     """Textový popis jedla -> Claude -> štruktúrovaný odhad nutričných hodnôt.
 
     Rovnaký kontrakt ako POST /analyze (fotka): len analyzuje a vráti výsledok,
@@ -184,22 +186,23 @@ async def analyze_meal_text(data: MealTextRequest):
     finally:
         session.close()
 
-    try:
-        result = await asyncio.to_thread(
-            analyzer.analyze_meal_text, data.description,
-        )
-    except RuntimeError as e:
-        logger.error('Meal text analysis not configured: %s', e)
-        raise HTTPException(status_code=500, detail=str(e))
-    except ValueError as e:
-        logger.warning('Meal text analysis returned unparseable output: %s', e)
-        raise HTTPException(
-            status_code=502,
-            detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s podrobnejším popisom.",
-        )
-    except Exception as e:
-        logger.error('Meal text analysis failed: %s', e)
-        raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze popisu jedla.")
+    with ai_call(user, "nutrition"):  # cache hits above are free
+        try:
+            result = await asyncio.to_thread(
+                analyzer.analyze_meal_text, data.description,
+            )
+        except RuntimeError as e:
+            logger.error('Meal text analysis not configured: %s', e)
+            raise HTTPException(status_code=500, detail=str(e))
+        except ValueError as e:
+            logger.warning('Meal text analysis returned unparseable output: %s', e)
+            raise HTTPException(
+                status_code=502,
+                detail="AI model nevrátil použiteľný výsledok. Skús to prosím znova, ideálne s podrobnejším popisom.",
+            )
+        except Exception as e:
+            logger.error('Meal text analysis failed: %s', e)
+            raise HTTPException(status_code=500, detail="Nastala neočakávaná chyba pri analýze popisu jedla.")
 
     # Cache zápis je best-effort — ak zlyhá (napr. súbežný rovnaký request
     # vyhral unique constraint pretek), analýza sa aj tak vráti používateľovi.
@@ -226,14 +229,15 @@ async def analyze_meal_text(data: MealTextRequest):
 
 
 @router.post("/entries")
-async def save_nutrition_entry(data: NutritionEntryCreate):
+async def save_nutrition_entry(
+    data: NutritionEntryCreate,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Uloží (prípadne používateľom upravenú) analýzu jedla do denníka."""
     session = get_session()
     try:
-        patient = _get_default_patient(session)
-
         entry = NutritionEntry(
-            patient_id=patient.id,
+            patient_id=patient_id,
             logged_at=datetime.now(),
             items=[item.model_dump() for item in data.items],
             total_calories=data.total_calories,
@@ -254,18 +258,20 @@ async def save_nutrition_entry(data: NutritionEntryCreate):
 
 
 @router.get("/entries")
-async def list_nutrition_entries(target_date: Optional[date] = None):
+async def list_nutrition_entries(
+    target_date: Optional[date] = None,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Zoznam zaznamenaných jedál pre daný deň (default: dnes), najnovšie prvé."""
     day = target_date or date.today()
     start, end = _day_bounds(day)
 
     session = get_session()
     try:
-        patient = _get_default_patient(session)
         entries = (
             session.query(NutritionEntry)
             .filter(
-                NutritionEntry.patient_id == patient.id,
+                NutritionEntry.patient_id == patient_id,
                 NutritionEntry.logged_at >= start,
                 NutritionEntry.logged_at < end,
             )
@@ -278,10 +284,20 @@ async def list_nutrition_entries(target_date: Optional[date] = None):
 
 
 @router.delete("/entries/{entry_id}")
-async def delete_nutrition_entry(entry_id: int):
+async def delete_nutrition_entry(
+    entry_id: int,
+    patient_id: int = Depends(get_current_patient_id),
+):
     session = get_session()
     try:
-        entry = session.query(NutritionEntry).filter_by(id=entry_id).first()
+        # Scoped by patient_id, not just id: an id-only lookup would let any
+        # authenticated user delete another patient's entry by guessing/
+        # incrementing the id (IDOR).
+        entry = (
+            session.query(NutritionEntry)
+            .filter_by(id=entry_id, patient_id=patient_id)
+            .first()
+        )
         if not entry:
             raise HTTPException(status_code=404, detail="Záznam sa nenašiel.")
         session.delete(entry)
@@ -292,7 +308,10 @@ async def delete_nutrition_entry(entry_id: int):
 
 
 @router.get("/summary")
-async def get_daily_summary(target_date: Optional[date] = None):
+async def get_daily_summary(
+    target_date: Optional[date] = None,
+    patient_id: int = Depends(get_current_patient_id),
+):
     """Súčet kalórií/makier za daný deň + jednoduché pravidlové odporúčanie.
 
     Toto je zámerne "hlúpe" pravidlové odporúčanie, nie AI — plná personalizácia
@@ -303,11 +322,10 @@ async def get_daily_summary(target_date: Optional[date] = None):
 
     session = get_session()
     try:
-        patient = _get_default_patient(session)
         entries = (
             session.query(NutritionEntry)
             .filter(
-                NutritionEntry.patient_id == patient.id,
+                NutritionEntry.patient_id == patient_id,
                 NutritionEntry.logged_at >= start,
                 NutritionEntry.logged_at < end,
             )
