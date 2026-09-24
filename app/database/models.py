@@ -343,7 +343,8 @@ def _get_engine():
             pool_recycle=300,    # ← recykluj spojenia každých 5 minút
         )
         _SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
-        _db_logger.info("[DATABASE] Initialized at: %s", db_url[:50])
+        # Only the part after "@": everything before it is user:password.
+        _db_logger.info("[DATABASE] Initialized at: %s", db_url.split("@")[-1][:40])
     return _engine
 
 
