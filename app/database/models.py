@@ -303,6 +303,10 @@ def get_database_path():
         # Railway/Heroku používajú starý postgres:// prefix
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql://", 1)
+        # A bare postgresql:// lets SQLAlchemy pick the driver, and SQLAlchemy
+        # 2.1 picks psycopg 3, which is not installed. Name the one that is.
+        if db_url.startswith("postgresql://"):
+            db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
         # A Supabase/REST project URL (https://...) is a common mix-up here. SQLAlchemy
         # would try to load a dialect named after the scheme and fail deep inside the

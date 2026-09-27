@@ -11,6 +11,10 @@ Railway dashboard, merge, and the next boot does the rest.
   can register that email first. Delete MIGRATE_ADMIN_PASSWORD afterwards.
 - SEED_DEMO_ACCOUNT=true: create the read-only demo account if it is missing.
   An existing demo is left as it is; re-run the script to refresh its dates.
+- RESET_PASSWORD_EMAIL + RESET_PASSWORD: set a new password for an existing
+  account — the way back in when the password is lost, since the app has no
+  email-based reset. Applied on every boot while set, so delete both variables
+  once you can log in.
 """
 import logging
 import os
@@ -84,6 +88,27 @@ def link_admin_account(email: str, password: str) -> str:
         session.close()
 
 
+def reset_password(email: str, password: str) -> str:
+    """Give an existing account a new password. Raises if there is no such account."""
+    email = email.strip().lower()
+    if len(password) < 10:
+        raise ValueError("password must be at least 10 characters")
+
+    session = get_session()
+    try:
+        user = session.query(User).filter_by(email=email).first()
+        if user is None:
+            raise ValueError(f"no account with email {email}")
+        user.password_hash = hash_password(password)
+        session.commit()
+        return f"new password set for {email} (id={user.id})"
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def run_startup_tasks() -> None:
     """Never raises: a failed one-time task must not keep the API from starting."""
     email = os.environ.get("MIGRATE_ADMIN_EMAIL", "").strip()
@@ -97,6 +122,18 @@ def run_startup_tasks() -> None:
             )
         except Exception as e:
             logger.error("startup: admin migration failed: %s", e)
+
+    reset_email = os.environ.get("RESET_PASSWORD_EMAIL", "").strip()
+    reset_to = os.environ.get("RESET_PASSWORD", "")
+    if reset_email and reset_to:
+        try:
+            logger.info("startup: password reset: %s", reset_password(reset_email, reset_to))
+            logger.warning(
+                "startup: remove RESET_PASSWORD_EMAIL and RESET_PASSWORD from the Railway "
+                "variables once you can log in — the reset repeats on every boot"
+            )
+        except Exception as e:
+            logger.error("startup: password reset failed: %s", e)
 
     if os.environ.get("SEED_DEMO_ACCOUNT", "").strip().lower() in ("1", "true", "yes"):
         try:
