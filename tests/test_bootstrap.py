@@ -87,3 +87,33 @@ def test_the_demo_is_seeded_once_when_asked(monkeypatch):
         assert session.query(User).filter_by(email=email).one().id == first
     finally:
         session.close()
+
+
+def test_a_lost_password_can_be_reset(monkeypatch):
+    monkeypatch.setattr(settings, "PROXY_SHARED_SECRET", "")
+    email = f"forgot-{uuid.uuid4().hex[:8]}@example.com"
+    client = TestClient(app)
+    assert client.post("/api/auth/register", json={
+        "email": email, "password": "the-old-password", "gdpr_consent": True,
+    }).status_code in (200, 201)
+
+    monkeypatch.setenv("RESET_PASSWORD_EMAIL", email.upper())
+    monkeypatch.setenv("RESET_PASSWORD", "a-brand-new-password")
+    bootstrap.run_startup_tasks()
+
+    fresh = TestClient(app)
+    assert fresh.post("/api/auth/login", json={"email": email, "password": "the-old-password"}).status_code == 401
+    assert fresh.post("/api/auth/login", json={"email": email, "password": "a-brand-new-password"}).status_code == 200
+
+
+def test_a_reset_for_an_unknown_account_does_not_raise_or_create_one(monkeypatch):
+    email = f"nobody-{uuid.uuid4().hex[:8]}@example.com"
+    monkeypatch.setenv("RESET_PASSWORD_EMAIL", email)
+    monkeypatch.setenv("RESET_PASSWORD", "a-brand-new-password")
+    bootstrap.run_startup_tasks()
+
+    session = get_session()
+    try:
+        assert session.query(User).filter_by(email=email).count() == 0
+    finally:
+        session.close()

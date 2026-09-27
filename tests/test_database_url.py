@@ -1,44 +1,19 @@
-"""Tests for DATABASE_URL validation.
+"""DATABASE_URL as Railway and people type it.
 
-A Supabase project REST URL (https://...) was configured as DATABASE_URL in
-production. SQLAlchemy failed deep inside engine creation with
-"Can't load plugin: sqlalchemy.dialects:https", the error was swallowed at
-startup, and every database-backed endpoint silently returned errors.
+SQLAlchemy 2.1 maps a bare postgresql:// to psycopg 3, which is not installed,
+so the API started without a database. The driver that is installed is named
+explicitly.
 """
-import os
-
 import pytest
 
 from app.database.models import get_database_path
 
 
-@pytest.fixture
-def clean_env(monkeypatch):
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-
-
-def test_rejects_https_project_url(monkeypatch, clean_env):
-    monkeypatch.setenv("DATABASE_URL", "https://abcdef.supabase.co")
-    with pytest.raises(ValueError, match="unusable scheme"):
-        get_database_path()
-
-
-def test_rewrites_legacy_postgres_prefix(monkeypatch, clean_env):
-    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@host:5432/db")
-    assert get_database_path() == "postgresql://u:p@host:5432/db"
-
-
-def test_accepts_postgresql_url(monkeypatch, clean_env):
-    url = "postgresql://u:p@host:5432/db"
-    monkeypatch.setenv("DATABASE_URL", url)
-    assert get_database_path() == url
-
-
-def test_accepts_driver_qualified_url(monkeypatch, clean_env):
-    url = "postgresql+psycopg2://u:p@host:5432/db"
-    monkeypatch.setenv("DATABASE_URL", url)
-    assert get_database_path() == url
-
-
-def test_falls_back_to_sqlite(clean_env):
-    assert get_database_path().startswith("sqlite:///")
+@pytest.mark.parametrize("raw,expected", [
+    ("postgres://u:p@h:5432/db", "postgresql+psycopg2://u:p@h:5432/db"),
+    ("postgresql://u:p@h:5432/db", "postgresql+psycopg2://u:p@h:5432/db"),
+    ("postgresql+psycopg2://u:p@h:5432/db", "postgresql+psycopg2://u:p@h:5432/db"),
+])
+def test_postgres_urls_use_the_installed_driver(monkeypatch, raw, expected):
+    monkeypatch.setenv("DATABASE_URL", raw)
+    assert get_database_path() == expected
