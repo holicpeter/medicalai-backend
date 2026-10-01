@@ -15,6 +15,9 @@ Railway dashboard, merge, and the next boot does the rest.
   account — the way back in when the password is lost, since the app has no
   email-based reset. Applied on every boot while set, so delete both variables
   once you can log in.
+- Always: the Withings connection from before per-user connections (one
+  app-wide row in withings_tokens) is moved to the admin's own account,
+  encrypted, and the old plain-text row is deleted.
 """
 import logging
 import os
@@ -134,6 +137,14 @@ def run_startup_tasks() -> None:
             )
         except Exception as e:
             logger.error("startup: password reset failed: %s", e)
+
+    try:
+        from app.integrations.connections import migrate_legacy_withings_tokens
+        moved = migrate_legacy_withings_tokens()
+        if moved:
+            logger.info("startup: %s", moved)
+    except Exception as e:
+        logger.error("startup: moving the legacy Withings connection failed: %s", e)
 
     if os.environ.get("SEED_DEMO_ACCOUNT", "").strip().lower() in ("1", "true", "yes"):
         try:

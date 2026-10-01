@@ -1,74 +1,45 @@
 """
 Withings connector - ScanWatch 2 + Body Scan
 
-Štruktúra kopíruje garmin_connector.py: trieda + singleton cez
-get_withings_connector(), async metódy, perzistencia do data/withings/.
+Withings používa OAuth2: každý používateľ sa prihlási do svojho Withings
+účtu a povolí prístup. Jedna vývojárska aplikácia (WITHINGS_CLIENT_ID) tak
+slúži všetkým používateľom, každý má vlastné tokeny v tabuľke
+wearable_connections, šifrované (app/integrations/token_crypto.py).
 
-Rozdiel oproti Garminu: Withings používa OAuth2, nie email+heslo. Tokeny
-sa preto ukladajú na disk a obnovujú automaticky.
+get_withings_connector(user_id) vracia konektor pre jedného používateľa.
+Konektory sa držia v pamäti kvôli zámku pri obnove tokenu, tokeny samotné
+sú v databáze, takže reštart ani deploy prepojenie nezrušia.
 
 Setup:
     WITHINGS_CLIENT_ID=...
     WITHINGS_CLIENT_SECRET=...
-    WITHINGS_REDIRECT_URI=http://localhost:3000/api/auth/callback/withings
+    WITHINGS_REDIRECT_URI=https://medicalai.peterholic.com/api/integrations/withings/callback
 """
 import asyncio
-import json
+import logging
 import os
 import statistics
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 import httpx
-from sqlalchemy import create_engine, text
+
+from app.database import WearableConnection, get_session
+from app.integrations import token_crypto
+
+logger = logging.getLogger(__name__)
+
+PROVIDER = "withings"
 
 API_BASE = "https://wbsapi.withings.net"
 ACCOUNT_BASE = "https://account.withings.com"
 
-DATA_DIR = Path("data/withings")
-# Súbor zostáva ako záloha pre lokálny beh bez databázy. Na Railway je
-# filesystem efemérny - pri každom deployi sa zmaže a autorizácia padne.
-TOKEN_FILE = DATA_DIR / "tokens.json"
 
-DB_URL = os.environ.get("DATABASE_URL", "")
+class WithingsNotConnected(RuntimeError):
+    """The user has no usable Withings connection — they need to connect (again)."""
 
-_TOKEN_DDL = """
-CREATE TABLE IF NOT EXISTS withings_tokens (
-    id               integer PRIMARY KEY,
-    withings_user_id bigint,
-    access_token     text NOT NULL,
-    refresh_token    text NOT NULL,
-    expires_at       double precision NOT NULL,
-    updated_at       timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT withings_tokens_single_row CHECK (id = 1)
-)
-"""
-
-_engine = None
-
-
-def _db():
-    """
-    Engine pre uloženie tokenov, alebo None keď DATABASE_URL nie je nastavená.
-
-    Tabuľku vytvárame lenivo pri prvom použití - je to jedna tabuľka s jedným
-    riadkom a takto netreba samostatnú migráciu.
-    """
-    global _engine
-    if not DB_URL:
-        return None
-    if _engine is None:
-        # Railway niekedy dáva starý prefix postgres://, ktorý SQLAlchemy 2.0
-        # už neakceptuje.
-        url = DB_URL.replace("postgres://", "postgresql://", 1)
-        eng = create_engine(url, pool_pre_ping=True, future=True)
-        with eng.begin() as conn:
-            conn.execute(text(_TOKEN_DDL))
-        _engine = eng
-    return _engine
 
 # meastype kódy. Hodnota v API = value * 10^unit
 MEASTYPES = {
@@ -114,7 +85,8 @@ def _iso(epoch) -> str:
 
 
 class WithingsConnector:
-    def __init__(self):
+    def __init__(self, user_id: int):
+        self.user_id = user_id
         self.client_id = os.environ.get("WITHINGS_CLIENT_ID", "")
         self.client_secret = os.environ.get("WITHINGS_CLIENT_SECRET", "")
         self.redirect_uri = os.environ.get("WITHINGS_REDIRECT_URI", "")
@@ -135,7 +107,11 @@ class WithingsConnector:
     def is_authenticated(self) -> bool:
         return bool(self._refresh_token)
 
-    def get_authorize_url(self, state: str = "medicalai") -> str:
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret and self.redirect_uri)
+
+    def get_authorize_url(self, state: str) -> str:
         params = {
             "response_type": "code",
             "client_id": self.client_id,
@@ -174,7 +150,9 @@ class WithingsConnector:
 
         body = resp.json()
         if body.get("status") != 0:
-            print(f"[WITHINGS] Token request zlyhal: {body}")
+            # Celé telo nelogujeme - pri úspechu by v ňom boli tokeny.
+            logger.warning("[WITHINGS] Token request pre user %s zlyhal: status=%s error=%s",
+                           self.user_id, body.get("status"), body.get("error"))
             return False
 
         b = body["body"]
@@ -183,85 +161,42 @@ class WithingsConnector:
         self._refresh_token = b["refresh_token"]
         self._expires_at = time.time() + int(b["expires_in"]) - 300
         self._save_tokens(b.get("userid"))
-        print(f"[WITHINGS] Autentifikované, userid={b.get('userid')}")
+        logger.info("[WITHINGS] User %s pripojený (withings userid=%s)", self.user_id, b.get("userid"))
         return True
 
     def _load_tokens(self) -> None:
-        """Najprv databáza, potom súbor. Súborová vetva slúži aj na migráciu."""
-        engine = _db()
-        if engine is not None:
-            try:
-                with engine.begin() as conn:
-                    row = conn.execute(text(
-                        "SELECT access_token, refresh_token, expires_at "
-                        "FROM withings_tokens WHERE id = 1"
-                    )).first()
-                if row:
-                    self._access_token = row[0]
-                    self._refresh_token = row[1]
-                    self._expires_at = float(row[2])
-                    print("[WITHINGS] Tokeny načítané z databázy")
-                    return
-            except Exception as e:
-                print(f"[WITHINGS] Tokeny sa nepodarilo načítať z DB: {e}")
-
-        if not TOKEN_FILE.exists():
-            return
+        session = get_session()
         try:
-            data = json.loads(TOKEN_FILE.read_text())
-            self._access_token = data.get("access_token")
-            self._refresh_token = data.get("refresh_token")
-            self._expires_at = data.get("expires_at", 0)
-            print("[WITHINGS] Tokeny načítané zo súboru")
-            if engine is not None and self._refresh_token:
-                # Prenesieme starý súborový token do DB, nech netreba
-                # autorizovať znova.
-                self._save_tokens(data.get("userid"))
-        except Exception as e:
-            print(f"[WITHINGS] Tokeny sa nepodarilo načítať: {e}")
+            row = (session.query(WearableConnection)
+                   .filter_by(user_id=self.user_id, provider=PROVIDER).first())
+            if row is None:
+                return
+            self._access_token = token_crypto.decrypt(row.access_token_enc)
+            self._refresh_token = token_crypto.decrypt(row.refresh_token_enc)
+            self._expires_at = float(row.expires_at or 0)
+        finally:
+            session.close()
 
     def _save_tokens(self, userid: Optional[int] = None) -> None:
-        engine = _db()
-        if engine is not None:
-            try:
-                with engine.begin() as conn:
-                    conn.execute(text("""
-                        INSERT INTO withings_tokens
-                            (id, withings_user_id, access_token, refresh_token,
-                             expires_at, updated_at)
-                        VALUES (1, :uid, :at, :rt, :exp, now())
-                        ON CONFLICT (id) DO UPDATE SET
-                            withings_user_id = COALESCE(
-                                EXCLUDED.withings_user_id,
-                                withings_tokens.withings_user_id
-                            ),
-                            access_token  = EXCLUDED.access_token,
-                            refresh_token = EXCLUDED.refresh_token,
-                            expires_at    = EXCLUDED.expires_at,
-                            updated_at    = now()
-                    """), {
-                        "uid": userid,
-                        "at": self._access_token,
-                        "rt": self._refresh_token,
-                        "exp": self._expires_at,
-                    })
-                return
-            except Exception as e:
-                # Pád zápisu do DB nesmie zhodiť autorizáciu - spadneme na súbor.
-                print(f"[WITHINGS] Tokeny sa nepodarilo uložiť do DB: {e}")
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        TOKEN_FILE.write_text(json.dumps({
-            "access_token": self._access_token,
-            "refresh_token": self._refresh_token,
-            "expires_at": self._expires_at,
-            "userid": userid,
-        }))
-        # Tokeny k zdravotným dátam - nenechávaj ich čitateľné pre kohokoľvek
+        session = get_session()
         try:
-            os.chmod(TOKEN_FILE, 0o600)
+            row = (session.query(WearableConnection)
+                   .filter_by(user_id=self.user_id, provider=PROVIDER).first())
+            if row is None:
+                row = WearableConnection(user_id=self.user_id, provider=PROVIDER,
+                                         connected_at=datetime.now())
+                session.add(row)
+            if userid is not None:
+                row.external_user_id = str(userid)
+            row.access_token_enc = token_crypto.encrypt(self._access_token)
+            row.refresh_token_enc = token_crypto.encrypt(self._refresh_token)
+            row.expires_at = self._expires_at
+            session.commit()
         except Exception:
-            pass
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     # ------------------------------------------------------------------
     # HTTP
@@ -284,7 +219,7 @@ class WithingsConnector:
         token = self._access_token
         if not token or time.time() >= self._expires_at:
             if not await self._refresh_locked(token):
-                raise RuntimeError("Withings: token vypršal, treba znovu autorizovať")
+                raise WithingsNotConnected("Withings: prepojenie vypršalo, pripojte Withings znova")
             token = self._access_token
 
         payload = {"action": action,
@@ -304,7 +239,7 @@ class WithingsConnector:
         if status == 401:
             if await self._refresh_locked(token):
                 return await self._call(path, action, **params)
-            raise RuntimeError("Withings: neplatný token")
+            raise WithingsNotConnected("Withings: prepojenie bolo zrušené, pripojte Withings znova")
 
         if status != 0:
             raise RuntimeError(f"Withings {path}/{action}: status={status} "
@@ -424,7 +359,7 @@ class WithingsConnector:
                     data_fields="hr,rr,sdnn_1,rmssd,mvt_score,snoring",
                 )
             except Exception as e:
-                print(f"[WITHINGS] HRV pre noc {night['startdate']} zlyhalo: {e}")
+                logger.warning("[WITHINGS] HRV pre noc %s zlyhalo: %s", night['startdate'], e)
                 continue
 
             # Kľúčom je časová značka, nie poradie. Withings vracia noc
@@ -562,11 +497,18 @@ class WithingsConnector:
         }
 
 
-_connector: Optional[WithingsConnector] = None
+_connectors: Dict[int, WithingsConnector] = {}
 
 
-def get_withings_connector() -> WithingsConnector:
-    global _connector
-    if _connector is None:
-        _connector = WithingsConnector()
-    return _connector
+def get_withings_connector(user_id: int) -> WithingsConnector:
+    """The connector for one user. Kept in memory so its refresh lock is shared."""
+    connector = _connectors.get(user_id)
+    if connector is None:
+        connector = WithingsConnector(user_id)
+        _connectors[user_id] = connector
+    return connector
+
+
+def forget_connector(user_id: int) -> None:
+    """Drop the cached connector, e.g. after the user disconnected or was deleted."""
+    _connectors.pop(user_id, None)

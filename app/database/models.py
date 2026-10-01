@@ -53,6 +53,28 @@ class AiUsage(Base):
     count = Column(Integer, nullable=False, default=0)
 
 
+class WearableConnection(Base):
+    """One user's link to a wearable/health service (Withings for now).
+
+    Everyone signs in to their own Withings account through OAuth and this row
+    keeps the tokens that come back, so one developer app at Withings serves
+    every user. Tokens are encrypted (app/integrations/token_crypto.py) and
+    never leave the server: the export lists the connection, not its tokens.
+    """
+    __tablename__ = 'wearable_connections'
+    __table_args__ = (UniqueConstraint('user_id', 'provider', name='uq_wearable_connection_user_provider'),)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    provider = Column(String(32), nullable=False)
+    external_user_id = Column(String(64), nullable=True)
+    access_token_enc = Column(Text, nullable=True)
+    refresh_token_enc = Column(Text, nullable=True)
+    expires_at = Column(Float, nullable=False, default=0)
+    connected_at = Column(DateTime, default=datetime.now)
+    last_sync_at = Column(DateTime, nullable=True)
+    last_sync_error = Column(Text, nullable=True)
+
+
 class Patient(Base):
     __tablename__ = 'patients'
     id = Column(Integer, primary_key=True)

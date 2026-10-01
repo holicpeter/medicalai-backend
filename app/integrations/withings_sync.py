@@ -64,14 +64,14 @@ def _day(iso: str):
     return datetime.fromisoformat(iso).date()
 
 
-async def collect_daily_metrics(days: int = 30, hrv_nights: int = 14) -> Dict:
+async def collect_daily_metrics(user_id: int, days: int = 30, hrv_nights: int = 14) -> Dict:
     """
     Stiahne z Withings všetko podstatné a zloží to na denné hodnoty.
 
     Vracia {(metrika, dátum): hodnota}. Kroky a vzdialenosť zámerne vynechávame
     — tie rieši aktivitná časť appky, nie interpretované metriky.
     """
-    connector = get_withings_connector()
+    connector = get_withings_connector(user_id)
     daily: Dict[tuple, List[float]] = defaultdict(list)
 
     # --- bodové merania (tep, SpO2, teplota, váha, VO2max) ---
@@ -111,16 +111,15 @@ async def collect_daily_metrics(days: int = 30, hrv_nights: int = 14) -> Dict:
     return {key: statistics.median(vals) for key, vals in daily.items() if vals}
 
 
-async def sync_withings_to_db(patient_id: int, days: int = 30, hrv_nights: int = 14) -> Dict:
-    """Stiahne dáta a zapíše ich do health_records. Idempotentné.
+async def sync_withings_to_db(user_id: int, patient_id: int, days: int = 30,
+                              hrv_nights: int = 14) -> Dict:
+    """Stiahne dáta z Withings účtu používateľa a zapíše ich do jeho health_records.
 
-    patient_id is the calling admin's own patient id (see app/api/integrations.py)
-    rather than "whichever Patient row sorts first" — this endpoint is
-    admin-only, but ADMIN_EMAILS can list more than one address, and the old
-    session.query(Patient).first() would have let a second admin's sync
-    silently write into (or overwrite) the first admin's records.
+    Idempotentné. user_id určuje, čie Withings prepojenie sa použije,
+    patient_id, kam sa dáta zapíšu — volajúci zaručuje, že patria k sebe
+    (app/integrations/connections.py).
     """
-    values = await collect_daily_metrics(days, hrv_nights)
+    values = await collect_daily_metrics(user_id, days, hrv_nights)
     if not values:
         return {"written": 0, "updated": 0, "metrics": []}
 

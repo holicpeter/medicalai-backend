@@ -84,7 +84,7 @@ def get_current_patient_id(user: User = Depends(get_current_user)) -> int:
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
-    """Gate for the Garmin/Withings/Calendar integration endpoints.
+    """Gate for the Garmin/Calendar integration endpoints (Withings is per user).
 
     Those connectors keep one OAuth session per process (see
     app/integrations/*_connector.py) — not per user — because they were built
@@ -99,7 +99,7 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
             status_code=403,
             detail=(
                 "Táto integrácia je zatiaľ dostupná len pre administrátora účtu "
-                "(Garmin/Withings/Kalendár zdieľajú jedno pripojenie pre celú appku)."
+                "(Garmin a Kalendár zdieľajú jedno pripojenie pre celú appku)."
             ),
         )
     return user

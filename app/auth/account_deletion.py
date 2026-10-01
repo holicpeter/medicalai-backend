@@ -29,6 +29,7 @@ from app.database import (
     NutritionEntry,
     Patient,
     User,
+    WearableConnection,
     get_session,
 )
 
@@ -80,6 +81,9 @@ def delete_account(user_id: int) -> Dict[str, int]:
             session.delete(patient)
             removed["patients"] = 1
 
+        removed["wearable_connections"] = (
+            session.query(WearableConnection).filter_by(user_id=user_id).delete(synchronize_session=False)
+        )
         removed["ai_usage"] = (
             session.query(AiUsage).filter_by(user_id=user_id).delete(synchronize_session=False)
         )
@@ -93,6 +97,11 @@ def delete_account(user_id: int) -> Dict[str, int]:
         session.close()
 
     _remove_files(files)
+    try:
+        from app.integrations.withings_connector import forget_connector
+        forget_connector(user_id)
+    except Exception as e:
+        logger.warning("account deletion: could not drop the Withings connector: %s", e)
     if patient_id is not None:
         _drop_caches(patient_id)
 

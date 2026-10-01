@@ -14,12 +14,12 @@ from typing import Any, Dict, List
 from sqlalchemy import inspect
 
 from app.auth.account_deletion import PATIENT_SCOPED
-from app.database import AiUsage, Document, DocumentChunk, Patient, User, get_session
+from app.database import AiUsage, Document, DocumentChunk, Patient, User, WearableConnection, get_session
 
 EXPORT_FORMAT_VERSION = 1
 
 # Never leave the server, not even to the account's owner.
-_EXCLUDED_COLUMNS = {"password_hash"}
+_EXCLUDED_COLUMNS = {"password_hash", "access_token_enc", "refresh_token_enc"}
 
 
 def _value(v: Any) -> Any:
@@ -82,6 +82,10 @@ def export_account(user_id: int) -> Dict[str, Any]:
             "account": _row(user),
             "patient_profile": _row(patient) if patient is not None else None,
             "data": data,
+            "connections": _rows(
+                session.query(WearableConnection).filter_by(user_id=user_id)
+                .order_by(WearableConnection.id).all()
+            ),
             "ai_usage": _rows(
                 session.query(AiUsage).filter_by(user_id=user_id).order_by(AiUsage.day).all()
             ),
