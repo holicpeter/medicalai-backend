@@ -110,6 +110,12 @@ class Settings(BaseSettings):
     WITHINGS_CLIENT_SECRET: str = ""
     WITHINGS_REDIRECT_URI: str = ""
 
+    # Where the web app lives. After connecting a wearable, the OAuth callback
+    # sends the browser back to APP_BASE_URL/connections.
+    APP_BASE_URL: str = "https://medicalai.peterholic.com"
+    # How often every connected wearable is synced in the background. 0 = off.
+    WEARABLE_SYNC_INTERVAL_HOURS: float = 6
+
     # OCR Settings
     TESSERACT_LANG: str = "slk"
 
