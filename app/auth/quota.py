@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import AiUsage, User, get_session
+from app.i18n import tr
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +33,28 @@ _TZ = ZoneInfo("Europe/Bratislava")
 QUOTA_HEADER = "X-AI-Quota-Exceeded"
 
 # kind -> (settings attribute holding the limit, label on the account screen,
-#          phrase for the "used up" message)
+#          phrase for the "used up" message), each text as (Slovak, English)
 KINDS: Dict[str, tuple] = {
-    "chat": ("AI_DAILY_LIMIT_CHAT", "Správy v AI chate", "na správy v AI chate"),
+    "chat": (
+        "AI_DAILY_LIMIT_CHAT",
+        ("Správy v AI chate", "AI chat messages"),
+        ("na správy v AI chate", "for AI chat messages"),
+    ),
     "documents": (
         "AI_DAILY_LIMIT_DOCUMENTS",
-        "Nahraté dokumenty (čítanie cez AI)",
-        "na čítanie dokumentov cez AI",
+        ("Nahraté dokumenty (čítanie cez AI)", "Uploaded documents (read by AI)"),
+        ("na čítanie dokumentov cez AI", "for reading documents with AI"),
     ),
-    "nutrition": ("AI_DAILY_LIMIT_NUTRITION", "Analýzy jedla", "na analýzy jedla"),
-    "risk_analysis": ("AI_DAILY_LIMIT_RISK_ANALYSIS", "AI analýzy rizík", "na AI analýzy rizík"),
+    "nutrition": (
+        "AI_DAILY_LIMIT_NUTRITION",
+        ("Analýzy jedla", "Meal analyses"),
+        ("na analýzy jedla", "for meal analyses"),
+    ),
+    "risk_analysis": (
+        "AI_DAILY_LIMIT_RISK_ANALYSIS",
+        ("AI analýzy rizík", "AI risk analyses"),
+        ("na AI analýzy rizík", "for AI risk analyses"),
+    ),
 }
 
 
@@ -62,9 +75,10 @@ def is_unlimited(user: User) -> bool:
 
 
 def exceeded_message(kind: str) -> str:
-    return (
-        f"Minuli ste dnešné bezplatné kredity {KINDS[kind][2]} "
-        f"({_limit(kind)} denne). Obnovia sa o polnoci."
+    phrase = tr(*KINDS[kind][2])
+    return tr(
+        f"Minuli ste dnešné bezplatné kredity {phrase} ({_limit(kind)} denne). Obnovia sa o polnoci.",
+        f"You've used today's free credits {phrase} ({_limit(kind)} a day). They reset at midnight.",
     )
 
 
@@ -184,7 +198,7 @@ def usage_summary(user: User) -> List[dict]:
         count = used.get(kind, 0)
         out.append({
             "kind": kind,
-            "label": label,
+            "label": tr(*label),
             "used": count,
             "limit": None if unlimited else limit,
             "remaining": None if unlimited else max(limit - count, 0),

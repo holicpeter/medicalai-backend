@@ -33,6 +33,7 @@ from app.auth.quota import is_unlimited, resets_at, usage_summary
 from app.auth.security import create_access_token, hash_password, verify_password
 from app.config import settings
 from app.database import Patient, User, get_session
+from app.i18n import tr
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 def _validate_email(value: str) -> str:
     value = value.strip().lower()
     if not _EMAIL_RE.match(value) or len(value) > 255:
-        raise ValueError("Neplatná emailová adresa.")
+        raise ValueError(tr("Neplatná emailová adresa.", "Invalid email address."))
     return value
 
 
@@ -71,7 +72,7 @@ class RegisterRequest(BaseModel):
     def _consent_must_be_given(cls, value: bool) -> bool:
         if not value:
             raise ValueError(
-                "Súhlas so spracovaním zdravotných údajov je potrebný na vytvorenie účtu."
+                tr("Súhlas so spracovaním zdravotných údajov je potrebný na vytvorenie účtu.", "Consent to the processing of health data is required to create an account.")
             )
         return value
 
@@ -143,7 +144,7 @@ async def register(data: RegisterRequest, request: Request, response: Response):
             # only way to give a useful error to someone who signed up
             # before and forgot. Rate limiting above is what keeps this from
             # being an enumeration oracle at scale.
-            raise HTTPException(status_code=409, detail="Účet s týmto emailom už existuje.")
+            raise HTTPException(status_code=409, detail=tr("Účet s týmto emailom už existuje.", "An account with this email already exists."))
 
         user = User(
             email=email,
@@ -172,7 +173,7 @@ async def register(data: RegisterRequest, request: Request, response: Response):
     except Exception as e:
         session.rollback()
         logger.exception("register failed")
-        raise HTTPException(status_code=500, detail="Registrácia zlyhala.") from e
+        raise HTTPException(status_code=500, detail=tr("Registrácia zlyhala.", "Sign-up failed.")) from e
     finally:
         session.close()
 
@@ -196,12 +197,12 @@ async def login(data: LoginRequest, request: Request, response: Response):
         password_ok = verify_password(data.password, password_hash)
 
         if user is None or not password_ok or not user.is_active:
-            raise HTTPException(status_code=401, detail="Nesprávny email alebo heslo.")
+            raise HTTPException(status_code=401, detail=tr("Nesprávny email alebo heslo.", "Wrong email or password."))
 
         patient = session.query(Patient).filter_by(user_id=user.id).first()
         if patient is None:
             logger.error("login: user %s has no linked Patient row", user.id)
-            raise HTTPException(status_code=500, detail="Profil sa nenašiel. Kontaktujte podporu.")
+            raise HTTPException(status_code=500, detail=tr("Profil sa nenašiel. Kontaktujte podporu.", "Profile not found. Please contact support."))
 
         logger.info("auth: logged in user id=%s", user.id)
         return _issue_session(request, response, user, patient.id)
@@ -223,7 +224,7 @@ async def me(current_user: User = Depends(get_current_user)):
     try:
         patient = session.query(Patient).filter_by(user_id=current_user.id).first()
         if patient is None:
-            raise HTTPException(status_code=500, detail="Profil sa nenašiel. Kontaktujte podporu.")
+            raise HTTPException(status_code=500, detail=tr("Profil sa nenašiel. Kontaktujte podporu.", "Profile not found. Please contact support."))
         return _serialize(current_user, patient.id)
     finally:
         session.close()
@@ -260,7 +261,7 @@ async def delete_my_account(
     check_rate_limit(request, bucket="delete-account")
 
     if not verify_password(data.password, current_user.password_hash):
-        raise HTTPException(status_code=401, detail="Nesprávne heslo.")
+        raise HTTPException(status_code=401, detail=tr("Nesprávne heslo.", "Wrong password."))
 
     # The admin account also holds the Garmin/Withings/Calendar connections
     # for the whole app; deleting it by accident from a phone would take
@@ -268,15 +269,19 @@ async def delete_my_account(
     if is_unlimited(current_user):
         raise HTTPException(
             status_code=403,
-            detail="Administrátorský účet sa nedá zmazať v aplikácii. "
-                   "Najprv odstráňte email z ADMIN_EMAILS.",
+            detail=tr("Administrátorský účet sa nedá zmazať v aplikácii. "
+                      "Najprv odstráňte email z ADMIN_EMAILS.",
+                      "The administrator account cannot be deleted in the app. "
+                      "Remove the email from ADMIN_EMAILS first."),
         )
 
     if current_user.email.lower() in {e.lower() for e in settings.DEMO_EMAILS}:
         raise HTTPException(
             status_code=403,
-            detail="Ukážkový účet sa nedá zmazať — zdieľajú ho všetci návštevníci. "
-                   "Vo vlastnom účte táto funkcia funguje.",
+            detail=tr("Ukážkový účet sa nedá zmazať — zdieľajú ho všetci návštevníci. "
+                      "Vo vlastnom účte táto funkcia funguje.",
+                      "The demo account cannot be deleted — all visitors share it. "
+                      "This works in your own account."),
         )
 
     try:
@@ -284,7 +289,7 @@ async def delete_my_account(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail="Zmazanie účtu zlyhalo, nič sa nezmazalo. Skúste to znova.",
+            detail=tr("Zmazanie účtu zlyhalo, nič sa nezmazalo. Skúste to znova.", "Deleting the account failed and nothing was deleted. Please try again."),
         ) from e
 
     clear_auth_cookie(response)
@@ -321,10 +326,10 @@ async def demo_login(request: Request, response: Response):
     try:
         user = session.query(User).filter_by(email=settings.DEMO_EMAIL.lower()).first()
         if user is None or not user.is_active or not is_demo_email(user.email):
-            raise HTTPException(status_code=503, detail="Ukážka momentálne nie je dostupná.")
+            raise HTTPException(status_code=503, detail=tr("Ukážka momentálne nie je dostupná.", "The demo is not available right now."))
         patient = session.query(Patient).filter_by(user_id=user.id).first()
         if patient is None:
-            raise HTTPException(status_code=503, detail="Ukážka momentálne nie je dostupná.")
+            raise HTTPException(status_code=503, detail=tr("Ukážka momentálne nie je dostupná.", "The demo is not available right now."))
         return _issue_session(request, response, user, patient.id)
     finally:
         session.close()

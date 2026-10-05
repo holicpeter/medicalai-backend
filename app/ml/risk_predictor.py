@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from app.analysis.trend_analyzer import TrendAnalyzer
+from app.i18n import tr
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +229,7 @@ class RiskPredictor:
             'risk_level': 'unknown',
             'risk_percentage': 0,
             'factors': [],
-            'recommendations': ["Zadajte namerané hodnoty pre výpočet rizika"],
+            'recommendations': [tr("Zadajte namerané hodnoty pre výpočet rizika", "Enter measured values to calculate the risk")],
             'evaluated_metrics': [],
             'missing_metrics': list(needed),
             'data_complete': False,
@@ -259,34 +260,34 @@ class RiskPredictor:
         if systolic is not None:
             if systolic >= 160:
                 risk_score += 3
-                factors.append("Vysoký systolický tlak")
+                factors.append(tr("Vysoký systolický tlak", "High systolic blood pressure"))
             elif systolic >= 140:
                 risk_score += 2
-                factors.append("Mierne zvýšený systolický tlak")
+                factors.append(tr("Mierne zvýšený systolický tlak", "Slightly raised systolic blood pressure"))
 
         ldl = features.get('ldl')
         if ldl is not None:
             if ldl >= 4.0:
                 risk_score += 2
-                factors.append("Vysoký LDL cholesterol")
+                factors.append(tr("Vysoký LDL cholesterol", "High LDL cholesterol"))
             elif ldl >= 3.0:
                 risk_score += 1
-                factors.append("Mierne zvýšený LDL cholesterol")
+                factors.append(tr("Mierne zvýšený LDL cholesterol", "Slightly raised LDL cholesterol"))
 
         # HDL cholesterol (nízky je rizikový)
         hdl = features.get('hdl')
         if hdl is not None and hdl < 1.0:
             risk_score += 2
-            factors.append("Nízky HDL cholesterol")
+            factors.append(tr("Nízky HDL cholesterol", "Low HDL cholesterol"))
 
         bmi = features.get('bmi')
         if bmi is not None:
             if bmi >= 30:
                 risk_score += 2
-                factors.append("Obezita")
+                factors.append(tr("Obezita", "Obesity"))
             elif bmi >= 25:
                 risk_score += 1
-                factors.append("Nadváha")
+                factors.append(tr("Nadváha", "Overweight"))
 
         risk_percentage = min(100, risk_score * 10)
         risk_level = self._level(risk_percentage, high=20, medium=10)
@@ -312,24 +313,24 @@ class RiskPredictor:
         if hba1c is not None:
             if hba1c >= 6.5:
                 risk_score += 4
-                factors.append("Diabetické hodnoty HbA1c")
+                factors.append(tr("Diabetické hodnoty HbA1c", "HbA1c in the diabetic range"))
             elif hba1c >= 5.7:
                 risk_score += 2
-                factors.append("Prediabetické hodnoty HbA1c")
+                factors.append(tr("Prediabetické hodnoty HbA1c", "HbA1c in the prediabetic range"))
 
         glucose = features.get('glucose')
         if glucose is not None:
             if glucose >= 7.0:
                 risk_score += 3
-                factors.append("Vysoká glukóza nalačno")
+                factors.append(tr("Vysoká glukóza nalačno", "High fasting glucose"))
             elif glucose >= 5.6:
                 risk_score += 2
-                factors.append("Zvýšená glukóza nalačno")
+                factors.append(tr("Zvýšená glukóza nalačno", "Raised fasting glucose"))
 
         bmi = features.get('bmi')
         if bmi is not None and bmi >= 30:
             risk_score += 2
-            factors.append("Obezita - rizikový faktor pre diabetes")
+            factors.append(tr("Obezita - rizikový faktor pre diabetes", "Obesity - a risk factor for diabetes"))
 
         risk_percentage = min(100, risk_score * 12)
         risk_level = self._level(risk_percentage, high=25, medium=15)
@@ -358,7 +359,7 @@ class RiskPredictor:
             criteria_evaluated += 1
             if bmi >= 30:
                 criteria_met += 1
-                factors.append("Abdominálna obezita")
+                factors.append(tr("Abdominálna obezita", "Abdominal obesity"))
 
         # 2. Triglyceridy
         tg = features.get('triglycerides')
@@ -366,7 +367,7 @@ class RiskPredictor:
             criteria_evaluated += 1
             if tg >= 1.7:
                 criteria_met += 1
-                factors.append("Zvýšené triglyceridy")
+                factors.append(tr("Zvýšené triglyceridy", "Raised triglycerides"))
 
         # 3. HDL cholesterol
         hdl = features.get('hdl')
@@ -374,7 +375,7 @@ class RiskPredictor:
             criteria_evaluated += 1
             if hdl < 1.0:
                 criteria_met += 1
-                factors.append("Nízky HDL cholesterol")
+                factors.append(tr("Nízky HDL cholesterol", "Low HDL cholesterol"))
 
         # 4. Krvný tlak
         systolic = features.get('systolic')
@@ -384,7 +385,7 @@ class RiskPredictor:
             if (systolic is not None and systolic >= 130) or \
                (diastolic is not None and diastolic >= 85):
                 criteria_met += 1
-                factors.append("Zvýšený krvný tlak")
+                factors.append(tr("Zvýšený krvný tlak", "Raised blood pressure"))
 
         # 5. Glukóza nalačno
         glucose = features.get('glucose')
@@ -392,7 +393,7 @@ class RiskPredictor:
             criteria_evaluated += 1
             if glucose >= 5.6:
                 criteria_met += 1
-                factors.append("Zvýšená glukóza nalačno")
+                factors.append(tr("Zvýšená glukóza nalačno", "Raised fasting glucose"))
 
         if criteria_met >= 3:
             risk_level = "high"
@@ -445,7 +446,7 @@ class RiskPredictor:
             'risk_level': risk_level,
             'risk_percentage': risk_percentage,
             'factors': [measured] if measured else [],
-            'recommendations': ["Pravidelné meranie tlaku", "Redukcia soli v strave"],
+            'recommendations': [tr("Pravidelné meranie tlaku", "Regular blood pressure checks"), tr("Redukcia soli v strave", "Less salt in your diet")],
             **coverage,
         }
 
@@ -457,40 +458,40 @@ class RiskPredictor:
         """Odporúčania pre kardiovaskulárne zdravie"""
         if risk_level == "high":
             return [
-                "Urgentná konzultácia s kardiológom",
-                "Pravidelné monitorovanie krvného tlaku",
-                "Zvážte liečbu statínmi",
-                "Úprava stravy - zníženie nasýtených tukov",
-                "Zvýšená fyzická aktivita",
+                tr("Urgentná konzultácia s kardiológom", "See a cardiologist urgently"),
+                tr("Pravidelné monitorovanie krvného tlaku", "Regular blood pressure monitoring"),
+                tr("Zvážte liečbu statínmi", "Discuss statin treatment with your doctor"),
+                tr("Úprava stravy - zníženie nasýtených tukov", "Adjust your diet - less saturated fat"),
+                tr("Zvýšená fyzická aktivita", "More physical activity"),
             ]
         elif risk_level == "medium":
             return [
-                "Kontrola u kardiológa do 3 mesiacov",
-                "Pravidelná aeróbna aktivita",
-                "Zdravá strava s nízkym obsahom cholesterolu",
+                tr("Kontrola u kardiológa do 3 mesiacov", "Cardiology check-up within 3 months"),
+                tr("Pravidelná aeróbna aktivita", "Regular aerobic exercise"),
+                tr("Zdravá strava s nízkym obsahom cholesterolu", "A healthy low-cholesterol diet"),
             ]
-        return ["Udržujte zdravý životný štýl", "Pravidelné ročné kontroly"]
+        return [tr("Udržujte zdravý životný štýl", "Keep up a healthy lifestyle"), tr("Pravidelné ročné kontroly", "Regular yearly check-ups")]
 
     def _get_diabetes_recommendations(self, risk_level: str) -> List[str]:
         """Odporúčania pre prevenciu diabetu"""
         if risk_level == "high":
             return [
-                "Konzultácia s diabetológom",
-                "Pravidelná kontrola glykémie",
-                "Redukcia jednoduchých cukrov",
-                "Zvýšenie fyzickej aktivity",
-                "Kontrola telesnej hmotnosti",
+                tr("Konzultácia s diabetológom", "See a diabetologist"),
+                tr("Pravidelná kontrola glykémie", "Regular blood sugar checks"),
+                tr("Redukcia jednoduchých cukrov", "Cut down on simple sugars"),
+                tr("Zvýšenie fyzickej aktivity", "Increase physical activity"),
+                tr("Kontrola telesnej hmotnosti", "Keep your weight in check"),
             ]
-        return ["Zdravá strava", "Pravidelná fyzická aktivita"]
+        return [tr("Zdravá strava", "A healthy diet"), tr("Pravidelná fyzická aktivita", "Regular physical activity")]
 
     def _get_metabolic_recommendations(self, risk_level: str) -> List[str]:
         """Odporúčania pre metabolický syndróm"""
         if risk_level == "high":
             return [
-                "Komplexná lekárska kontrola",
-                "Redukcia telesnej hmotnosti",
-                "Zvýšenie fyzickej aktivity na 150 min/týždeň",
-                "Strava bohatá na vlákninu",
-                "Pravidelné sledovanie metabolických parametrov",
+                tr("Komplexná lekárska kontrola", "A comprehensive medical check-up"),
+                tr("Redukcia telesnej hmotnosti", "Lose some body weight"),
+                tr("Zvýšenie fyzickej aktivity na 150 min/týždeň", "Increase physical activity to 150 min/week"),
+                tr("Strava bohatá na vlákninu", "A fibre-rich diet"),
+                tr("Pravidelné sledovanie metabolických parametrov", "Regular monitoring of metabolic markers"),
             ]
-        return ["Prevencia nadváhy", "Pravidelná pohybová aktivita"]
+        return [tr("Prevencia nadváhy", "Preventing weight gain"), tr("Pravidelná pohybová aktivita", "Regular exercise")]

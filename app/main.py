@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -7,10 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from app.api import auth, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition
+from app.api import auth, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition, connections
 from app.auth.bootstrap import run_startup_tasks
 from app.auth.demo import demo_read_only
 from app.config import settings
+from app.i18n import language_middleware
 from app.database import init_database
 
 logging.basicConfig(
@@ -38,7 +40,14 @@ async def lifespan(app: FastAPI):
     # Admin migration and demo account, when their Railway variables are set
     # (app/auth/bootstrap.py). Before `yield`, so before any request is served.
     run_startup_tasks()
+
+    sync_task = None
+    if settings.WEARABLE_SYNC_INTERVAL_HOURS > 0:
+        from app.integrations.connections import periodic_sync_loop
+        sync_task = asyncio.create_task(periodic_sync_loop(settings.WEARABLE_SYNC_INTERVAL_HOURS))
     yield
+    if sync_task is not None:
+        sync_task.cancel()
 
 
 app = FastAPI(
@@ -52,6 +61,8 @@ app = FastAPI(
 # outermost, so CORS wraps this one and its 403 still carries the CORS
 # headers the browser needs to read it (and the X-Demo-Read-Only header).
 app.middleware("http")(demo_read_only)
+# Outside the demo check, so its refusal is already in the user's language.
+app.middleware("http")(language_middleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,6 +121,7 @@ app.include_router(analysis.router, prefix="/api/analysis", tags=["analysis"])
 app.include_router(predictions.router, prefix="/api/predictions", tags=["predictions"])
 app.include_router(chat.router)
 app.include_router(integrations.router)
+app.include_router(connections.router)
 app.include_router(manual_entry.router)
 app.include_router(apple_health.router)
 app.include_router(nutrition.router)

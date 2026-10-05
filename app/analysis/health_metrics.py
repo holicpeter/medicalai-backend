@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from app.analysis.sources import load_all_measurements
+from app.i18n import tr
 
 logger = logging.getLogger(__name__)
 
@@ -162,29 +163,32 @@ class HealthMetricsAnalyzer:
                 alerts.append({
                     'severity': 'high',
                     'metric': metric_name,
-                    'message': f'{metric_name} je výrazne nad normou',
+                    'message': tr(f'{metric_name} je výrazne nad normou', f'{metric_name} is well above the normal range'),
                     'value': value,
-                    'recommendation': f'Konzultujte s lekárom ohľadom {metric_name}',
+                    'recommendation': tr(f'Konzultujte s lekárom ohľadom {metric_name}', f'Talk to your doctor about {metric_name}'),
                 })
             elif status == 'warning':
                 alerts.append({
                     'severity': 'medium',
                     'metric': metric_name,
-                    'message': f'{metric_name} je mierne zvýšený',
+                    'message': tr(f'{metric_name} je mierne zvýšený', f'{metric_name} is slightly raised'),
                     'value': value,
-                    'recommendation': f'Monitorujte {metric_name} a zvážte úpravu životného štýlu',
+                    'recommendation': tr(f'Monitorujte {metric_name} a zvážte úpravu životného štýlu', f'Keep an eye on {metric_name} and consider lifestyle changes'),
                 })
         return alerts
 
     def _generate_basic_recommendations(self, latest_metrics: Dict) -> list:
         if not latest_metrics or 'error' in latest_metrics:
             return []
-        recs = [{'category': 'general', 'title': 'Pravidelné kontroly',
-                 'description': 'Odporúčame pravidelnú kontrolu zdravotného stavu'}]
+        recs = [{'category': 'general', 'title': tr('Pravidelné kontroly', 'Regular check-ups'),
+                 'description': tr('Odporúčame pravidelnú kontrolu zdravotného stavu',
+                                   'We recommend regular health check-ups')}]
         if 'glucose' in latest_metrics or 'hba1c' in latest_metrics:
-            recs.append({'category': 'diabetes_prevention', 'title': 'Kontrola glykémie',
-                         'description': 'Monitorujte hladiny cukru a zvážte konzultáciu s diabetológom'})
+            recs.append({'category': 'diabetes_prevention', 'title': tr('Kontrola glykémie', 'Blood sugar check'),
+                         'description': tr('Monitorujte hladiny cukru a zvážte konzultáciu s diabetológom',
+                                           'Monitor your blood sugar and consider seeing a diabetologist')})
         if 'blood_pressure' in latest_metrics:
-            recs.append({'category': 'cardiovascular', 'title': 'Kardiovaskulárne zdravie',
-                         'description': 'Pravidelne kontrolujte krvný tlak a konzultujte s kardiológom'})
+            recs.append({'category': 'cardiovascular', 'title': tr('Kardiovaskulárne zdravie', 'Heart health'),
+                         'description': tr('Pravidelne kontrolujte krvný tlak a konzultujte s kardiológom',
+                                           'Check your blood pressure regularly and talk to a cardiologist')})
         return recs

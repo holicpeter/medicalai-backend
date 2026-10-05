@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from app.auth.security import decode_access_token
 from app.config import settings
 from app.database import User, get_session
+from app.i18n import tr
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,10 @@ DEMO_READ_ONLY_HEADER = "X-Demo-Read-Only"
 DEMO_READ_ONLY_MESSAGE = (
     "Toto je ukážkový účet s vymyslenými údajmi, v ktorom sa nič nedá meniť. "
     "Vytvorte si vlastný účet zdarma a vyskúšajte to na svojich dátach."
+)
+DEMO_READ_ONLY_MESSAGE_EN = (
+    "This is a demo account with made-up data in which nothing can be changed. "
+    "Create your own free account and try it with your own data."
 )
 
 # Requests a demo session may still make even though they are not GETs:
@@ -78,7 +83,7 @@ async def demo_read_only(request: Request, call_next):
     if request.url.path.startswith("/api/") and _is_write(request) and _is_demo_session(request):
         return JSONResponse(
             status_code=403,
-            content={"detail": DEMO_READ_ONLY_MESSAGE},
+            content={"detail": tr(DEMO_READ_ONLY_MESSAGE, DEMO_READ_ONLY_MESSAGE_EN)},
             headers={DEMO_READ_ONLY_HEADER: "1"},
         )
     return await call_next(request)

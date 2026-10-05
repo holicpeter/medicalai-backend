@@ -26,6 +26,8 @@ psycopg2-binary>=2.9.0
 # Password hashing itself uses stdlib hashlib.pbkdf2_hmac — no extra
 # dependency for that, so bcrypt/argon2/passlib were deliberately left out.
 PyJWT>=2.8.0
+# Encrypts wearable OAuth tokens at rest (app/integrations/token_crypto.py).
+cryptography>=42.0.0
 
 # scripts/apple_health_watcher.py
 requests>=2.31.0

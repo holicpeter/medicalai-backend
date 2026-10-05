@@ -10,6 +10,7 @@ from app.auth.quota import ai_call
 from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
 from app.config import settings
 from app.database import ChatMessage, User, get_session
+from app.i18n import current_lang, tr
 
 _MODEL = "claude-haiku-4-5-20251001"
 
@@ -29,6 +30,14 @@ try:
     from mistralai.client import MistralClient
 except Exception:
     MistralClient = None
+
+def _language_rule() -> str:
+    """The reply language follows the SK | EN switch in the app."""
+    if current_lang() == "en":
+        return ("Answer ONLY in English, even though these instructions and the patient's "
+                "data are written in Slovak")
+    return "Odpovedaj VÝHRADNE v slovenskom jazyku"
+
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -71,7 +80,7 @@ async def ask_question(
     Tvoja úloha je odpovedať na otázky pacienta o jeho zdravotných výsledkoch.
 
     DÔLEŽITÉ PRAVIDLÁ:
-    - Odpovedaj VÝHRADNE v slovenskom jazyku
+    - """ + _language_rule() + """
     - Buď presný, faktický a opieraj sa len o poskytnuté dáta
     - Nikdy si nevymýšľaj hodnoty, ktoré v dátach nie sú
     - Ak sa pacient pýta na obdobie, za ktoré nie sú merania, NEPÍŠ, že žiadne dáta
@@ -129,7 +138,7 @@ async def ask_question(
             else:
                 raise HTTPException(
                     status_code=500,
-                    detail="Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env",
+                    detail=tr("Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env", "The AI service is not configured on the server."),
                 )
 
             await asyncio.to_thread(_save_turn, patient_id, request.question, answer)
@@ -139,7 +148,7 @@ async def ask_question(
             raise
         except Exception as e:
             logger.error('Chat error: %s', e)
-            raise HTTPException(status_code=500, detail=f"Chyba pri spracovaní otázky: {str(e)}")
+            raise HTTPException(status_code=500, detail=tr("Chyba pri spracovaní otázky: ", "Could not process the question: ") + str(e))
 
 
 def load_history(patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
