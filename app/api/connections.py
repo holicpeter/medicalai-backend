@@ -9,6 +9,7 @@ from app.api.integrations import withings_authorize_url
 from app.auth.dependencies import get_current_user
 from app.database import User
 from app.integrations import connections
+from app.i18n import tr
 
 router = APIRouter(prefix="/api/connections", tags=["connections"])
 
@@ -32,7 +33,7 @@ async def sync_withings(user: User = Depends(get_current_user)):
     from app.integrations.withings_connector import WithingsNotConnected, get_withings_connector
 
     if not get_withings_connector(user.id).is_authenticated:
-        raise HTTPException(status_code=401, detail="Withings nie je pripojený.")
+        raise HTTPException(status_code=401, detail=tr("Withings nie je pripojený.", "Withings is not connected."))
     try:
         return await connections.sync_withings(user.id, days=30)
     except WithingsNotConnected as e:
@@ -40,13 +41,13 @@ async def sync_withings(user: User = Depends(get_current_user)):
     except Exception:
         raise HTTPException(
             status_code=502,
-            detail="Withings teraz neodpovedá. Skúste to o chvíľu znova.",
+            detail=tr("Withings teraz neodpovedá. Skúste to o chvíľu znova.", "Withings is not responding right now. Please try again in a moment."),
         )
 
 
 @router.delete("/{provider}")
 def disconnect(provider: str, user: User = Depends(get_current_user)):
     if provider not in _DISCONNECTABLE:
-        raise HTTPException(status_code=404, detail="Neznáme prepojenie.")
+        raise HTTPException(status_code=404, detail=tr("Neznáme prepojenie.", "Unknown connection."))
     connections.disconnect(user.id, provider)
     return {"disconnected": provider}

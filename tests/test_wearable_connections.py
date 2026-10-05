@@ -234,3 +234,21 @@ def test_a_token_encrypted_under_another_key_reads_as_disconnected(monkeypatch):
     stored = token_crypto.encrypt("secret-token")
     monkeypatch.setattr(settings, "SECRET_KEY", "a-completely-different-secret-key")
     assert token_crypto.decrypt(stored) is None
+
+
+def test_body_measures_ask_withings_for_the_scale_types(monkeypatch):
+    client, _ = _user()
+    _callback(client, _state_from(client))
+    asked = {}
+
+    async def fake_get_measures(self, days=30, meastypes=None):
+        asked["types"] = meastypes
+        return [{"metric": "weight", "value": 80.5, "unit": "kg", "measured_at": "2026-10-01T07:00:00+00:00",
+                 "device_id": None, "manual": False}]
+
+    monkeypatch.setattr(withings_connector.WithingsConnector, "get_measures", fake_get_measures)
+    r = client.get("/api/integrations/withings/measures", params={"kind": "body", "days": 365})
+    assert r.status_code == 200
+    assert r.json()["measures"][0]["metric"] == "weight"
+    assert asked["types"] == withings_connector.BODY_MEASTYPES
+    assert client.get("/api/integrations/withings/measures", params={"kind": "nope"}).status_code == 422

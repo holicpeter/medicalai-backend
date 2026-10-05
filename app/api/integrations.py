@@ -11,6 +11,7 @@ from app.auth.dependencies import get_current_user, require_admin
 from app.auth.security import decode_access_token
 from app.config import settings
 from app.database import User
+from app.i18n import tr
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ async def authenticate_garmin(request: GarminAuthRequest, _admin=Depends(require
     """
     try:
         if not GARMIN_AVAILABLE or get_garmin_connector is None:
-            raise HTTPException(status_code=503, detail="Garmin integrácia nie je dostupná (chýba balík alebo závislosti).")
+            raise HTTPException(status_code=503, detail=tr("Garmin integrácia nie je dostupná (chýba balík alebo závislosti).", "The Garmin integration is not available."))
         connector = get_garmin_connector()
         success = await connector.authenticate(request.email, request.password)
         
@@ -91,7 +92,7 @@ async def get_garmin_daily_data(date: Optional[str] = None, _admin=Depends(requi
     """
     try:
         if not GARMIN_AVAILABLE or get_garmin_connector is None:
-            raise HTTPException(status_code=503, detail="Garmin integrácia nie je dostupná (chýba balík alebo závislosti).")
+            raise HTTPException(status_code=503, detail=tr("Garmin integrácia nie je dostupná (chýba balík alebo závislosti).", "The Garmin integration is not available."))
         connector = get_garmin_connector()
         
         if not connector.is_authenticated:
@@ -114,7 +115,7 @@ async def sync_garmin_data(request: SyncRequest, background_tasks: BackgroundTas
     """
     try:
         if not GARMIN_AVAILABLE or get_garmin_connector is None:
-            raise HTTPException(status_code=503, detail="Garmin integrácia nie je dostupná (chýba balík alebo závislosti).")
+            raise HTTPException(status_code=503, detail=tr("Garmin integrácia nie je dostupná (chýba balík alebo závislosti).", "The Garmin integration is not available."))
         connector = get_garmin_connector()
         
         if not connector.is_authenticated:
@@ -145,11 +146,12 @@ def _withings_for(user: User):
     if not WITHINGS_AVAILABLE or get_withings_connector is None:
         raise HTTPException(
             status_code=503,
-            detail="Withings integrácia nie je dostupná (chýba balík alebo závislosti).",
+            detail=tr("Withings integrácia nie je dostupná (chýba balík alebo závislosti).",
+                      "The Withings integration is not available."),
         )
     connector = get_withings_connector(user.id)
     if not connector.is_authenticated:
-        raise HTTPException(status_code=401, detail="Withings nie je pripojený.")
+        raise HTTPException(status_code=401, detail=tr("Withings nie je pripojený.", "Withings is not connected."))
     return connector
 
 
@@ -168,12 +170,12 @@ async def _withings_call(coro):
 def withings_authorize_url(user: User) -> str:
     """Withings' consent page for this user. Shared with app/api/connections.py."""
     if not WITHINGS_AVAILABLE or get_withings_connector is None:
-        raise HTTPException(status_code=503, detail="Withings integrácia nie je dostupná.")
+        raise HTTPException(status_code=503, detail=tr("Withings integrácia nie je dostupná.", "The Withings integration is not available."))
     if is_demo_email(user.email):
-        raise HTTPException(status_code=403, detail="Ukážkový účet nemôže pripájať zariadenia.")
+        raise HTTPException(status_code=403, detail=tr("Ukážkový účet nemôže pripájať zariadenia.", "The demo account cannot connect devices."))
     connector = get_withings_connector(user.id)
     if not connector.is_configured:
-        raise HTTPException(status_code=503, detail="Withings zatiaľ nie je na serveri nastavený.")
+        raise HTTPException(status_code=503, detail=tr("Withings zatiaľ nie je na serveri nastavený.", "Withings is not set up on the server yet."))
     from app.integrations.connections import make_oauth_state
     return connector.get_authorize_url(make_oauth_state(user.id, "withings"))
 
@@ -259,11 +261,17 @@ async def get_withings_activity(days: int = 30, user: User = Depends(get_current
 
 
 @router.get("/withings/measures")
-async def get_withings_measures(days: int = 30, user: User = Depends(get_current_user)):
+async def get_withings_measures(days: int = 30, kind: str = "watch",
+                                user: User = Depends(get_current_user)):
     """
-    Merania — tep, SpO2, teplota, VO2max, EKG intervaly
+    Merania. kind=watch: tep, SpO2, teplota, VO2max, EKG intervaly z hodiniek.
+    kind=body: hmotnosť, tuk, svaly, voda, kosti a rýchlosť pulzovej vlny z váhy.
     """
-    return {"measures": await _withings_call(_withings_for(user).get_measures(days))}
+    from app.integrations.withings_connector import BODY_MEASTYPES, WATCH_MEASTYPES
+    if kind not in ("watch", "body"):
+        raise HTTPException(status_code=422, detail="kind must be 'watch' or 'body'")
+    meastypes = BODY_MEASTYPES if kind == "body" else WATCH_MEASTYPES
+    return {"measures": await _withings_call(_withings_for(user).get_measures(days, meastypes))}
 
 
 @router.get("/withings/hrv")
@@ -327,7 +335,7 @@ async def authenticate_calendar(_admin=Depends(require_admin)):
     """
     try:
         if not CALENDAR_AVAILABLE or get_calendar_connector is None:
-            raise HTTPException(status_code=503, detail="Calendar integrácia nie je dostupná (chýba balík alebo závislosti).")
+            raise HTTPException(status_code=503, detail=tr("Calendar integrácia nie je dostupná (chýba balík alebo závislosti).", "The Calendar integration is not available."))
         connector = get_calendar_connector()
         success = connector.authenticate()
         
@@ -350,7 +358,7 @@ async def get_calendar_events(days_back: int = 30, days_forward: int = 7, _admin
     """
     try:
         if not CALENDAR_AVAILABLE or get_calendar_connector is None:
-            raise HTTPException(status_code=503, detail="Calendar integrácia nie je dostupná (chýba balík alebo závislosti).")
+            raise HTTPException(status_code=503, detail=tr("Calendar integrácia nie je dostupná (chýba balík alebo závislosti).", "The Calendar integration is not available."))
         connector = get_calendar_connector()
         
         if not connector.is_authenticated:
@@ -378,9 +386,9 @@ async def analyze_correlations(request: CorrelationAnalysisRequest, _admin=Depen
     """
     try:
         if not GARMIN_AVAILABLE or get_garmin_connector is None:
-            raise HTTPException(status_code=503, detail="Garmin integrácia nie je dostupná (chýba balík alebo závislosti).")
+            raise HTTPException(status_code=503, detail=tr("Garmin integrácia nie je dostupná (chýba balík alebo závislosti).", "The Garmin integration is not available."))
         if not CALENDAR_AVAILABLE or get_calendar_connector is None:
-            raise HTTPException(status_code=503, detail="Calendar integrácia nie je dostupná (chýba balík alebo závislosti).")
+            raise HTTPException(status_code=503, detail=tr("Calendar integrácia nie je dostupná (chýba balík alebo závislosti).", "The Calendar integration is not available."))
         garmin = get_garmin_connector()
         calendar = get_calendar_connector()
         

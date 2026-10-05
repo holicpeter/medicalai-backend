@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 import anthropic
 from PIL import Image
+from app.i18n import current_lang
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +32,14 @@ Format:
   "total_carbs_g": 50.6,
   "total_fat_g": 5.8,
   "overall_confidence": 0.55,
-  "recommendation": "Jedna až dve krátke vety po slovensky, praktické a neklinické, NIE diagnóza."
+  "recommendation": "{recommendation_hint}"
 }
 
 Rules:
 - estimated_grams, calories, protein_g, carbs_g, fat_g must be numbers >= 0
 - confidence and overall_confidence are numbers between 0.0 and 1.0
-- name should be in Slovak
-- recommendation must be in Slovak
+- name should be in {language}
+- recommendation must be in {language}
 - include every distinct food item you can identify, even small ones
 """
 
@@ -70,8 +71,33 @@ invent items the description does not mention.
 
 """
 
-_ANALYSIS_INSTRUCTION = _PHOTO_ANALYSIS_INTRO + _ANALYSIS_OUTPUT_FORMAT
-_TEXT_ANALYSIS_INSTRUCTION = _TEXT_ANALYSIS_INTRO + _ANALYSIS_OUTPUT_FORMAT
+# One fixed text per language, so the prompt cache still hits for every user
+# of the same language.
+_LANGUAGE_FILL = {
+    "sk": {
+        "language": "Slovak",
+        "recommendation_hint": "Jedna až dve krátke vety po slovensky, praktické a neklinické, NIE diagnóza.",
+    },
+    "en": {
+        "language": "English",
+        "recommendation_hint": "One or two short sentences in English, practical and non-clinical, NOT a diagnosis.",
+    },
+}
+
+
+def _output_format(lang: str) -> str:
+    fill = _LANGUAGE_FILL.get(lang, _LANGUAGE_FILL["sk"])
+    return (_ANALYSIS_OUTPUT_FORMAT
+            .replace("{recommendation_hint}", fill["recommendation_hint"])
+            .replace("{language}", fill["language"]))
+
+
+def _photo_instruction() -> str:
+    return _PHOTO_ANALYSIS_INTRO + _output_format(current_lang())
+
+
+def _text_instruction() -> str:
+    return _TEXT_ANALYSIS_INTRO + _output_format(current_lang())
 
 
 def _read_image_as_jpeg(image_bytes: bytes) -> bytes:
@@ -117,7 +143,7 @@ class MealAnalyzer:
             },
             {
                 'type': 'text',
-                'text': _ANALYSIS_INSTRUCTION,
+                'text': _photo_instruction(),
                 'cache_control': {'type': 'ephemeral'},
             },
         ]
@@ -145,7 +171,7 @@ class MealAnalyzer:
         content = [
             {
                 'type': 'text',
-                'text': _TEXT_ANALYSIS_INSTRUCTION,
+                'text': _text_instruction(),
                 'cache_control': {'type': 'ephemeral'},
             },
             # Popis ide do samostatného bloku až za cache breakpoint. Keby bol

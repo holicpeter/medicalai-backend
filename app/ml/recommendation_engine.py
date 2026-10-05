@@ -1,6 +1,8 @@
 from typing import Dict, List, Optional
 from datetime import datetime
 
+from app.i18n import tr
+
 class RecommendationEngine:
     """Generuje odporúčania pre preventívne vyšetrenia"""
     
@@ -28,78 +30,78 @@ class RecommendationEngine:
         
         # Základné vyšetrenia pre všetkých
         tests.append({
-            'test': 'Kompletný krvný obraz',
-            'frequency': 'ročne',
+            'test': tr('Kompletný krvný obraz', "Complete blood count"),
+            'frequency': tr('ročne', "yearly"),
             'priority': 'high',
-            'description': 'Základné vyšetrenie krvi'
+            'description': tr('Základné vyšetrenie krvi', "Basic blood test")
         })
         
         tests.append({
-            'test': 'Lipidový profil',
-            'frequency': 'ročne',
+            'test': tr('Lipidový profil', "Lipid profile"),
+            'frequency': tr('ročne', "yearly"),
             'priority': 'high',
-            'description': 'Cholesterol, LDL, HDL, triglyceridy'
+            'description': tr('Cholesterol, LDL, HDL, triglyceridy', "Cholesterol, LDL, HDL, triglycerides")
         })
         
         tests.append({
-            'test': 'Glykémia nalačno',
-            'frequency': 'ročne',
+            'test': tr('Glykémia nalačno', "Fasting blood glucose"),
+            'frequency': tr('ročne', "yearly"),
             'priority': 'high',
-            'description': 'Hladina cukru v krvi'
+            'description': tr('Hladina cukru v krvi', "Blood sugar level")
         })
         
         # Vyšetrenia podľa veku
         if age >= 40:
             tests.append({
                 'test': 'HbA1c',
-                'frequency': 'ročne',
+                'frequency': tr('ročne', "yearly"),
                 'priority': 'high',
-                'description': 'Dlhodobá kontrola glykémie'
+                'description': tr('Dlhodobá kontrola glykémie', "Long-term blood sugar control")
             })
             
             tests.append({
                 'test': 'EKG',
-                'frequency': 'ročne',
+                'frequency': tr('ročne', "yearly"),
                 'priority': 'medium',
-                'description': 'Vyšetrenie srdca'
+                'description': tr('Vyšetrenie srdca', "Heart check")
             })
         
         if age >= 45:
             tests.append({
-                'test': 'Ergometria (záťažové EKG)',
-                'frequency': '2 roky',
+                'test': tr('Ergometria (záťažové EKG)', "Exercise stress test (stress ECG)"),
+                'frequency': tr('2 roky', "every 2 years"),
                 'priority': 'medium',
-                'description': 'Funkčná kapacita srdca'
+                'description': tr('Funkčná kapacita srdca', "Functional capacity of the heart")
             })
             
             tests.append({
-                'test': 'Kolonoskopia',
-                'frequency': '10 rokov',
+                'test': tr('Kolonoskopia', "Colonoscopy"),
+                'frequency': tr('10 rokov', "every 10 years"),
                 'priority': 'high',
-                'description': 'Screening rakoviny hrubého čreva'
+                'description': tr('Screening rakoviny hrubého čreva', "Colorectal cancer screening")
             })
         
         if age >= 50:
             tests.append({
-                'test': 'PSA (muži)',
-                'frequency': 'ročne',
+                'test': tr('PSA (muži)', "PSA (men)"),
+                'frequency': tr('ročne', "yearly"),
                 'priority': 'medium',
-                'description': 'Screening rakoviny prostaty'
+                'description': tr('Screening rakoviny prostaty', "Prostate cancer screening")
             })
             
             tests.append({
-                'test': 'Mamografia (ženy)',
-                'frequency': '2 roky',
+                'test': tr('Mamografia (ženy)', "Mammography (women)"),
+                'frequency': tr('2 roky', "every 2 years"),
                 'priority': 'high',
-                'description': 'Screening rakoviny prsníka'
+                'description': tr('Screening rakoviny prsníka', "Breast cancer screening")
             })
         
         if age >= 55:
             tests.append({
-                'test': 'Denzitometria',
-                'frequency': '2 roky',
+                'test': tr('Denzitometria', "Bone densitometry"),
+                'frequency': tr('2 roky', "every 2 years"),
                 'priority': 'medium',
-                'description': 'Meranie hustoty kostí'
+                'description': tr('Meranie hustoty kostí', "Bone density measurement")
             })
         
         return tests
@@ -108,41 +110,41 @@ class RecommendationEngine:
         """Odporúčania pre zdravý životný štýl"""
         return [
             {
-                'category': 'Výživa',
+                'category': tr('Výživa', "Nutrition"),
                 'recommendations': [
-                    'Mediteránska diéta s vysokým obsahom zeleniny',
-                    'Obmedzenie červeného mäsa',
-                    'Zvýšenie príjmu omega-3 mastných kyselín',
-                    'Redukcia soli a cukru',
-                    'Dostatočný príjem vlákniny'
+                    tr('Mediteránska diéta s vysokým obsahom zeleniny', "A Mediterranean diet rich in vegetables"),
+                    tr('Obmedzenie červeného mäsa', "Less red meat"),
+                    tr('Zvýšenie príjmu omega-3 mastných kyselín', "More omega-3 fatty acids"),
+                    tr('Redukcia soli a cukru', "Less salt and sugar"),
+                    tr('Dostatočný príjem vlákniny', "Enough fibre")
                 ]
             },
             {
-                'category': 'Fyzická aktivita',
+                'category': tr('Fyzická aktivita', "Physical activity"),
                 'recommendations': [
-                    'Minimálne 150 minút stredne intenzívnej aktivity týždenne',
-                    'Silový tréning 2x týždenne',
-                    'Denné prechádzky',
-                    'Zníženie sedavého spôsobu života'
+                    tr('Minimálne 150 minút stredne intenzívnej aktivity týždenne', "At least 150 minutes of moderate activity a week"),
+                    tr('Silový tréning 2x týždenne', "Strength training twice a week"),
+                    tr('Denné prechádzky', "Daily walks"),
+                    tr('Zníženie sedavého spôsobu života', "Sit less")
                 ]
             },
             {
-                'category': 'Životný štýl',
+                'category': tr('Životný štýl', "Lifestyle"),
                 'recommendations': [
-                    'Dostatok spánku (7-9 hodín)',
-                    'Manažment stresu',
-                    'Vyhýbanie sa fajčeniu',
-                    'Obmedzenie alkoholu',
-                    'Pravidelné merane krvného tlaku doma'
+                    tr('Dostatok spánku (7-9 hodín)', "Enough sleep (7-9 hours)"),
+                    tr('Manažment stresu', "Stress management"),
+                    tr('Vyhýbanie sa fajčeniu', "Avoid smoking"),
+                    tr('Obmedzenie alkoholu', "Limit alcohol"),
+                    tr('Pravidelné merane krvného tlaku doma', "Regular blood pressure checks at home")
                 ]
             },
             {
-                'category': 'Preventívne kontroly',
+                'category': tr('Preventívne kontroly', "Preventive check-ups"),
                 'recommendations': [
-                    'Pravidelné návštevy praktického lekára',
-                    'Preventívne zubné kontroly',
-                    'Očné vyšetrenia',
-                    'Dermatologické kontroly'
+                    tr('Pravidelné návštevy praktického lekára', "Regular visits to your GP"),
+                    tr('Preventívne zubné kontroly', "Preventive dental check-ups"),
+                    tr('Očné vyšetrenia', "Eye examinations"),
+                    tr('Dermatologické kontroly', "Skin check-ups")
                 ]
             }
         ]
@@ -158,29 +160,29 @@ class RecommendationEngine:
         
         # Okamžité vyšetrenia (ak neboli vykonané v posledných 6 mesiacoch)
         schedule['immediate'] = [
-            'Kompletný krvný obraz',
-            'Lipidový profil',
-            'Glykémia nalačno'
+            tr('Kompletný krvný obraz', "Complete blood count"),
+            tr('Lipidový profil', "Lipid profile"),
+            tr('Glykémia nalačno', "Fasting blood glucose")
         ]
         
         # Do 3 mesiacov
         schedule['next_3_months'] = [
-            'Kontrola krvného tlaku',
-            'BMI a obvod pása'
+            tr('Kontrola krvného tlaku', "Blood pressure check"),
+            tr('BMI a obvod pása', "BMI and waist circumference")
         ]
         
         # Do 6 mesiacov
         if age >= 40:
             schedule['next_6_months'] = [
                 'EKG',
-                'Ultrazvuk brucha'
+                tr('Ultrazvuk brucha', "Abdominal ultrasound")
             ]
         
         # Ročné kontroly
         schedule['annual'] = [
-            'Komplexná lekárska prehliadka',
-            'Očné vyšetrenie',
-            'Zubná kontrola'
+            tr('Komplexná lekárska prehliadka', "Comprehensive medical check-up"),
+            tr('Očné vyšetrenie', "Eye examination"),
+            tr('Zubná kontrola', "Dental check-up")
         ]
         
         return schedule

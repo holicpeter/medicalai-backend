@@ -12,6 +12,7 @@ from app.api import auth, health, upload, analysis, predictions, chat, integrati
 from app.auth.bootstrap import run_startup_tasks
 from app.auth.demo import demo_read_only
 from app.config import settings
+from app.i18n import language_middleware
 from app.database import init_database
 
 logging.basicConfig(
@@ -60,6 +61,8 @@ app = FastAPI(
 # outermost, so CORS wraps this one and its 403 still carries the CORS
 # headers the browser needs to read it (and the X-Demo-Read-Only header).
 app.middleware("http")(demo_read_only)
+# Outside the demo check, so its refusal is already in the user's language.
+app.middleware("http")(language_middleware)
 
 app.add_middleware(
     CORSMiddleware,

@@ -70,6 +70,9 @@ MEASTYPES = {
 # Čo produkuje ScanWatch 2 (bez váhy a bioimpedancie)
 WATCH_MEASTYPES = [11, 12, 54, 71, 73, 91, 123, 135, 136, 137, 138, 139]
 
+# Čo meria váha (Body Scan, Body+ a podobné): hmotnosť a bioimpedancia
+BODY_MEASTYPES = [1, 5, 6, 8, 76, 77, 88, 91]
+
 
 
 def _iso(epoch) -> str:

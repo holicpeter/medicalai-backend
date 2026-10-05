@@ -3,15 +3,18 @@ from typing import Dict, Optional
 import anthropic
 
 from app.config import settings
+from app.i18n import answer_language
 
 logger = logging.getLogger(__name__)
 
-_ANALYSIS_SYSTEM_PROMPT = (
-    "Si skúsený lekár s expertízou v preventívnej medicíne. "
-    "Analyzuj predikcie zdravotných rizík a poskytni štruktúrovanú analýzu v slovenčine. "
-    "Zdôrazni preventívne aspekty a motivuj k zdravému životnému štýlu. "
-    "Nikdy nediagnostikuj - len informuj o rizikách a odporúčaniach."
-)
+def _analysis_system_prompt() -> str:
+    return (
+        "Si skúsený lekár s expertízou v preventívnej medicíne. "
+        "Analyzuj predikcie zdravotných rizík a poskytni štruktúrovanú analýzu. "
+        f"Celú odpoveď napíš v jazyku: {answer_language()}. "
+        "Zdôrazni preventívne aspekty a motivuj k zdravému životnému štýlu. "
+        "Nikdy nediagnostikuj - len informuj o rizikách a odporúčaniach."
+    )
 
 
 class MedicalAdvisor:
@@ -49,7 +52,7 @@ class MedicalAdvisor:
                 system=[
                     {
                         "type": "text",
-                        "text": _ANALYSIS_SYSTEM_PROMPT,
+                        "text": _analysis_system_prompt(),
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
@@ -99,7 +102,7 @@ class MedicalAdvisor:
             "1. Krátkodobý akčný plán (1-3 mesiace)\n"
             "2. Strednodobé ciele (3-6 mesiacov)\n"
             "3. Dlhodobú stratégiu (1+ rok)\n\n"
-            "Odpoveď v slovenčine, prakticky a motivujúco."
+            f"Odpoveď v jazyku: {answer_language()}, prakticky a motivujúco."
         )
 
         try:

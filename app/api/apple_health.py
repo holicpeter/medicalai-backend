@@ -30,6 +30,7 @@ _import_jobs: Dict[str, Dict[str, Any]] = {}
 
 from ..database.models import AppleHealthData, get_session
 from ..auth.dependencies import get_current_patient_id
+from app.i18n import current_lang, tr
 
 router = APIRouter(prefix="/api/apple-health", tags=["apple_health"])
 
@@ -82,6 +83,39 @@ APPLE_HEALTH_TYPE_MAPPING = {
     # Ostatné
     "HKQuantityTypeIdentifierDietaryWater": "Pitie vody",
 }
+
+APPLE_HEALTH_TYPE_MAPPING_EN = {
+    "HKQuantityTypeIdentifierStepCount": "Steps",
+    "HKQuantityTypeIdentifierDistanceWalkingRunning": "Distance (walking/running)",
+    "HKQuantityTypeIdentifierFlightsClimbed": "Flights climbed",
+    "HKQuantityTypeIdentifierActiveEnergyBurned": "Active calories",
+    "HKQuantityTypeIdentifierBasalEnergyBurned": "Resting calories",
+    "HKQuantityTypeIdentifierHeartRate": "Heart rate",
+    "HKQuantityTypeIdentifierRestingHeartRate": "Resting heart rate",
+    "HKQuantityTypeIdentifierWalkingHeartRateAverage": "Walking heart rate average",
+    "HKQuantityTypeIdentifierHeartRateVariabilitySDNN": "Heart rate variability (HRV)",
+    "HKQuantityTypeIdentifierHeight": "Height",
+    "HKQuantityTypeIdentifierBodyMass": "Weight",
+    "HKQuantityTypeIdentifierBodyMassIndex": "BMI",
+    "HKQuantityTypeIdentifierBodyFatPercentage": "Body fat %",
+    "HKQuantityTypeIdentifierLeanBodyMass": "Lean body mass",
+    "HKCategoryTypeIdentifierSleepAnalysis": "Sleep",
+    "HKQuantityTypeIdentifierRespiratoryRate": "Respiratory rate",
+    "HKQuantityTypeIdentifierVO2Max": "VO2 Max",
+    "HKQuantityTypeIdentifierOxygenSaturation": "Oxygen saturation",
+    "HKQuantityTypeIdentifierBloodPressureSystolic": "Systolic pressure",
+    "HKQuantityTypeIdentifierBloodPressureDiastolic": "Diastolic pressure",
+    "HKQuantityTypeIdentifierBloodGlucose": "Blood glucose",
+    "HKQuantityTypeIdentifierBodyTemperature": "Body temperature",
+    "HKCategoryTypeIdentifierMenstrualFlow": "Menstruation",
+    "HKQuantityTypeIdentifierDietaryWater": "Water intake",
+}
+
+
+def _display_name(record_type: str) -> str:
+    """Human-readable name of an Apple Health type in the request's language."""
+    mapping = APPLE_HEALTH_TYPE_MAPPING_EN if current_lang() == "en" else APPLE_HEALTH_TYPE_MAPPING
+    return mapping.get(record_type, record_type)
 
 
 def parse_apple_health_date(date_str: str) -> Optional[datetime]:
@@ -341,9 +375,11 @@ def _validate_upload_name(filename: str) -> str:
     else:
         raise HTTPException(
             status_code=400,
-            detail=(
+            detail=tr(
                 "Neplatný súbor. Podporované sú .xml, .xml.gz a .zip "
-                "(napr. export.xml, export.xml.gz, export.zip)."
+                "(napr. export.xml, export.xml.gz, export.zip).",
+                "Invalid file. Supported are .xml, .xml.gz and .zip "
+                "(e.g. export.xml, export.xml.gz, export.zip).",
             ),
         )
 
@@ -354,10 +390,13 @@ def _validate_upload_name(filename: str) -> str:
     if fmt != 'zip' and 'cda' in Path(name).stem.lower():
         raise HTTPException(
             status_code=400,
-            detail=(
+            detail=tr(
                 "Toto je súbor export_cda.xml, ktorý obsahuje klinické dokumenty "
                 "v inom formáte a žiadne merania. Nahrajte prosím export.xml — "
-                "nájdete ho v tom istom priečinku apple_health_export."
+                "nájdete ho v tom istom priečinku apple_health_export.",
+                "This is export_cda.xml, which holds clinical documents in another "
+                "format and no measurements. Please upload export.xml — it is in "
+                "the same apple_health_export folder.",
             ),
         )
 
@@ -367,7 +406,8 @@ def _validate_upload_name(filename: str) -> str:
 def _too_large(limit: int) -> HTTPException:
     return HTTPException(
         status_code=413,
-        detail=f"Súbor je príliš veľký (limit {limit // (1024 * 1024)} MB).",
+        detail=tr(f"Súbor je príliš veľký (limit {limit // (1024 * 1024)} MB).",
+                  f"The file is too large (limit {limit // (1024 * 1024)} MB)."),
     )
 
 
@@ -387,9 +427,11 @@ def _pick_zip_member(archive: 'zipfile.ZipFile') -> 'zipfile.ZipInfo':
     if not candidates:
         raise HTTPException(
             status_code=400,
-            detail=(
+            detail=tr(
                 "V archíve nie je žiadny export.xml. Nahrajte prosím export.zip "
-                "z Health appky, alebo priamo export.xml."
+                "z Health appky, alebo priamo export.xml.",
+                "There is no export.xml in the archive. Please upload export.zip "
+                "from the Health app, or export.xml directly.",
             ),
         )
     # Prefer the canonical name; otherwise the biggest XML is the measurements one.
@@ -424,7 +466,8 @@ def _extract_zip_member(zip_path: Path) -> Path:
     except zipfile.BadZipFile:
         raise HTTPException(
             status_code=400,
-            detail="Súbor sa nedá rozbaliť — nie je to platný .zip archív.",
+            detail=tr("Súbor sa nedá rozbaliť — nie je to platný .zip archív.",
+                      "The file cannot be unpacked — it is not a valid .zip archive."),
         )
     return xml_path
 
@@ -477,9 +520,11 @@ async def _spool_stream(chunks, fmt: str) -> tuple[Path, int]:
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=400,
-            detail=(
+            detail=tr(
                 "Súbor sa nedá rozbaliť — nie je to platný gzip. Skontrolujte, "
-                "či prípona .gz zodpovedá obsahu."
+                "či prípona .gz zodpovedá obsahu.",
+                "The file cannot be unpacked — it is not valid gzip. Check that "
+                "the .gz extension matches the content.",
             ),
         )
     except HTTPException:
@@ -540,10 +585,13 @@ async def import_apple_health_data(
         if total_records == 0:
             raise HTTPException(
                 status_code=400,
-                detail=(
+                detail=tr(
                     "V súbore sa nenašli žiadne merania. Uistite sa, že nahrávate "
                     "export.xml z priečinka apple_health_export (nie export_cda.xml "
-                    "ani iný XML súbor)."
+                    "ani iný XML súbor).",
+                    "No measurements were found in the file. Make sure you upload "
+                    "export.xml from the apple_health_export folder (not export_cda.xml "
+                    "or another XML file).",
                 ),
             )
         
@@ -555,7 +603,10 @@ async def import_apple_health_data(
 
         return JSONResponse(content={
             "success": True,
-            "message": f"Import úspešný! Importovaných {saved_count} nových záznamov, {duplicate_count} duplikátov preskočených.",
+            "message": tr(
+                f"Import úspešný! Importovaných {saved_count} nových záznamov, {duplicate_count} duplikátov preskočených.",
+                f"Import successful! {saved_count} new records imported, {duplicate_count} duplicates skipped.",
+            ),
             "batch_id": batch_id,
             "stats": {
                 "total_records": total_records,
@@ -889,7 +940,7 @@ async def get_apple_health_data_by_type(
             result.append({
                 "id": record.id,
                 "type": record.record_type,
-                "friendly_name": APPLE_HEALTH_TYPE_MAPPING.get(record.record_type, record.record_type),
+                "friendly_name": _display_name(record.record_type),
                 "value": record.value,
                 "unit": record.unit,
                 "start_date": record.start_date.isoformat() if record.start_date else None,
@@ -900,7 +951,7 @@ async def get_apple_health_data_by_type(
         
         return JSONResponse(content={
             "record_type": record_type,
-            "friendly_name": APPLE_HEALTH_TYPE_MAPPING.get(record_type, record_type),
+            "friendly_name": _display_name(record_type),
             "count": len(result),
             "data": result
         })
@@ -928,7 +979,7 @@ async def delete_all_apple_health_data(patient_id: int = Depends(get_current_pat
         
         return JSONResponse(content={
             "success": True,
-            "message": f"Vymazaných {count} záznamov"
+            "message": tr(f"Vymazaných {count} záznamov", f"{count} records deleted")
         })
         
     except Exception as e:
@@ -951,7 +1002,7 @@ async def get_available_types(patient_id: int = Depends(get_current_patient_id))
         for (record_type,) in types:
             result.append({
                 "id": record_type,
-                "name": APPLE_HEALTH_TYPE_MAPPING.get(record_type, record_type)
+                "name": _display_name(record_type)
             })
         
         # Sort by friendly name

@@ -18,6 +18,7 @@ from fastapi import Depends, HTTPException, Request, Response
 from app.auth.security import decode_access_token
 from app.config import settings
 from app.database import Patient, User, get_session
+from app.i18n import tr
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +41,17 @@ def get_current_user(request: Request) -> User:
     """
     token = request.cookies.get(settings.AUTH_COOKIE_NAME) or _bearer_token(request)
     if not token:
-        raise HTTPException(status_code=401, detail="Neprihlásený.")
+        raise HTTPException(status_code=401, detail=tr("Neprihlásený.", "Not logged in."))
 
     user_id = decode_access_token(token)
     if user_id is None:
-        raise HTTPException(status_code=401, detail="Neplatné alebo expirované prihlásenie.")
+        raise HTTPException(status_code=401, detail=tr("Neplatné alebo expirované prihlásenie.", "Invalid or expired login."))
 
     session = get_session()
     try:
         user = session.query(User).filter_by(id=user_id).first()
         if user is None or not user.is_active:
-            raise HTTPException(status_code=401, detail="Neplatné alebo expirované prihlásenie.")
+            raise HTTPException(status_code=401, detail=tr("Neplatné alebo expirované prihlásenie.", "Invalid or expired login."))
         # Detached from the session on purpose — the caller gets a plain
         # object with the fields already loaded, not a live ORM instance tied
         # to a session that is about to close underneath it.
@@ -76,7 +77,7 @@ def get_current_patient_id(user: User = Depends(get_current_user)) -> int:
             logger.error("get_current_patient_id: user %s has no linked Patient row", user.id)
             raise HTTPException(
                 status_code=500,
-                detail="Profil sa nenašiel. Kontaktujte podporu.",
+                detail=tr("Profil sa nenašiel. Kontaktujte podporu.", "Profile not found. Please contact support."),
             )
         return patient.id
     finally:
@@ -98,8 +99,10 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
         raise HTTPException(
             status_code=403,
             detail=(
-                "Táto integrácia je zatiaľ dostupná len pre administrátora účtu "
-                "(Garmin a Kalendár zdieľajú jedno pripojenie pre celú appku)."
+                tr("Táto integrácia je zatiaľ dostupná len pre administrátora účtu "
+                   "(Garmin a Kalendár zdieľajú jedno pripojenie pre celú appku).",
+                   "This integration is only available to the account administrator for now "
+                   "(Garmin and Calendar share one connection for the whole app).")
             ),
         )
     return user
@@ -151,7 +154,7 @@ def check_rate_limit(request: Request, bucket: str) -> None:
     if len(window) >= _MAX_ATTEMPTS:
         raise HTTPException(
             status_code=429,
-            detail="Príliš veľa pokusov. Skúste to znova o pár minút.",
+            detail=tr("Príliš veľa pokusov. Skúste to znova o pár minút.", "Too many attempts. Please try again in a few minutes."),
         )
 
     window.append(now)
