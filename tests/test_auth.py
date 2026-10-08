@@ -141,6 +141,16 @@ def test_me_with_a_session_returns_the_logged_in_account(client):
     assert r.json()["email"] == email
 
 
+def test_me_says_whether_the_account_is_an_admin(client, monkeypatch):
+    admin, customer = _email(), _email()
+    monkeypatch.setattr(settings, "ADMIN_EMAILS", [admin.upper()])
+    _register(client, email=customer)
+    assert client.get("/api/auth/me").json()["is_admin"] is False
+    client.post("/api/auth/logout")
+    _register(client, email=admin)
+    assert client.get("/api/auth/me").json()["is_admin"] is True
+
+
 def test_logout_clears_the_session(client):
     _register(client)
     assert client.get("/api/auth/me").status_code == 200

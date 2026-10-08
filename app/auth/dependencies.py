@@ -84,6 +84,10 @@ def get_current_patient_id(user: User = Depends(get_current_user)) -> int:
         session.close()
 
 
+def is_admin(user: User) -> bool:
+    return user.email.lower() in {e.lower() for e in settings.ADMIN_EMAILS}
+
+
 def require_admin(user: User = Depends(get_current_user)) -> User:
     """Gate for the Garmin/Calendar integration endpoints (Withings is per user).
 
@@ -95,7 +99,7 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     admin's connector session entirely. Restricting them to ADMIN_EMAILS is
     the stopgap until those integrations store a token per user.
     """
-    if user.email.lower() not in {e.lower() for e in settings.ADMIN_EMAILS}:
+    if not is_admin(user):
         raise HTTPException(
             status_code=403,
             detail=(

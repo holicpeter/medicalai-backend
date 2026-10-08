@@ -24,6 +24,7 @@ from app.auth.dependencies import (
     check_rate_limit,
     clear_auth_cookie,
     get_current_user,
+    is_admin,
     set_auth_cookie,
 )
 from app.auth.account_deletion import delete_account
@@ -92,6 +93,8 @@ class UserOut(BaseModel):
     # The shared read-only demo account (app/auth/demo.py): clients show a
     # banner and offer registration instead of the editing tools.
     is_demo: bool = False
+    # Admin-only features (Garmin, Calendar) are hidden from everyone else.
+    is_admin: bool = False
     # Only for the mobile app (see _wants_token); the web never gets it.
     token: Optional[str] = None
 
@@ -126,6 +129,7 @@ def _serialize(user: User, patient_id: int) -> UserOut:
         patient_id=patient_id,
         created_at=user.created_at.isoformat() if user.created_at else "",
         is_demo=is_demo_email(user.email),
+        is_admin=is_admin(user),
     )
 
 
