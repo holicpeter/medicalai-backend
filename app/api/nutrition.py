@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from app.auth.dependencies import get_current_patient_id, get_current_user
@@ -33,12 +33,12 @@ _DEFAULT_DAILY_TARGETS = {
 
 
 class FoodItemModel(BaseModel):
-    name: str
-    estimated_grams: float
-    calories: float
-    protein_g: float
-    carbs_g: float
-    fat_g: float
+    name: str = Field(..., min_length=1, max_length=200)
+    estimated_grams: float = Field(0, ge=0)
+    calories: float = Field(..., ge=0)
+    protein_g: float = Field(0, ge=0)
+    carbs_g: float = Field(0, ge=0)
+    fat_g: float = Field(0, ge=0)
     confidence: float = 0.5
 
 
@@ -55,6 +55,25 @@ class NutritionEntryCreate(BaseModel):
     overall_confidence: Optional[float] = None
     recommendation: Optional[str] = None
     notes: Optional[str] = None
+    # When the meal was eaten. Omitted: now. Set when the user adds a meal to
+    # an earlier day. Naive local time, like the stored logged_at values.
+    logged_at: Optional[datetime] = None
+
+    @field_validator("logged_at")
+    @classmethod
+    def _not_in_future_or_too_old(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            value = value.astimezone().replace(tzinfo=None)
+        now = datetime.now()
+        # A day of slack: the browser's clock and timezone are not the server's.
+        if value > now + timedelta(days=1):
+            raise ValueError(tr("Jedlo nemôže byť v budúcnosti.", "A meal cannot be in the future."))
+        if value < now - timedelta(days=366):
+            raise ValueError(tr("Jedlo môžete pridať najviac rok dozadu.",
+                                "Meals can be added at most one year back."))
+        return value
 
 
 def _serialize_entry(entry: NutritionEntry) -> dict:
@@ -249,12 +268,16 @@ async def save_nutrition_entry(
     data: NutritionEntryCreate,
     patient_id: int = Depends(get_current_patient_id),
 ):
-    """Uloží (prípadne používateľom upravenú) analýzu jedla do denníka."""
+    """Uloží jedlo do denníka: AI analýzu (prípadne upravenú) alebo ručne zadané hodnoty.
+
+    Ručný záznam ide rovnakou cestou, len bez AI, takže nemíňa kredity.
+    logged_at umožňuje doplniť jedlo aj do predchádzajúcich dní.
+    """
     session = get_session()
     try:
         entry = NutritionEntry(
             patient_id=patient_id,
-            logged_at=datetime.now(),
+            logged_at=data.logged_at or datetime.now(),
             items=[item.model_dump() for item in data.items],
             total_calories=data.total_calories,
             total_protein_g=data.total_protein_g,
