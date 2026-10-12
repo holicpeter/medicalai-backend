@@ -1,6 +1,10 @@
 import asyncio
 import logging
+import re
+import uuid
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import and_, or_
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import anthropic
@@ -45,10 +49,50 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 class ChatRequest(BaseModel):
     question: str
     health_data: Optional[Dict[str, Any]] = None
+    # Continue this conversation; without it the question starts a new one.
+    conversation_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     answer: str
+    conversation_id: str
+
+
+# Messages from before conversations existed have no id; each day of them
+# is shown as one conversation, addressed as "legacy-YYYY-MM-DD".
+_LEGACY_PREFIX = "legacy-"
+_CONVERSATION_ID = re.compile(r"^(legacy-\d{4}-\d{2}-\d{2}|[0-9a-f]{32})$")
+MAX_LISTED_CONVERSATIONS = 100
+
+
+def _valid_conversation_id(conversation_id: Optional[str]) -> Optional[str]:
+    if conversation_id is None:
+        return None
+    if not _CONVERSATION_ID.match(conversation_id):
+        raise HTTPException(status_code=400, detail=tr("Neplatná konverzácia.", "Invalid conversation."))
+    return conversation_id
+
+
+def _conversation_filter(conversation_id: str):
+    """SQL condition selecting the messages of one conversation."""
+    if conversation_id.startswith(_LEGACY_PREFIX):
+        day = datetime.strptime(conversation_id[len(_LEGACY_PREFIX):], "%Y-%m-%d")
+        return or_(
+            ChatMessage.conversation_id == conversation_id,
+            and_(
+                ChatMessage.conversation_id.is_(None),
+                ChatMessage.created_at >= day,
+                ChatMessage.created_at < day + timedelta(days=1),
+            ),
+        )
+    return ChatMessage.conversation_id == conversation_id
+
+
+def _conversation_key(row) -> str:
+    if row.conversation_id:
+        return row.conversation_id
+    day = row.created_at.date().isoformat() if row.created_at else "1970-01-01"
+    return _LEGACY_PREFIX + day
 
 
 @router.post("/ask", response_model=ChatResponse)
@@ -60,6 +104,7 @@ async def ask_question(
     """
     Spracuje otázku používateľa a vráti odpoveď založenú na zdravotných dátach
     """
+    conversation_id = _valid_conversation_id(request.conversation_id) or uuid.uuid4().hex
     with ai_call(user, "chat"):
         try:
             # The context is built here, from the database, rather than taken from
@@ -103,7 +148,10 @@ async def ask_question(
     Kontext obsahuje len posledné obdobie. Ak sa otázka týka dlhšieho obdobia alebo
     vývoja hodnoty v čase, zavolaj get_metric_history namiesto odhadovania z
     poslednej hodnoty. Ak potrebuješ iný obsah lekárskej správy než sú priložené
-    úryvky, zavolaj search_documents. Neospravedlňuj sa za volanie nástroja a
+    úryvky, zavolaj search_documents. Na pohyb, spánok a ďalšie údaje z Apple
+    Health za iné obdobie použi get_activity_history, na jedálniček (sekcia Výživa)
+    get_nutrition_history. Máš prístup ku všetkým údajom pacienta v aplikácii —
+    ak sú v kontexte len zhrnuté, dohľadaj ich nástrojom. Neospravedlňuj sa za volanie nástroja a
     nespomínaj ho v odpovedi — pacienta zaujíma výsledok."""
 
             user_prompt = f"""ZDRAVOTNÉ DÁTA PACIENTA:
@@ -129,7 +177,7 @@ async def ask_question(
                 answer = response.choices[0].message.content
             elif settings.ANTHROPIC_API_KEY:
                 client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-                history = await asyncio.to_thread(load_history, patient_id)
+                history = await asyncio.to_thread(load_history, patient_id, conversation_id=conversation_id)
                 # Off the event loop: the SDK call is blocking and there can now be
                 # several of them in one question.
                 answer = await asyncio.to_thread(
@@ -141,8 +189,8 @@ async def ask_question(
                     detail=tr("Chýba API kľúč pre Mistral alebo Claude. Pridaj MISTRAL_API_KEY alebo ANTHROPIC_API_KEY do .env", "The AI service is not configured on the server."),
                 )
 
-            await asyncio.to_thread(_save_turn, patient_id, request.question, answer)
-            return ChatResponse(answer=answer)
+            await asyncio.to_thread(_save_turn, patient_id, request.question, answer, conversation_id)
+            return ChatResponse(answer=answer, conversation_id=conversation_id)
 
         except HTTPException:
             raise
@@ -151,8 +199,12 @@ async def ask_question(
             raise HTTPException(status_code=500, detail=tr("Chyba pri spracovaní otázky: ", "Could not process the question: ") + str(e))
 
 
-def load_history(patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = False) -> list:
-    """The last turns for one patient, oldest first, in the shape the Messages API expects.
+def load_history(
+    patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = False,
+    conversation_id: Optional[str] = None,
+) -> list:
+    """The last turns for one patient (of one conversation, if given), oldest first,
+    in the shape the Messages API expects.
 
     A failure here must not cost the patient an answer: a chat without memory
     is worse than one with it, and far better than a 500.
@@ -162,9 +214,11 @@ def load_history(patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = F
         # Acquired inside the try: if the database is unreachable, get_session
         # itself raises, and a chat without memory beats a chat that 500s.
         session = get_session()
+        query = session.query(ChatMessage).filter(ChatMessage.patient_id == patient_id)
+        if conversation_id:
+            query = query.filter(_conversation_filter(conversation_id))
         rows = (
-            session.query(ChatMessage)
-            .filter(ChatMessage.patient_id == patient_id)
+            query
             .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
             .limit(limit)
             .all()
@@ -188,12 +242,12 @@ def load_history(patient_id: int, limit: int = MAX_HISTORY_TURNS, full: bool = F
             session.close()
 
 
-def _save_turn(patient_id: int, question: str, answer: str) -> None:
+def _save_turn(patient_id: int, question: str, answer: str, conversation_id: Optional[str] = None) -> None:
     session = None
     try:
         session = get_session()
-        session.add(ChatMessage(patient_id=patient_id, role='user', content=question))
-        session.add(ChatMessage(patient_id=patient_id, role='assistant', content=answer))
+        session.add(ChatMessage(patient_id=patient_id, role='user', content=question, conversation_id=conversation_id))
+        session.add(ChatMessage(patient_id=patient_id, role='assistant', content=answer, conversation_id=conversation_id))
         session.commit()
     except Exception as e:
         if session is not None:
@@ -205,9 +259,67 @@ def _save_turn(patient_id: int, question: str, answer: str) -> None:
 
 
 @router.get("/history")
-async def get_chat_history(limit: int = 50, patient_id: int = Depends(get_current_patient_id)):
-    """Every question and answer for the current patient, with its timestamp, oldest first."""
-    return {"messages": load_history(patient_id, limit=max(1, min(limit, 500)), full=True)}
+async def get_chat_history(
+    limit: int = 50,
+    conversation_id: Optional[str] = None,
+    patient_id: int = Depends(get_current_patient_id),
+):
+    """Questions and answers with timestamps, oldest first: one conversation, or the latest overall."""
+    conversation_id = _valid_conversation_id(conversation_id)
+    return {"messages": load_history(
+        patient_id, limit=max(1, min(limit, 500)), full=True, conversation_id=conversation_id,
+    )}
+
+
+@router.get("/conversations")
+def list_conversations(patient_id: int = Depends(get_current_patient_id)):
+    """Earlier conversations, newest first, each titled by its first question."""
+    session = get_session()
+    try:
+        rows = (
+            session.query(ChatMessage.conversation_id, ChatMessage.role, ChatMessage.content, ChatMessage.created_at)
+            .filter(ChatMessage.patient_id == patient_id)
+            .order_by(ChatMessage.created_at, ChatMessage.id)
+            .all()
+        )
+    finally:
+        session.close()
+
+    conversations: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = _conversation_key(row)
+        conv = conversations.setdefault(key, {
+            "id": key, "title": None, "started_at": row.created_at, "updated_at": row.created_at, "messages": 0,
+        })
+        conv["messages"] += 1
+        conv["updated_at"] = row.created_at or conv["updated_at"]
+        if conv["title"] is None and row.role == "user" and row.content:
+            text = " ".join(row.content.split())
+            conv["title"] = text[:80] + ("…" if len(text) > 80 else "")
+    listed = sorted(conversations.values(), key=lambda c: c["updated_at"] or datetime.min, reverse=True)
+    for conv in listed:
+        conv["title"] = conv["title"] or tr("Konverzácia", "Conversation")
+        for field in ("started_at", "updated_at"):
+            conv[field] = conv[field].isoformat() if conv[field] else None
+    return {"conversations": listed[:MAX_LISTED_CONVERSATIONS]}
+
+
+@router.delete("/conversations/{conversation_id}")
+def delete_conversation(conversation_id: str, patient_id: int = Depends(get_current_patient_id)):
+    conversation_id = _valid_conversation_id(conversation_id)
+    session = get_session()
+    try:
+        removed = (
+            session.query(ChatMessage)
+            .filter(ChatMessage.patient_id == patient_id, _conversation_filter(conversation_id))
+            .delete(synchronize_session=False)
+        )
+        session.commit()
+    finally:
+        session.close()
+    if not removed:
+        raise HTTPException(status_code=404, detail=tr("Konverzácia sa nenašla.", "Conversation not found."))
+    return {"deleted": removed}
 
 
 def _ask_claude(

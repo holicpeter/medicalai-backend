@@ -26,6 +26,7 @@ import pandas as pd
 
 from app.analysis.health_metrics import HealthMetricsAnalyzer
 from app.analysis.trend_analyzer import TrendAnalyzer
+from app.analysis.lifestyle_data import ACTIVITY_KINDS, activity_overview, nutrition_overview
 from app.database import FamilyMember, Patient, get_session
 from app.rag import document_inventory, search as search_documents
 
@@ -440,8 +441,52 @@ def build_health_context(
         "family": _family(patient_id),
         "risks": _risks(patient_id),
         "documents": _documents(patient_id, question),
+        "activity": activity_overview(patient_id),
+        "nutrition": nutrition_overview(patient_id),
     }
     return context
+
+
+def _lifestyle_sections(context: Dict[str, Any]) -> List[str]:
+    """Activity/sleep from Apple Health and the food diary, short enough for every prompt."""
+    parts: List[str] = []
+    activity = context.get("activity") or {}
+    available = activity.get("available") or {}
+    if available:
+        lines = [
+            f"  - {kind} ({ACTIVITY_KINDS[kind][2]}): {info['records']} záznamov, {info['first']} až {info['last']}"
+            for kind, info in sorted(available.items())
+        ]
+        recent = activity.get("recent") or {}
+        for kind, days in recent.items():
+            values = ", ".join(f"{d}: {_format_number(v)}" for d, v in days)
+            lines.append(f"  {kind.upper()} za posledných {activity.get('recent_days')} dní ({ACTIVITY_KINDS[kind][2]}): {values}")
+        parts.append(
+            "\n=== POHYB A SPÁNOK (Apple Health) ===\n"
+            "Dostupné typy (inú dobu alebo typ získaš nástrojom get_activity_history):\n" + "\n".join(lines)
+        )
+
+    nutrition = context.get("nutrition") or {}
+    if nutrition.get("total_meals"):
+        week = nutrition.get("week") or {}
+        lines = [f"  Jedálniček obsahuje {nutrition['total_meals']} jedál, {nutrition.get('first')} až {nutrition.get('last')}. "
+                 "Približné denné ciele aplikácie: 2000 kcal, bielkoviny 90 g, sacharidy 250 g, tuky 70 g."]
+        for d in week.get("daily_totals") or []:
+            lines.append(
+                f"  - {d['date']}: {_format_number(d['calories'])} kcal, B {_format_number(d['protein_g'])} g, "
+                f"S {_format_number(d['carbs_g'])} g, T {_format_number(d['fat_g'])} g ({d['meals']} jedál)"
+            )
+        meals = (week.get("meals") or [])[-15:]
+        if meals:
+            lines.append("  Posledné jedlá:")
+            lines += [f"    {m['time']}: {m['meal']} ({m['kcal']} kcal)" for m in meals]
+        parts.append(
+            "\n=== VÝŽIVA (jedálniček za posledných 7 dní) ===\n"
+            "Staršie obdobie alebo všetky jedlá získaš nástrojom get_nutrition_history.\n" + "\n".join(lines)
+        )
+    elif nutrition:
+        parts.append("\n=== VÝŽIVA ===\n  V jedálničku zatiaľ nie sú žiadne jedlá.")
+    return parts
 
 
 def _format_number(value: Any) -> str:
@@ -510,7 +555,10 @@ def format_health_context(context: Dict[str, Any]) -> str:
     inventory = context.get("inventory") or {}
     by_metric = inventory.get("by_metric") or {}
     documents = context.get("documents") or {}
-    if not by_metric and not context.get("family") and not documents.get("inventory"):
+    has_lifestyle = bool((context.get("activity") or {}).get("available")) or bool(
+        (context.get("nutrition") or {}).get("total_meals")
+    )
+    if not by_metric and not context.get("family") and not documents.get("inventory") and not has_lifestyle:
         return ""
 
     parts: List[str] = [f"DNEŠNÝ DÁTUM: {context.get('today')}"]
@@ -618,6 +666,8 @@ def format_health_context(context: Dict[str, Any]) -> str:
             lines.append("  - pozn.: rizikový model nemá kompletné vstupy, ide o orientačný odhad")
         parts.append("\n=== PREDIKCIA RIZÍK (ML model) ===\n" + "\n".join(lines))
 
+
+    parts.extend(_lifestyle_sections(context))
 
     # Daily aggregates go last, and deliberately so: they are by far the
     # bulkiest section (every metric × every day), and the cap below trims from

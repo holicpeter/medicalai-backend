@@ -227,6 +227,9 @@ class ChatMessage(Base):
     role = Column(String(20))  # 'user' or 'assistant'
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.now)
+    # Groups the turns of one conversation. Messages saved before conversations
+    # existed have none; app/api/chat.py groups those by day.
+    conversation_id = Column(String(40), nullable=True)
 
 
 class DocumentChunk(Base):
@@ -402,18 +405,23 @@ def init_database():
 # somewhere to write.
 _COLUMNS = (
     ("patients", "user_id", "INTEGER"),
+    ("chat_messages", "conversation_id", "VARCHAR(40)"),
 )
 
 
 def _ensure_columns(engine):
-    from sqlalchemy import text
+    from sqlalchemy import inspect, text
 
+    # Checked first rather than relying on "ADD COLUMN IF NOT EXISTS": SQLite
+    # (the local and test database) does not accept IF NOT EXISTS there.
+    inspector = inspect(engine)
     with engine.connect() as conn:
         for table, column, coltype in _COLUMNS:
             try:
-                conn.execute(text(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}"
-                ))
+                existing = {c["name"] for c in inspector.get_columns(table)}
+                if column in existing:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
                 conn.commit()
             except Exception as e:
                 _db_logger.warning(
@@ -431,6 +439,7 @@ _INDEXES = (
     ("ix_health_records_source", "health_records", "source"),
     ("ix_document_chunks_document", "document_chunks", "document_id"),
     ("ix_chat_messages_created", "chat_messages", "created_at"),
+    ("ix_chat_messages_patient_conversation", "chat_messages", "patient_id, conversation_id"),
     ("ix_documents_filename", "documents", "filename"),
     ("ix_nutrition_entries_patient_logged", "nutrition_entries", "patient_id, logged_at"),
     ("ix_patients_user", "patients", "user_id"),
