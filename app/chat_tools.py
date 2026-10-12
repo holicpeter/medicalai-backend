@@ -23,6 +23,7 @@ import logging
 from typing import Any, Dict, List
 
 from app.analysis.chat_context import metric_history
+from app.analysis.lifestyle_data import ACTIVITY_KINDS, activity_history, nutrition_history
 from app.rag import search as search_documents
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,59 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "get_activity_history",
+        "description": (
+            "Vráti pohyb, spánok a ďalšie údaje z Apple Health po dňoch (pri dlhom období po "
+            "týždňoch) za ľubovoľné obdobie: kroky, spánok, spálené kalórie, vzdialenosť, HRV, "
+            "VO2max a ďalšie. Použi pri otázkach na aktivitu, spánok alebo kondíciu mimo "
+            "posledných 7 dní v kontexte, alebo na typy, ktoré v kontexte nie sú rozpísané."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": list(ACTIVITY_KINDS)},
+                "start_date": {"type": "string", "description": "YYYY-MM-DD, voliteľné (inak posledných 30 dní)."},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD, voliteľné."},
+            },
+            "required": ["kind"],
+        },
+    },
+    {
+        "name": "get_nutrition_history",
+        "description": (
+            "Vráti jedálniček pacienta (sekcia Výživa) za ľubovoľné obdobie: súčty kalórií a "
+            "živín po dňoch a zoznam jedál s časom. Použi pri otázkach na stravu mimo "
+            "posledných 7 dní v kontexte alebo keď potrebuješ všetky jedlá."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "YYYY-MM-DD, voliteľné (inak posledných 7 dní)."},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD, voliteľné."},
+                "include_meals": {"type": "boolean", "description": "Či vrátiť aj jednotlivé jedlá (predvolene áno)."},
+            },
+        },
+    },
 ]
+
+
+def _get_activity_history(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
+    return activity_history(
+        kind=payload.get("kind", ""),
+        patient_id=patient_id,
+        start_date=payload.get("start_date"),
+        end_date=payload.get("end_date"),
+    )
+
+
+def _get_nutrition_history(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
+    return nutrition_history(
+        patient_id,
+        start_date=payload.get("start_date"),
+        end_date=payload.get("end_date"),
+        include_meals=payload.get("include_meals", True) is not False,
+    )
 
 
 def _get_metric_history(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
@@ -102,6 +155,8 @@ def _search_documents(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any
 _HANDLERS = {
     "get_metric_history": _get_metric_history,
     "search_documents": _search_documents,
+    "get_activity_history": _get_activity_history,
+    "get_nutrition_history": _get_nutrition_history,
 }
 
 

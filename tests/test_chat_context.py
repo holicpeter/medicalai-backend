@@ -136,6 +136,9 @@ def stub_sources(monkeypatch, rows):
                         lambda q, patient_id, limit=5: list(PASSAGES) if q else [])
     # the ML predictor loads its own view of the data; not what these cover
     monkeypatch.setattr(chat_context, "_risks", lambda patient_id: {})
+    # Activity and the food diary have their own tests (test_chat_conversations.py).
+    monkeypatch.setattr(chat_context, "activity_overview", lambda patient_id: {})
+    monkeypatch.setattr(chat_context, "nutrition_overview", lambda patient_id: {})
 
 
 @pytest.mark.parametrize("metric,value,expected", [
