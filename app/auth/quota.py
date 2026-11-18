@@ -50,6 +50,11 @@ KINDS: Dict[str, tuple] = {
         ("Analýzy jedla", "Meal analyses"),
         ("na analýzy jedla", "for meal analyses"),
     ),
+    "workouts": (
+        "AI_DAILY_LIMIT_WORKOUTS",
+        ("Rozpoznanie stroja z fotky", "Machine recognition from a photo"),
+        ("na rozpoznanie stroja z fotky", "for recognising machines from a photo"),
+    ),
     "risk_analysis": (
         "AI_DAILY_LIMIT_RISK_ANALYSIS",
         ("AI analýzy rizík", "AI risk analyses"),

@@ -30,6 +30,7 @@ from app.database import (
     Patient,
     User,
     WearableConnection,
+    WorkoutEntry,
     get_session,
 )
 
@@ -42,6 +43,7 @@ PATIENT_SCOPED = [
     HealthRecord,
     FamilyMember,
     NutritionEntry,
+    WorkoutEntry,
     ChatMessage,
     GarminData,
     CalendarEvent,

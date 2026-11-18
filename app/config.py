@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     AI_DAILY_LIMIT_CHAT: int = 50
     AI_DAILY_LIMIT_DOCUMENTS: int = 10
     AI_DAILY_LIMIT_NUTRITION: int = 15
+    AI_DAILY_LIMIT_WORKOUTS: int = 15
     AI_DAILY_LIMIT_RISK_ANALYSIS: int = 5
     # Shared promo account with made-up data (scripts/seed_demo_account.py).
     # Accounts in DEMO_EMAILS cannot be deleted from the app, since many
