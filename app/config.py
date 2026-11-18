@@ -86,6 +86,8 @@ class Settings(BaseSettings):
         return [str(v).strip() for v in (value or []) if str(v).strip()]
 
     ALLOWED_ORIGINS: List[str] = [
+        "https://app.prognesa.ai",
+        "https://prognesa.ai",
         "https://medicalai.peterholic.com",
         "http://localhost:3000",
         "http://localhost:8000",

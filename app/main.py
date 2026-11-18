@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="MedicalAI API",
+    title="Prognesa API",
     description="API for medical health analysis and predictions",
     version="1.0.0",
     lifespan=lifespan,
@@ -132,7 +132,7 @@ app.include_router(onboarding.router)
 @app.get("/")
 async def root():
     return {
-        "message": "MedicalAI API",
+        "message": "Prognesa API",
         "version": "1.0.0",
         "status": "running",
     }

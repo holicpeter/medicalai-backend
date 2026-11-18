@@ -1,5 +1,5 @@
 """
-Database models pre MedicalAI
+Database models pre Prognesa
 Podporuje PostgreSQL (Railway/Supabase) aj SQLite (lokálne)
 """
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text, Boolean, ForeignKey, JSON, UniqueConstraint, event
@@ -524,7 +524,7 @@ def create_default_patient():
 
         patient = Patient(
             first_name="Používateľ",
-            last_name="MedicalAI",
+            last_name="Prognesa",
             gender="other",
         )
         session.add(patient)

@@ -33,7 +33,7 @@ async def health_status():
 
     body = {
         "status": "healthy" if database == "ok" else "degraded",
-        "service": "MedicalAI Backend",
+        "service": "Prognesa Backend",
         "database": database,
     }
     if detail:
