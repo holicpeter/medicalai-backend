@@ -309,7 +309,7 @@ async def export_my_data(request: Request, current_user: User = Depends(get_curr
     """
     check_rate_limit(request, bucket="export")
     data = await asyncio.to_thread(export_account, current_user.id)
-    filename = f"medicalai-export-{datetime.now():%Y-%m-%d}.json"
+    filename = f"prognesa-export-{datetime.now():%Y-%m-%d}.json"
     return JSONResponse(
         content=data,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
