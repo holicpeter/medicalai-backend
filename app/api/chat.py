@@ -150,7 +150,10 @@ async def ask_question(
     poslednej hodnoty. Ak potrebuješ iný obsah lekárskej správy než sú priložené
     úryvky, zavolaj search_documents. Na pohyb, spánok a ďalšie údaje z Apple
     Health za iné obdobie použi get_activity_history, na jedálniček (sekcia Výživa)
-    get_nutrition_history. Máš prístup ku všetkým údajom pacienta v aplikácii —
+    get_nutrition_history, na cvičenie (sekcia Tréningový plán) get_workout_history.
+    Pri tréningoch hodnoť progres z uvedených čísel (váha, odhad 1RM, objem, tempo),
+    navrhuj konkrétne úpravy (série, opakovania, váha, frekvencia, regenerácia) a
+    zohľadni spánok, HRV a zdravotné riziká pacienta. Máš prístup ku všetkým údajom pacienta v aplikácii —
     ak sú v kontexte len zhrnuté, dohľadaj ich nástrojom. Neospravedlňuj sa za volanie nástroja a
     nespomínaj ho v odpovedi — pacienta zaujíma výsledok."""
 

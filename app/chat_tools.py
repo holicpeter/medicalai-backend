@@ -25,6 +25,7 @@ from typing import Any, Dict, List
 from app.analysis.chat_context import metric_history
 from app.analysis.lifestyle_data import ACTIVITY_KINDS, activity_history, nutrition_history
 from app.rag import search as search_documents
+from app.workouts.history import workout_history
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,23 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "get_workout_history",
+        "description": (
+            "Vráti tréningový denník pacienta (sekcia Tréningový plán): tréningové dni s cvikmi, "
+            "sériami, váhou, trvaním a vzdialenosťou, a progres každého cviku (prvý → posledný "
+            "tréning, najlepší výkon). S parametrom exercise vráti celý vývoj jedného cviku po dňoch. "
+            "Použi pri otázkach na cvičenie mimo posledných 14 dní v kontexte alebo na detail cviku."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "YYYY-MM-DD, voliteľné (inak posledných 30 dní)."},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD, voliteľné."},
+                "exercise": {"type": "string", "description": "Názov cviku, voliteľné (bez obdobia celá história cviku)."},
+            },
+        },
+    },
 ]
 
 
@@ -127,6 +145,15 @@ def _get_nutrition_history(payload: Dict[str, Any], patient_id: int) -> Dict[str
         start_date=payload.get("start_date"),
         end_date=payload.get("end_date"),
         include_meals=payload.get("include_meals", True) is not False,
+    )
+
+
+def _get_workout_history(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
+    return workout_history(
+        patient_id,
+        start_date=payload.get("start_date"),
+        end_date=payload.get("end_date"),
+        exercise=(payload.get("exercise") or "").strip() or None,
     )
 
 
@@ -157,6 +184,7 @@ _HANDLERS = {
     "search_documents": _search_documents,
     "get_activity_history": _get_activity_history,
     "get_nutrition_history": _get_nutrition_history,
+    "get_workout_history": _get_workout_history,
 }
 
 

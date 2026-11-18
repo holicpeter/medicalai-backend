@@ -27,6 +27,7 @@ import pandas as pd
 from app.analysis.health_metrics import HealthMetricsAnalyzer
 from app.analysis.trend_analyzer import TrendAnalyzer
 from app.analysis.lifestyle_data import ACTIVITY_KINDS, activity_overview, nutrition_overview
+from app.workouts.history import summary_text, workout_overview
 from app.database import FamilyMember, Patient, get_session
 from app.rag import document_inventory, search as search_documents
 
@@ -443,6 +444,7 @@ def build_health_context(
         "documents": _documents(patient_id, question),
         "activity": activity_overview(patient_id),
         "nutrition": nutrition_overview(patient_id),
+        "workouts": workout_overview(patient_id),
     }
     return context
 
@@ -486,6 +488,25 @@ def _lifestyle_sections(context: Dict[str, Any]) -> List[str]:
         )
     elif nutrition:
         parts.append("\n=== VÝŽIVA ===\n  V jedálničku zatiaľ nie sú žiadne jedlá.")
+
+    workouts = context.get("workouts") or {}
+    if workouts.get("total_entries"):
+        lines = [f"  Denník obsahuje {workouts['total_entries']} zapísaných cvikov v {workouts['training_days']} "
+                 f"tréningových dňoch, {workouts.get('first')} až {workouts.get('last')}."]
+        lines.append("  Progres po cvikoch (prvý → posledný tréning, celá história; 1RM = odhad maxima na jedno opakovanie):")
+        lines += [f"    - {summary_text(x['exercise'], x['summary'], x['last_date'])}" for x in workouts.get("per_exercise") or []]
+        recent = workouts.get("recent") or []
+        if recent:
+            lines.append(f"  Tréningy za posledných {workouts.get('recent_days')} dní:")
+            lines += [f"    {r['date']}: {r['text']}" for r in recent]
+        else:
+            lines.append(f"  Za posledných {workouts.get('recent_days')} dní nie je zapísaný žiadny tréning.")
+        parts.append(
+            "\n=== TRÉNINGY (sekcia Tréningový plán) ===\n"
+            "Staršie tréningy alebo celý vývoj jedného cviku získaš nástrojom get_workout_history.\n" + "\n".join(lines)
+        )
+    elif workouts:
+        parts.append("\n=== TRÉNINGY (sekcia Tréningový plán) ===\n  V tréningovom denníku zatiaľ nie sú žiadne cviky.")
     return parts
 
 
@@ -557,7 +578,7 @@ def format_health_context(context: Dict[str, Any]) -> str:
     documents = context.get("documents") or {}
     has_lifestyle = bool((context.get("activity") or {}).get("available")) or bool(
         (context.get("nutrition") or {}).get("total_meals")
-    )
+    ) or bool((context.get("workouts") or {}).get("total_entries"))
     if not by_metric and not context.get("family") and not documents.get("inventory") and not has_lifestyle:
         return ""
 
