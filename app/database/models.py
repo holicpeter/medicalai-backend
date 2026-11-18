@@ -97,6 +97,7 @@ class Patient(Base):
     health_records = relationship("HealthRecord", back_populates="patient")
     family_members = relationship("FamilyMember", back_populates="patient")
     nutrition_entries = relationship("NutritionEntry", back_populates="patient")
+    workout_entries = relationship("WorkoutEntry", back_populates="patient")
 
 
 class FamilyMember(Base):
@@ -169,6 +170,34 @@ class NutritionEntry(Base):
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     patient = relationship("Patient", back_populates="nutrition_entries")
+
+
+class WorkoutEntry(Base):
+    """Jeden odcvičený cvik v jeden deň (tréningový denník).
+
+    Série sú v JSON stĺpci — počet sérií sa líši cvik od cviku a nikdy sa
+    nedopytujú jednotlivo, vždy celý záznam naraz. Progres sa počíta z nich
+    v app/workouts/progress.py.
+
+    exercise_key je znormalizovaný názov (malé písmená, bez diakritiky,
+    zjednotené medzery): „Bench press" a „bench  Press" sú ten istý cvik
+    pre históriu aj graf progresu, kým exercise drží názov tak, ako ho
+    používateľ napísal naposledy.
+    """
+    __tablename__ = 'workout_entries'
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey('patients.id'))
+    logged_at = Column(DateTime, default=datetime.now)
+    exercise = Column(String(200), nullable=False)
+    exercise_key = Column(String(200), nullable=False)
+    category = Column(String(20), default='strength')  # strength | cardio | other
+    sets = Column(JSON)  # [{reps, weight_kg}, ...]
+    duration_min = Column(Float, nullable=True)
+    distance_km = Column(Float, nullable=True)
+    notes = Column(Text, nullable=True)
+    source = Column(String(20), default='manual')  # manual | photo
+    created_at = Column(DateTime, default=datetime.now)
+    patient = relationship("Patient", back_populates="workout_entries")
 
 
 class NutritionTextCache(Base):
@@ -442,6 +471,8 @@ _INDEXES = (
     ("ix_chat_messages_patient_conversation", "chat_messages", "patient_id, conversation_id"),
     ("ix_documents_filename", "documents", "filename"),
     ("ix_nutrition_entries_patient_logged", "nutrition_entries", "patient_id, logged_at"),
+    ("ix_workout_entries_patient_logged", "workout_entries", "patient_id, logged_at"),
+    ("ix_workout_entries_patient_exercise", "workout_entries", "patient_id, exercise_key"),
     ("ix_patients_user", "patients", "user_id"),
     ("ix_documents_patient", "documents", "patient_id"),
 )
