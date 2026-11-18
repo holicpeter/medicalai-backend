@@ -177,3 +177,37 @@ def test_identification_output_is_validated():
     assert out["exercise"] == "Lat pulldown" and out["category"] == "strength" and out["confidence"] == 1.0
     with pytest.raises(ValueError):
         parse_identification("no json here")
+
+
+# The chat assistant sees the training diary.
+
+def _log_bench_series(client):
+    today = date.today()
+    for back, weight in ((14, 60), (7, 62.5), (0, 65)):
+        assert client.post("/api/workouts/entries", json=_bench(today - timedelta(days=back), weight)).status_code == 200
+
+
+def test_the_chat_context_includes_workouts_and_their_progress(client):
+    from app.analysis.chat_context import build_health_context, format_health_context
+
+    _log_bench_series(client)
+    patient_id = client.get("/api/auth/me").json()["patient_id"]
+    text = format_health_context(build_health_context(patient_id))
+    assert "TRÉNINGY" in text
+    assert "Bench press: 3 tréningy" in text and "+8.3 %" in text
+    assert "2× 8 × 65 kg" in text
+
+
+def test_the_workout_tool_returns_one_exercise_over_its_whole_history(client):
+    import json
+
+    from app.chat_tools import run_tool
+
+    _log_bench_series(client)
+    patient_id = client.get("/api/auth/me").json()["patient_id"]
+    result = json.loads(run_tool("get_workout_history", {"exercise": "bench press"}, patient_id))
+    assert [p["best_weight_kg"] for p in result["points"]] == [60, 62.5, 65]
+    assert result["per_exercise"][0]["summary"]["improved"] is True
+
+    other = _register().get("/api/auth/me").json()["patient_id"]
+    assert json.loads(run_tool("get_workout_history", {}, other))["sessions"] == []
