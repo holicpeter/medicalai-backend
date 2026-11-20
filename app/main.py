@@ -45,7 +45,11 @@ async def lifespan(app: FastAPI):
     if settings.WEARABLE_SYNC_INTERVAL_HOURS > 0:
         from app.integrations.connections import periodic_sync_loop
         sync_task = asyncio.create_task(periodic_sync_loop(settings.WEARABLE_SYNC_INTERVAL_HOURS))
+    # Keeps the demo account's dates current (app/auth/bootstrap.py).
+    from app.auth.bootstrap import demo_refresh_loop
+    demo_task = asyncio.create_task(demo_refresh_loop())
     yield
+    demo_task.cancel()
     if sync_task is not None:
         sync_task.cancel()
 
