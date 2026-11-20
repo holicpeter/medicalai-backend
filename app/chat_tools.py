@@ -24,6 +24,7 @@ from typing import Any, Dict, List
 
 from app.analysis.chat_context import metric_history
 from app.analysis.lifestyle_data import ACTIVITY_KINDS, activity_history, nutrition_history
+from app.integrations import consensus
 from app.rag import search as search_documents
 from app.workouts.history import workout_history
 
@@ -129,6 +130,20 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
 ]
 
+# Štúdie z Consensus: ponúknuť modelu len s kľúčom, inak by volal nástroj,
+# ktorý vždy vráti „nie je nakonfigurované“.
+if consensus.is_enabled():
+    TOOL_SCHEMAS.append(consensus.SEARCH_STUDIES_SCHEMA)
+
+
+def _search_studies(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
+    # patient_id sa zámerne nepoužíva: do externej služby nejde nič o pacientovi.
+    return consensus.search_studies(
+        payload.get("query", ""),
+        study_types=payload.get("study_types"),
+        year_min=payload.get("year_min"),
+    )
+
 
 def _get_activity_history(payload: Dict[str, Any], patient_id: int) -> Dict[str, Any]:
     return activity_history(
@@ -185,6 +200,7 @@ _HANDLERS = {
     "get_activity_history": _get_activity_history,
     "get_nutrition_history": _get_nutrition_history,
     "get_workout_history": _get_workout_history,
+    "search_studies": _search_studies,
 }
 
 
