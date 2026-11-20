@@ -10,7 +10,11 @@ Railway dashboard, merge, and the next boot does the rest.
   with that email exists. It runs before the app serves any request, so nobody
   can register that email first. Delete MIGRATE_ADMIN_PASSWORD afterwards.
 - SEED_DEMO_ACCOUNT=true: create the read-only demo account if it is missing.
-  An existing demo is left as it is; re-run the script to refresh its dates.
+- Always: an existing demo account whose data has gone stale (its newest
+  Apple Health day is more than DEMO_MAX_AGE_DAYS old) is re-seeded, so its
+  dates move to today. The activity overview shows recent days and the
+  nutrition diary shows today; with old dates both screens looked empty.
+  demo_refresh_loop repeats the check while the app runs.
 - RESET_PASSWORD_EMAIL + RESET_PASSWORD: set a new password for an existing
   account — the way back in when the password is lost, since the app has no
   email-based reset. Applied on every boot while set, so delete both variables
@@ -19,11 +23,16 @@ Railway dashboard, merge, and the next boot does the rest.
   app-wide row in withings_tokens) is moved to the admin's own account,
   encrypted, and the old plain-text row is deleted.
 """
+import asyncio
 import logging
 import os
+from datetime import date, timedelta
+from typing import Optional
+
+from sqlalchemy import func
 
 from app.auth.security import hash_password
-from app.database import Document, Patient, User, get_session
+from app.database import AppleHealthData, Document, Patient, User, get_session
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +121,78 @@ def reset_password(email: str, password: str) -> str:
         session.close()
 
 
+DEMO_MAX_AGE_DAYS = 2
+DEMO_CHECK_INTERVAL_HOURS = 6
+
+
+def _demo_newest_day(email: str) -> Optional[date]:
+    """Newest Apple Health day in the demo account, or None if there is none."""
+    session = get_session()
+    try:
+        newest = (
+            session.query(func.max(AppleHealthData.start_date))
+            .join(Patient, Patient.id == AppleHealthData.patient_id)
+            .join(User, User.id == Patient.user_id)
+            .filter(User.email == email)
+            .scalar()
+        )
+    finally:
+        session.close()
+    if newest is None:
+        return None
+    return newest.date() if hasattr(newest, "date") else newest
+
+
+def demo_is_stale(newest: Optional[date], today: Optional[date] = None,
+                  max_age_days: int = DEMO_MAX_AGE_DAYS) -> bool:
+    today = today or date.today()
+    return newest is None or newest < today - timedelta(days=max_age_days)
+
+
+def refresh_demo_if_stale() -> str:
+    """Re-seed the demo account when its dates have fallen behind. Never raises."""
+    try:
+        from app.config import settings
+
+        email = settings.DEMO_EMAIL.lower()
+        session = get_session()
+        try:
+            exists = session.query(User.id).filter_by(email=email).first()
+        finally:
+            session.close()
+        if not exists:
+            return "no demo account"
+        newest = _demo_newest_day(email)
+        if not demo_is_stale(newest):
+            return f"demo data is current (newest day {newest})"
+
+        import secrets
+
+        from scripts.seed_demo_account import seed
+
+        result = seed(email, secrets.token_urlsafe(18))
+        logger.info("demo account re-seeded (newest day was %s): %s", newest, result)
+        return "re-seeded"
+    except Exception as e:
+        logger.error("demo refresh failed: %s", e)
+        return f"failed: {e}"
+
+
+async def demo_refresh_loop(interval_hours: float = DEMO_CHECK_INTERVAL_HOURS) -> None:
+    """Started from the app's lifespan; cancelled on shutdown.
+
+    Assumes one web replica: two processes re-seeding at the same moment would
+    both delete and recreate the account.
+    """
+    # First check a minute after boot, off the startup path: re-seeding takes a
+    # few seconds and must not delay the API from serving requests.
+    await asyncio.sleep(60)
+    while True:
+        result = await asyncio.to_thread(refresh_demo_if_stale)
+        logger.info("demo refresh check: %s", result)
+        await asyncio.sleep(interval_hours * 3600)
+
+
 def run_startup_tasks() -> None:
     """Never raises: a failed one-time task must not keep the API from starting."""
     email = os.environ.get("MIGRATE_ADMIN_EMAIL", "").strip()
@@ -156,7 +237,7 @@ def run_startup_tasks() -> None:
             finally:
                 session.close()
             if exists:
-                logger.info("startup: demo account already exists — left as it is")
+                logger.info("startup: demo account already exists — demo_refresh_loop keeps it current")
             else:
                 # scripts/ is a package at the repo root, next to app/.
                 import secrets
