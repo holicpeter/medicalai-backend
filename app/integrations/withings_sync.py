@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 
 from app.database import get_session, HealthRecord
-from app.integrations.withings_connector import get_withings_connector
+from app.integrations.withings_connector import WithingsNotConnected, get_withings_connector
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,14 @@ METRIC_UNITS = {
 }
 
 
+def _invalidate_trends(patient_id: int) -> None:
+    try:
+        from app.analysis.trend_analyzer import TrendAnalyzer
+        TrendAnalyzer.invalidate_cache(patient_id)
+    except Exception as e:
+        logger.warning("[WITHINGS SYNC] Cache trendov sa nepodarilo zneplatniť: %s", e)
+
+
 def _day(iso: str):
     """ISO reťazec s offsetom -> dátum. Časy z konektora sú v UTC."""
     return datetime.fromisoformat(iso).date()
@@ -94,6 +102,20 @@ async def collect_daily_metrics(user_id: int, days: int = 30, hrv_nights: int = 
         # dostaneme — spot merania cez deň sú ovplyvnené aktivitou.
         if night.get("hr_average") is not None:
             daily[("resting_heart_rate", day)].append(float(night["hr_average"]))
+
+    # --- teplota jadra tela (ScanWatch 2) ---
+    # Nejde cez getmeas — pozri WithingsConnector.get_core_body_temperature.
+    # Denný medián zo stoviek vzoriek; ukladá sa ako body_temperature, takže
+    # ju chat, trendy aj riziká vidia rovnako ako teplotu z Apple Health.
+    try:
+        for s in await connector.get_core_body_temperature(days):
+            daily[("body_temperature", _day(s["measured_at"]))].append(s["value"])
+    except WithingsNotConnected:
+        raise
+    except Exception as e:
+        # Bez balíka biomarkerov alebo bez ScanWatch 2 Withings teplotu nedá —
+        # to nesmie zhodiť zvyšok syncu.
+        logger.warning("[WITHINGS SYNC] Teplotu sa nepodarilo stiahnuť: %s", e)
 
     # --- HRV ---
     try:
@@ -160,6 +182,9 @@ async def sync_withings_to_db(user_id: int, patient_id: int, days: int = 30,
             written += 1
 
         session.commit()
+        # Trendy (a cez ne chat) majú 5-minútovú cache — bez tohto by čerstvo
+        # stiahnuté dáta, napr. dnešná teplota, v chate ešte chvíľu chýbali.
+        _invalidate_trends(patient_id)
         logger.info(
             "[WITHINGS SYNC] %d nových, %d aktualizovaných záznamov",
             written, updated,

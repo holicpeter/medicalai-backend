@@ -15,6 +15,7 @@ from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
 from app.config import settings
 from app.database import ChatMessage, User, get_session
 from app.i18n import current_lang, tr
+from app.integrations.connections import refresh_if_stale
 
 _MODEL = "claude-haiku-4-5-20251001"
 
@@ -105,6 +106,10 @@ async def ask_question(
     Spracuje otázku používateľa a vráti odpoveď založenú na zdravotných dátach
     """
     conversation_id = _valid_conversation_id(request.conversation_id) or uuid.uuid4().hex
+    # Otázky typu „ako som na tom dnes“ potrebujú dnešné dáta z hodiniek, no
+    # plánovaný sync beží len raz za pár hodín. Ak sú staršie ako hodina,
+    # dotiahnu sa teraz (s časovým limitom, chyba odpoveď nezastaví).
+    await refresh_if_stale(user.id)
     with ai_call(user, "chat"):
         try:
             # The context is built here, from the database, rather than taken from

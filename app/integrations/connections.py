@@ -186,6 +186,50 @@ async def initial_sync(user_id: int) -> None:
         logger.warning("[CONNECTIONS] initial Withings sync for user %s failed: %s", user_id, e)
 
 
+# Chat sa pýta na „dnes“, ale plánovaný sync beží len raz za niekoľko hodín.
+# Pred odpoveďou preto dotiahneme posledné 2 dni, ak sú dáta staršie.
+FRESH_FOR = timedelta(minutes=60)
+# Keď Withings nefunguje, last_sync_at sa neposúva — bez tejto poistky by
+# každá otázka v chate čakala na ten istý neúspešný pokus.
+_RETRY_AFTER = timedelta(minutes=10)
+_FRESHNESS_TIMEOUT_S = 20
+_last_attempt: Dict[int, datetime] = {}
+
+
+async def refresh_if_stale(user_id: int) -> Optional[Dict[str, Any]]:
+    """Dotiahne čerstvé Withings dáta, ak posledný sync je starší ako FRESH_FOR.
+
+    Volá sa pred odpoveďou v chate. Nikdy nevyhodí výnimku a nikdy nečaká
+    dlhšie než _FRESHNESS_TIMEOUT_S — radšej odpoveď nad trochu staršími
+    dátami než žiadna.
+    """
+    session = get_session()
+    try:
+        row = _connection(session, user_id, "withings")
+        if row is None or not row.refresh_token_enc:
+            return None
+        last_sync = row.last_sync_at
+    finally:
+        session.close()
+
+    now = datetime.now()
+    if last_sync is not None and now - last_sync < FRESH_FOR:
+        return None
+    attempted = _last_attempt.get(user_id)
+    if attempted is not None and now - attempted < _RETRY_AFTER:
+        return None
+    _last_attempt[user_id] = now
+
+    try:
+        return await asyncio.wait_for(
+            sync_withings(user_id, days=2, hrv_nights=1),
+            timeout=_FRESHNESS_TIMEOUT_S,
+        )
+    except Exception as e:
+        logger.warning("[CONNECTIONS] pre-chat Withings sync for user %s failed: %s", user_id, e)
+        return None
+
+
 async def sync_all_connections(days: int = 7) -> None:
     """One pass over every connected user. Errors are recorded per user, never raised."""
     session = get_session()
