@@ -19,7 +19,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 
 from app.database import get_session, HealthRecord
-from app.integrations.withings_connector import WithingsNotConnected, get_withings_connector
+from app.integrations.withings_connector import (
+    BODY_MEASTYPES,
+    WATCH_MEASTYPES,
+    WithingsNotConnected,
+    get_withings_connector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +43,15 @@ MEASURE_TO_METRIC = {
     "skin_temperature": "skin_temperature",
     "vo2max": "vo2max",
     "pulse_wave_velocity": "pulse_wave_velocity",
+    "fat_ratio": "body_fat",   # rovnaký názov ako HKQuantityTypeIdentifierBodyFatPercentage
 }
+
+# Tlak: systolický (10) a diastolický (9) prídu ako dve merania v jednej skupine.
+BP_MEASTYPES = [9, 10]
+
+# Hodinky, váha aj tlakomer jedným volaním. Predtým sa sťahovali len typy
+# z hodiniek, takže hmotnosť z váhy a tlak z tlakomeru do záznamu nikdy neprišli.
+SYNC_MEASTYPES = sorted(set(WATCH_MEASTYPES + BODY_MEASTYPES + BP_MEASTYPES))
 
 # Jednotky, ktoré posielame do normalize(). Pri metrikách mimo CANONICAL sa
 # hodnota nechá tak, ako je — normalize neháda.
@@ -51,6 +64,8 @@ METRIC_UNITS = {
     "skin_temperature": "degC",
     "vo2max": "ml/kg/min",
     "pulse_wave_velocity": "m/s",
+    "body_fat": "%",
+    "blood_pressure": "mmHg",
     "sleep_duration": "h",
     "sleep_score": "score",
     "respiration_rate": "1/min",
@@ -76,14 +91,22 @@ async def collect_daily_metrics(user_id: int, days: int = 30, hrv_nights: int = 
     """
     Stiahne z Withings všetko podstatné a zloží to na denné hodnoty.
 
-    Vracia {(metrika, dátum): hodnota}. Kroky a vzdialenosť zámerne vynechávame
-    — tie rieši aktivitná časť appky, nie interpretované metriky.
+    Vracia {(metrika, dátum): hodnota}. Hodnota je číslo, len tlak je reťazec
+    "120/80" — v tomto tvare ho ukladá aj ručné zadávanie a číta
+    app.analysis.sources. Kroky a vzdialenosť zámerne vynechávame — tie rieši
+    aktivitná časť appky, nie interpretované metriky.
     """
     connector = get_withings_connector(user_id)
     daily: Dict[tuple, List[float]] = defaultdict(list)
+    # Jedno meranie tlaku = jedna skupina = rovnaký čas a zariadenie.
+    bp_readings: Dict[tuple, Dict[str, float]] = defaultdict(dict)
 
-    # --- bodové merania (tep, SpO2, teplota, váha, VO2max) ---
-    for m in await connector.get_measures(days):
+    # --- bodové merania (tep, SpO2, teplota, váha, tuk, tlak, VO2max) ---
+    for m in await connector.get_measures(days, meastypes=SYNC_MEASTYPES):
+        if m["metric"] in ("bp_systolic", "bp_diastolic"):
+            key = (m["measured_at"], m.get("device_id"))
+            bp_readings[key]["systolic" if m["metric"] == "bp_systolic" else "diastolic"] = m["value"]
+            continue
         metric = MEASURE_TO_METRIC.get(m["metric"])
         if not metric:
             continue
@@ -130,7 +153,22 @@ async def collect_daily_metrics(user_id: int, days: int = 30, hrv_nights: int = 
         logger.warning("[WITHINGS SYNC] HRV sa nepodarilo stiahnuť: %s", e)
 
     # Medián je odolnejší voči jednotlivým chybným meraniam než priemer.
-    return {key: statistics.median(vals) for key, vals in daily.items() if vals}
+    result: Dict[tuple, object] = {
+        key: statistics.median(vals) for key, vals in daily.items() if vals
+    }
+
+    # Tlak: len úplné merania (obe hodnoty), denný medián zvlášť pre každú.
+    bp_daily: Dict[object, Dict[str, List[float]]] = defaultdict(lambda: {"s": [], "d": []})
+    for (measured_at, _device), r in bp_readings.items():
+        if "systolic" in r and "diastolic" in r:
+            day = _day(measured_at)
+            bp_daily[day]["s"].append(r["systolic"])
+            bp_daily[day]["d"].append(r["diastolic"])
+    for day, v in bp_daily.items():
+        result[("blood_pressure", day)] = (
+            f"{round(statistics.median(v['s']))}/{round(statistics.median(v['d']))}"
+        )
+    return result
 
 
 async def sync_withings_to_db(user_id: int, patient_id: int, days: int = 30,
@@ -159,7 +197,7 @@ async def sync_withings_to_db(user_id: int, patient_id: int, days: int = 30,
         }
 
         for (metric, day), value in values.items():
-            text_value = f"{round(float(value), 2)}"
+            text_value = value if isinstance(value, str) else f"{round(float(value), 2)}"
             unit = METRIC_UNITS.get(metric)
 
             row = existing.get((metric, day))
