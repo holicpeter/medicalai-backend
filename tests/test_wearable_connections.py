@@ -252,3 +252,24 @@ def test_body_measures_ask_withings_for_the_scale_types(monkeypatch):
     assert r.json()["measures"][0]["metric"] == "weight"
     assert asked["types"] == withings_connector.BODY_MEASTYPES
     assert client.get("/api/integrations/withings/measures", params={"kind": "nope"}).status_code == 422
+
+
+def test_watch_temperature_comes_from_the_intraday_series(monkeypatch):
+    client, _ = _user()
+    _callback(client, _state_from(client))
+    asked = {}
+
+    async def fake_temperature(self, days=7):
+        asked["days"] = days
+        return [{"measured_at": "2026-11-20T03:00:00+00:00", "value": 36.7}]
+
+    monkeypatch.setattr(withings_connector.WithingsConnector, "get_core_body_temperature", fake_temperature)
+    r = client.get("/api/integrations/withings/temperature", params={"days": 3})
+    assert r.status_code == 200
+    assert r.json()["temperature"] == [{"measured_at": "2026-11-20T03:00:00+00:00", "value": 36.7}]
+    assert asked["days"] == 3
+
+
+def test_watch_temperature_needs_a_connection():
+    client, _ = _user()
+    assert client.get("/api/integrations/withings/temperature").status_code == 401

@@ -75,6 +75,45 @@ BODY_MEASTYPES = [1, 5, 6, 8, 76, 77, 88, 91]
 
 
 
+# getintradayactivity dáva najviac 24 h na volanie; viac dní = viac requestov.
+MAX_TEMPERATURE_DAYS = 14
+
+# Teplota jadra mimo tohto rozsahu je chyba senzora (hodinky mimo ruky,
+# kalibrácia po nasadení), nie meranie.
+_PLAUSIBLE_CORE_TEMP = (30.0, 43.0)
+
+
+def parse_core_temperature(body: Dict[str, Any]) -> Dict[int, float]:
+    """
+    Odpoveď getintradayactivity -> {epoch: °C}.
+
+    Withings vracia `series` ako slovník {"<epoch>": {"core_body_temperature": ..}};
+    staršie odpovede ako zoznam objektov s kľúčom `timestamp`. Zvládne oboje.
+    """
+    series = body.get("series") or {}
+    if isinstance(series, dict):
+        items = [(ts, row) for ts, row in series.items()]
+    else:
+        items = [(row.get("timestamp"), row) for row in series if isinstance(row, dict)]
+
+    out: Dict[int, float] = {}
+    low, high = _PLAUSIBLE_CORE_TEMP
+    for ts, row in items:
+        if ts is None or not isinstance(row, dict):
+            continue
+        raw = row.get("core_body_temperature")
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+            epoch = int(ts)
+        except (TypeError, ValueError):
+            continue
+        if low <= value <= high:
+            out[epoch] = round(value, 2)
+    return out
+
+
 def _iso(epoch) -> str:
     """
     Epoch -> ISO 8601 s explicitným UTC offsetom.
@@ -486,6 +525,41 @@ class WithingsConnector:
                 item["wear_position"] = sig.get("wearposition")
             out.append(item)
         return out
+
+    async def get_core_body_temperature(self, days: int = 7) -> List[Dict]:
+        """
+        Teplota jadra tela zo ScanWatch 2 (TempTech 24/7), vzorky v čase.
+
+        TOTO CEZ getmeas NEPRÍDE. Typy 12/71/73 vypĺňa teplomer Thermo, nie
+        hodinky — ScanWatch 2 dáva teplotu len ako intradenný rad
+        core_body_temperature v /v2/measure getintradayactivity. Kvôli tomu
+        appka teplotu z hodiniek nikdy nevidela.
+
+        Endpoint vracia najviac 24 h na jedno volanie, takže ide deň po dni.
+        Pri days=7 je to 7 requestov; limit 120/min platí pre celú appku,
+        preto je počet dní zhora obmedzený.
+        """
+        days = max(1, min(int(days), MAX_TEMPERATURE_DAYS))
+        end = int(time.time())
+        samples: Dict[int, float] = {}
+        for i in range(days):
+            window_end = end - i * 86400
+            try:
+                body = await self._call(
+                    "/v2/measure", "getintradayactivity",
+                    startdate=window_end - 86400, enddate=window_end,
+                    data_fields="core_body_temperature",
+                )
+            except WithingsNotConnected:
+                raise
+            except Exception as e:
+                # Jeden zlý deň nesmie zahodiť ostatné.
+                logger.warning("[WITHINGS] Teplota pre okno končiace %s zlyhala: %s", window_end, e)
+                continue
+            samples.update(parse_core_temperature(body))
+
+        return [{"measured_at": _iso(ts), "value": value}
+                for ts, value in sorted(samples.items())]
 
     async def get_historical_data(self, days: int = 30) -> Dict[str, Any]:
         """Všetko naraz - rovnaký tvar ako garmin.get_historical_data()."""

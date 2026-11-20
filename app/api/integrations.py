@@ -274,6 +274,17 @@ async def get_withings_measures(days: int = 30, kind: str = "watch",
     return {"measures": await _withings_call(_withings_for(user).get_measures(days, meastypes))}
 
 
+@router.get("/withings/temperature")
+async def get_withings_temperature(days: int = 7, user: User = Depends(get_current_user)):
+    """
+    Teplota jadra tela zo ScanWatch 2 — vzorky v čase (°C).
+
+    Nie je súčasťou /measures: hodinky ju neposielajú cez getmeas, ale ako
+    intradenný rad. Jeden deň = jeden request na Withings, max 14 dní.
+    """
+    return {"temperature": await _withings_call(_withings_for(user).get_core_body_temperature(days))}
+
+
 @router.get("/withings/hrv")
 async def get_withings_hrv(nights: int = 14, user: User = Depends(get_current_user)):
     """
