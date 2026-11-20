@@ -189,11 +189,36 @@ class TrendAnalyzer:
 
     def _analyze_blood_pressure(self, data: pd.DataFrame) -> Dict:
         systolic_values, diastolic_values = [], []
+        # One point per complete reading, oldest first, so the app can chart
+        # both lines. 'value' repeats the systolic number for older clients
+        # that only read a single series.
+        values_over_time = []
+        if 'date' in data.columns:
+            data = data.sort_values('date')
         for _, row in data.iterrows():
-            if isinstance(row['value'], dict):
-                systolic_values.append(row['value'].get('systolic'))
-                diastolic_values.append(row['value'].get('diastolic'))
+            val = row['value']
+            if not isinstance(val, dict):
+                continue
+            try:
+                s, d = float(val.get('systolic')), float(val.get('diastolic'))
+            except (TypeError, ValueError):
+                continue  # incomplete reading: skip rather than poison the stats
+            systolic_values.append(s)
+            diastolic_values.append(d)
+            date = row.get('date')
+            if date is not None and not pd.isna(date):
+                values_over_time.append({
+                    'date': date.strftime('%Y-%m-%d'),
+                    'systolic': s,
+                    'diastolic': d,
+                    'value': s,
+                })
+        if not systolic_values:
+            return {"error": "No complete blood pressure readings"}
         return {
+            'count': len(systolic_values),
+            'trend': self._calculate_trend(data),
+            'values_over_time': values_over_time,
             'systolic': {
                 'latest': systolic_values[-1] if systolic_values else None,
                 'mean': float(np.mean(systolic_values)) if systolic_values else None,
@@ -219,8 +244,11 @@ class TrendAnalyzer:
         for val in data_sorted['value'].values:
             if isinstance(val, (int, float)):
                 values.append(float(val))
-            elif isinstance(val, dict) and 'systolic' in val:
-                values.append(float(val['systolic']))
+            elif isinstance(val, dict) and val.get('systolic') is not None:
+                try:
+                    values.append(float(val['systolic']))
+                except (TypeError, ValueError):
+                    continue
 
         if len(values) < 2:
             return "insufficient_data"
