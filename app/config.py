@@ -104,6 +104,10 @@ class Settings(BaseSettings):
     # Mistral API
     MISTRAL_API_KEY: str = ""
 
+    # Consensus (consensus.app) — vyhľadávanie vo vedeckých štúdiách pre chat.
+    # Bez kľúča sa nástroj search_studies modelu vôbec neponúkne.
+    CONSENSUS_API_KEY: str = ""
+
     # Withings API (ScanWatch 2 + Body Scan)
     #
     # WITHINGS_REDIRECT_URI must match the Callback URL registered at

@@ -15,6 +15,7 @@ from app.chat_tools import MAX_TOOL_ROUNDS, TOOL_SCHEMAS, run_tool
 from app.config import settings
 from app.database import ChatMessage, User, get_session
 from app.i18n import current_lang, tr
+from app.integrations import consensus
 from app.integrations.connections import refresh_if_stale
 
 _MODEL = "claude-haiku-4-5-20251001"
@@ -42,6 +43,21 @@ def _language_rule() -> str:
         return ("Answer ONLY in English, even though these instructions and the patient's "
                 "data are written in Slovak")
     return "Odpovedaj VÝHRADNE v slovenskom jazyku"
+
+
+def _studies_rule() -> str:
+    """Pravidlo pre search_studies — len ak je nástroj modelu naozaj ponúknutý."""
+    if not consensus.is_enabled():
+        return ""
+    return """
+
+    ŠTÚDIE:
+    Keď sa pacient pýta, či niečo (doplnok, liek, strava, cvičenie, návyk, terapia) pomáha,
+    funguje alebo je bezpečné, VŽDY najprv zavolaj search_studies so všeobecnou anglickou
+    otázkou BEZ údajov pacienta. V odpovedi uveď 2–3 najrelevantnejšie štúdie (typ alebo
+    časopis, rok a odkaz ako markdown link) a povedz, či sa výsledky zhodujú. Až potom to
+    prepoj s dátami pacienta. Ak nástroj štúdie nevráti, povedz to otvorene a nevymýšľaj
+    citácie. Štúdie nikdy nevymýšľaj ani neuvádzaj z pamäti."""
 
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -160,7 +176,8 @@ async def ask_question(
     navrhuj konkrétne úpravy (série, opakovania, váha, frekvencia, regenerácia) a
     zohľadni spánok, HRV a zdravotné riziká pacienta. Máš prístup ku všetkým údajom pacienta v aplikácii —
     ak sú v kontexte len zhrnuté, dohľadaj ich nástrojom. Neospravedlňuj sa za volanie nástroja a
-    nespomínaj ho v odpovedi — pacienta zaujíma výsledok."""
+    nespomínaj ho v odpovedi — pacienta zaujíma výsledok.
+    - Nepíš „môj odborný názor“ ani sa nevydávaj za lekára; záver nazvi „Zhrnutie“.""" + _studies_rule()
 
             user_prompt = f"""ZDRAVOTNÉ DÁTA PACIENTA:
     {context}
