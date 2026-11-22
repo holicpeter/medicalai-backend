@@ -123,6 +123,23 @@ class Settings(BaseSettings):
     # How often every connected wearable is synced in the background. 0 = off.
     WEARABLE_SYNC_INTERVAL_HOURS: float = 6
 
+    # Stripe billing (app/billing). Empty STRIPE_SECRET_KEY = billing off:
+    # the plans endpoint reports it and checkout answers 503, the rest of the
+    # app is unaffected. Use sk_test_/price_ IDs from test mode first.
+    STRIPE_SECRET_KEY: str = ""
+    # Signing secret of the webhook endpoint (whsec_...), from Stripe →
+    # Developers → Webhooks for https://app.prognesa.ai/api/billing/webhook.
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_PRICE_PRO_MONTHLY: str = ""
+    STRIPE_PRICE_PRO_YEARLY: str = ""
+    STRIPE_PRICE_FAMILY_YEARLY: str = ""
+    # Founding-member price for accounts that join during the beta.
+    STRIPE_PRICE_FOUNDING_YEARLY: str = ""
+    BILLING_FOUNDING_OPEN: bool = True
+    BILLING_TRIAL_DAYS: int = 14
+    # Stripe Tax: turn on once tax registrations are set up in Stripe.
+    STRIPE_AUTOMATIC_TAX: bool = False
+
     # OCR Settings
     TESSERACT_LANG: str = "slk"
 
@@ -174,6 +191,11 @@ if settings.WITHINGS_CLIENT_ID and settings.WITHINGS_CLIENT_SECRET:
     logger.info('Withings credentials loaded')
 else:
     logger.warning('WITHINGS_CLIENT_ID / WITHINGS_CLIENT_SECRET not set — Withings sync disabled')
+
+if settings.STRIPE_SECRET_KEY:
+    logger.info('Stripe billing enabled (%s mode)', 'live' if settings.STRIPE_SECRET_KEY.startswith(('sk_live_', 'rk_live_')) else 'test')
+else:
+    logger.warning('STRIPE_SECRET_KEY not set — billing disabled')
 
 if settings.ADMIN_EMAILS:
     logger.info('Admin emails loaded (%d) — Garmin/Withings/Calendar restricted to them', len(settings.ADMIN_EMAILS))

@@ -30,6 +30,7 @@ from app.database import (
     Patient,
     User,
     WearableConnection,
+    Subscription,
     WorkoutEntry,
     get_session,
 )
@@ -53,6 +54,13 @@ PATIENT_SCOPED = [
 
 def delete_account(user_id: int) -> Dict[str, int]:
     """Remove the user, their patient profile and all data. Returns row counts per table."""
+    # Stop billing before the rows that link the user to Stripe are gone.
+    try:
+        from app.billing.service import cancel_for_deleted_account
+        cancel_for_deleted_account(user_id)
+    except Exception as e:
+        logger.error("account deletion: could not cancel the subscription of user %s: %s", user_id, e)
+
     session = get_session()
     removed: Dict[str, int] = {}
     files: List[str] = []
@@ -85,6 +93,9 @@ def delete_account(user_id: int) -> Dict[str, int]:
 
         removed["wearable_connections"] = (
             session.query(WearableConnection).filter_by(user_id=user_id).delete(synchronize_session=False)
+        )
+        removed["subscriptions"] = (
+            session.query(Subscription).filter_by(user_id=user_id).delete(synchronize_session=False)
         )
         removed["ai_usage"] = (
             session.query(AiUsage).filter_by(user_id=user_id).delete(synchronize_session=False)
