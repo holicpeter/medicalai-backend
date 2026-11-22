@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from app.api import auth, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition, connections, onboarding, workouts
+from app.api import auth, billing, health, upload, analysis, predictions, chat, integrations, manual_entry, apple_health, nutrition, connections, onboarding, workouts
 from app.auth.bootstrap import run_startup_tasks
 from app.auth.demo import demo_read_only
 from app.config import settings
@@ -131,6 +131,7 @@ app.include_router(apple_health.router)
 app.include_router(nutrition.router)
 app.include_router(workouts.router)
 app.include_router(onboarding.router)
+app.include_router(billing.router)
 
 
 @app.get("/")

@@ -53,6 +53,29 @@ class AiUsage(Base):
     count = Column(Integer, nullable=False, default=0)
 
 
+class Subscription(Base):
+    """A user's paid plan, mirrored from Stripe (see app/billing).
+
+    Stripe is the source of truth; this row is what the webhook last told us,
+    so the app can answer "is this user on Pro?" without calling Stripe on
+    every request. One row per user, created the first time they open
+    checkout (that is when the Stripe customer is created).
+    """
+    __tablename__ = 'subscriptions'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, unique=True, index=True)
+    stripe_customer_id = Column(String(64), nullable=True, index=True)
+    stripe_subscription_id = Column(String(64), nullable=True, index=True)
+    # pro_monthly | pro_yearly | family_yearly | founding_yearly
+    plan = Column(String(32), nullable=True)
+    # Stripe subscription status: trialing, active, past_due, canceled, ...
+    status = Column(String(32), nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
+    cancel_at_period_end = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class WearableConnection(Base):
     """One user's link to a wearable/health service (Withings for now).
 
